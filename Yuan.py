@@ -2925,17 +2925,50 @@ class StorageBudget:
                 else:
                     self.reservations.pop(self.key, None)
 
+    def reclaim_recovery(self, cancel=None, required=0):
+        root = safe_path(self.state, "learning/recovery")
+        if not root.is_dir() or root.is_symlink():
+            return 0
+        entries, total = [], 0
+        for path in root.iterdir():
+            check(cancel)
+            if path.is_symlink() or not path.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", path.name):
+                continue
+            files = list(path.iterdir())
+            if any(file.is_symlink() or not file.is_file() for file in files):
+                continue
+            size = sum(file.stat().st_size for file in files)
+            total += size
+            entries.append((path.stat().st_mtime_ns, path, size))
+        policy = AdaptivePolicy(self.state)
+        available = self.snapshot(required)["available_bytes"]
+        budget = policy.integer("storage", "checkpoint_recovery_bytes", (available + total) // 4, 0, max(1, available + total))
+        keep = policy.integer("storage", "checkpoint_recovery_generations", 1, 0, max(1, math.isqrt(os.cpu_count() or 1)))
+        remaining, removed = len(entries), 0
+        for _, path, size in sorted(entries):
+            check(cancel)
+            if remaining <= keep and total <= budget and self.snapshot(required)["ready"]:
+                break
+            shutil.rmtree(path)
+            remaining -= 1
+            total -= size
+            removed += size
+        if removed:
+            sync_dir(root)
+        return removed
+
     def reclaim(self, store, cancel, required=0):
         removed = 0
         before = self.snapshot(required)
         if before["ready"]:
             return before
+        removed += self.reclaim_recovery(cancel, required)
         key = store.setting("serving_memory_key", "")
         with store.transaction():
             store.db.execute("DELETE FROM memories WHERE model_key<>?", (key,))
             store.db.execute("DELETE FROM memory_progress WHERE model_key<>?", (key,))
         with store.audio_files(cancel):
-            rows = store.db.execute("SELECT s.* FROM samples s JOIN groups g ON g.id=s.group_id WHERE g.retention='training_cache' AND g.split='train' AND s.generated=0 AND (s.visits>0 OR EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.visits>0)) AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE p.group_id=g.id AND p.verified=1) AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.eligible=1 AND p.visits=0 AND " + store.training_pair_filter + ") ORDER BY s.visits DESC,s.created").fetchall()
+            rows = store.db.execute("SELECT s.* FROM samples s JOIN groups g ON g.id=s.group_id WHERE g.retention='training_cache' AND g.split='train' AND s.generated=0 AND s.audio_status IN ('ready','evicted') AND (s.visits>0 OR EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.visits>0)) AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE p.group_id=g.id AND p.verified=1) AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.eligible=1 AND p.visits=0 AND " + store.training_pair_filter + ") ORDER BY s.visits DESC,s.created").fetchall()
             for row in rows:
                 check(cancel)
                 if self.snapshot(required)["ready"]:
@@ -2944,17 +2977,18 @@ class StorageBudget:
                 if path.is_symlink():
                     continue
                 with store.transaction():
-                    store.db.execute("DELETE FROM turn_pairs WHERE user_sample=? OR assistant_sample=?", (row["id"], row["id"]))
-                    store.db.execute("DELETE FROM samples WHERE id=?", (row["id"],))
-                if not store.db.execute("SELECT 1 FROM samples WHERE audio=?", (row["audio"],)).fetchone():
-                    try:
-                        size = path.stat().st_size
-                        path.unlink()
-                        removed += size
-                    except FileNotFoundError:
-                        pass
-                    store.integrity_cache.pop(row["audio"], None)
+                    if store.db.execute("SELECT 1 FROM samples WHERE audio=? AND id<>? AND audio_status<>'evicted'", (row["audio"], row["id"])).fetchone():
+                        continue
+                    store.db.execute("UPDATE samples SET audio_status='evicted',retry_at=0,read_failures=0,audio_error='' WHERE id=?", (row["id"],))
+                try:
+                    size = path.stat().st_size
+                    path.unlink()
+                    removed += size
+                except FileNotFoundError:
+                    pass
+                store.integrity_cache.pop(row["audio"], None)
         if removed:
+            sync_dir(store.audio)
             store.set_setting("storage_reclaimed_bytes", int(store.setting("storage_reclaimed_bytes", 0)) + removed)
         result = self.snapshot(required)
         result["reclaimed_bytes"] = removed
@@ -2990,6 +3024,9 @@ class AudioStore:
         self.audio.mkdir(exist_ok=True)
         self.db = sqlite3.connect(str(database_path(self.root, "memory.sqlite3")), timeout=math.sqrt(os.cpu_count() or 1))
         self.db.row_factory = sqlite3.Row
+        self.db.create_function("yuan_sample_supervision", 1, lambda value: payload_digest(self.sample_supervision(json.loads(value))), deterministic=True)
+        self.db.create_function("yuan_pair_supervision", 1, lambda value: payload_digest(self.pair_supervision(json.loads(value))), deterministic=True)
+        self.db.create_function("yuan_evidence", 1, lambda value: payload_digest(self.evidence_metadata(json.loads(value))), deterministic=True)
         self.transaction_depth = 0
         self.integrity_cache = {}
         self.coverage_cache = {}
@@ -3001,7 +3038,7 @@ class AudioStore:
         CREATE TABLE IF NOT EXISTS groups(id TEXT PRIMARY KEY, split TEXT NOT NULL CHECK(split IN ('train','validation','guard','release')), origin TEXT NOT NULL, created REAL NOT NULL, source_key TEXT NOT NULL, retention TEXT NOT NULL DEFAULT 'protected' CHECK(retention IN ('protected','training_cache')), provenance TEXT NOT NULL DEFAULT '{}');
         CREATE INDEX IF NOT EXISTS group_source ON groups(source_key,split);
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, prompt TEXT NOT NULL, language TEXT NOT NULL, started REAL NOT NULL, ended REAL);
-        CREATE TABLE IF NOT EXISTS samples(id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), role TEXT NOT NULL, task TEXT NOT NULL CHECK(task IN ('acoustic','generated_reply')), audio TEXT NOT NULL, seconds REAL NOT NULL, rate INTEGER NOT NULL, count INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, visits INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, digest TEXT NOT NULL, file_sha256 TEXT NOT NULL, audio_status TEXT NOT NULL DEFAULT 'ready' CHECK(audio_status IN ('ready','retry','invalid')), retry_at REAL NOT NULL DEFAULT 0, read_failures INTEGER NOT NULL DEFAULT 0, audio_error TEXT NOT NULL DEFAULT '', generated INTEGER NOT NULL CHECK(generated IN (0,1)), learnable INTEGER NOT NULL CHECK(learnable IN (0,1)), dialogue_eligible INTEGER NOT NULL CHECK(dialogue_eligible IN (0,1)), memory_eligible INTEGER NOT NULL DEFAULT 0 CHECK(memory_eligible IN (0,1)), memory_exclusion TEXT NOT NULL DEFAULT '', exclusion TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS samples(id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), role TEXT NOT NULL, task TEXT NOT NULL CHECK(task IN ('acoustic','generated_reply')), audio TEXT NOT NULL, seconds REAL NOT NULL, rate INTEGER NOT NULL, count INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, visits INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, digest TEXT NOT NULL, file_sha256 TEXT NOT NULL, audio_status TEXT NOT NULL DEFAULT 'ready' CHECK(audio_status IN ('ready','retry','invalid','evicted')), retry_at REAL NOT NULL DEFAULT 0, read_failures INTEGER NOT NULL DEFAULT 0, audio_error TEXT NOT NULL DEFAULT '', generated INTEGER NOT NULL CHECK(generated IN (0,1)), learnable INTEGER NOT NULL CHECK(learnable IN (0,1)), dialogue_eligible INTEGER NOT NULL CHECK(dialogue_eligible IN (0,1)), memory_eligible INTEGER NOT NULL DEFAULT 0 CHECK(memory_eligible IN (0,1)), memory_exclusion TEXT NOT NULL DEFAULT '', exclusion TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}');
         CREATE INDEX IF NOT EXISTS sample_group ON samples(group_id, created);
         CREATE INDEX IF NOT EXISTS sample_digest ON samples(digest);
         CREATE UNIQUE INDEX IF NOT EXISTS eligible_digest ON samples(digest) WHERE learnable=1 OR dialogue_eligible=1;
@@ -3036,7 +3073,7 @@ class AudioStore:
             self.repair()
 
     def repair(self):
-        for row in self.db.execute("SELECT * FROM samples").fetchall():
+        for row in self.db.execute("SELECT * FROM samples WHERE audio_status<>'evicted'").fetchall():
             try:
                 safe_path(self.root, row["audio"]).stat()
             except (OSError, YuanError) as exc:
@@ -3078,9 +3115,17 @@ class AudioStore:
                 self.db.execute("INSERT INTO settings(key,value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET value=CAST(COALESCE(CAST(settings.value AS INTEGER),0)+1 AS TEXT)", (key,))
 
     @staticmethod
+    def sample_supervision(metadata):
+        return {key: value for key, value in metadata.items() if key not in ("attribution", "annotation", "annotation_id")}
+
+    @staticmethod
+    def evidence_metadata(metadata):
+        return {key: value for key, value in metadata.items() if key != "attribution"}
+
+    @staticmethod
     def pair_supervision(evidence):
         return {key: value for key, value in evidence.items() if key not in
-                ("reviewer", "annotation_id", "annotation_sha256", "license", "attribution", "scenarios", "contrasts", "reference_checks", "retrieval")}
+                ("reviewer", "annotation_id", "annotation_sha256", "attribution", "reference_checks", "retrieval")}
 
     def group(self, group_id, origin, forced=None, source_key=None, retention="protected", provenance=None):
         if retention not in ("protected", "training_cache"):
@@ -3157,8 +3202,7 @@ class AudioStore:
                         raise YuanError("音频片段标识与内容不一致 / Audio sample identity does not match its content")
                     if origin == "dataset" and (json.loads(previous["metadata"]) != metadata or previous["exclusion"] == "annotation_removed" or previous["created"] != created):
                         prior_metadata = json.loads(previous["metadata"])
-                        fields = ("recording_id", "speaker", "raw_sha256", "utterance_final", "capture_gap", "playback_overlap", "interrupted", "discontinuous", "input_incomplete", "final", "limited")
-                        changed = previous["exclusion"] == "annotation_removed" or previous["created"] != created or any(prior_metadata.get(key) != metadata.get(key) for key in fields)
+                        changed = previous["exclusion"] == "annotation_removed" or previous["created"] != created or self.sample_supervision(prior_metadata) != self.sample_supervision(metadata)
                         if changed:
                             reason = self.memory_reason(metadata, eligible, generated)
                             duplicate = self.db.execute("SELECT 1 FROM samples WHERE digest=? AND id<>? AND (learnable=1 OR dialogue_eligible=1)", (checksum, sample_id)).fetchone()
@@ -3424,8 +3468,8 @@ class AudioStore:
     def audio_failure(self, row, exc):
         if row is None or getattr(exc, "yuan_sample", None) == row["id"]:
             return
-        current = self.db.execute("SELECT read_failures,audio FROM samples WHERE id=?", (row["id"],)).fetchone()
-        if current is None:
+        current = self.db.execute("SELECT read_failures,audio,audio_status FROM samples WHERE id=?", (row["id"],)).fetchone()
+        if current is None or current["audio_status"] == "evicted":
             return
         invalid = isinstance(exc, InvalidAudio)
         attempts = current["read_failures"] + 1
@@ -3450,7 +3494,7 @@ class AudioStore:
 
     def recheck_audio(self, cancel=None):
         limit = self.policy.integer("storage", "recheck_batch", max(1, math.isqrt(os.cpu_count() or 1)), 1, max(1, os.cpu_count() or 1))
-        rows = self.db.execute("SELECT * FROM samples WHERE audio_status<>'ready' AND retry_at<=? ORDER BY retry_at,id LIMIT ?", (time.time(), limit)).fetchall()
+        rows = self.db.execute("SELECT * FROM samples WHERE audio_status IN ('retry','invalid') AND retry_at<=? ORDER BY retry_at,id LIMIT ?", (time.time(), limit)).fetchall()
         recovered = 0
         for row in rows:
             check(cancel)
@@ -3496,6 +3540,10 @@ class AudioStore:
                         with self.transaction():
                             self.db.execute("UPDATE samples SET file_sha256=?,audio_status='ready',retry_at=0,read_failures=0,audio_error='' WHERE audio=? AND digest=?",
                                             (file_sha256, target.relative_to(self.root).as_posix(), checksum))
+                if known:
+                    with self.transaction():
+                        self.db.execute("UPDATE samples SET audio_status='ready',retry_at=0,read_failures=0,audio_error='' WHERE audio=? AND digest=? AND audio_status='evicted' AND file_sha256=?",
+                                        (target.relative_to(self.root).as_posix(), checksum, file_sha256))
                 return {"audio": target.relative_to(self.root).as_posix(), "digest": checksum, "file_sha256": file_sha256,
                         "rate": rate, "count": len(waveform), "new_file": new_file}
             finally:
@@ -3613,44 +3661,67 @@ class AudioStore:
         return True
 
     def _revision_triggers(self):
-            def bump(key, condition="1"):
-                return ("INSERT INTO settings(key,value) SELECT '" + key + "','1' WHERE " + condition +
-                        " ON CONFLICT(key) DO UPDATE SET value=CAST(COALESCE(CAST(settings.value AS INTEGER),0)+1 AS TEXT);")
-            statements = []
-            fields = {
-                "samples": ("group_id", "role", "digest", "file_sha256", "rate", "count", "audio", "audio_status", "generated", "learnable", "dialogue_eligible", "metadata", "created"),
-                "turn_pairs": ("group_id", "user_sample", "assistant_sample", "source", "quality", "verified", "eligible", "evidence")
-            }
-            for table, columns in fields.items():
-                for action in ("INSERT", "UPDATE", "DELETE"):
-                    ref = "OLD" if action == "DELETE" else "NEW"
-                    changed = " WHEN " + " OR ".join("OLD." + col + " IS NOT NEW." + col for col in columns) if action == "UPDATE" else ""
-                    group = "SELECT split FROM groups WHERE id=" + ref + ".group_id"
-                    affected = "(" + group + ")"
-                    if action == "UPDATE":
-                        affected = "(SELECT split FROM groups WHERE id IN (OLD.group_id,NEW.group_id))"
-                    body = bump("data_revision")
-                    for split in ("train", "validation", "guard", "release"):
-                        body += bump("revision_" + split, "'" + split + "' IN " + affected)
-                    learnable = "1" if table == "turn_pairs" else (ref + ".generated=0 AND (" + ref + ".learnable=1 OR " + ref + ".dialogue_eligible=1)")
-                    if table == "samples" and action == "UPDATE":
-                        learnable = "((OLD.generated=0 AND (OLD.learnable=1 OR OLD.dialogue_eligible=1)) OR (NEW.generated=0 AND (NEW.learnable=1 OR NEW.dialogue_eligible=1)))"
-                    body += bump("training_addition_revision" if action == "INSERT" else "training_revision", "'train' IN " + affected + " AND " + learnable)
-                    body += bump("evaluation_revision", "EXISTS(SELECT 1 FROM groups WHERE id IN (" + ("OLD.group_id,NEW.group_id" if action == "UPDATE" else ref + ".group_id") + ") AND split<>'train')")
-                    statements.append("CREATE TRIGGER IF NOT EXISTS revision_" + table + "_" + action.lower() + " AFTER " + action + " ON " + table + changed + " BEGIN " + body + " END;")
-            for table in fields:
-                body = ""
+        def bump(key, condition="1"):
+            return ("INSERT INTO settings(key,value) SELECT '" + key + "','1' WHERE " + condition +
+                    " ON CONFLICT(key) DO UPDATE SET value=CAST(COALESCE(CAST(settings.value AS INTEGER),0)+1 AS TEXT);")
+        def changed(columns):
+            return " OR ".join("OLD." + col + " IS NOT NEW." + col for col in columns)
+        def group_splits(action):
+            ids = "OLD.group_id,NEW.group_id" if action == "UPDATE" else ("OLD" if action == "DELETE" else "NEW") + ".group_id"
+            return "(SELECT split FROM groups WHERE id IN (" + ids + "))"
+        fields = {
+            "samples": ("group_id", "role", "task", "digest", "file_sha256", "rate", "count", "generated", "learnable", "dialogue_eligible", "created"),
+            "turn_pairs": ("group_id", "user_sample", "assistant_sample", "source", "quality", "verified", "eligible")
+        }
+        statements = []
+        for table, columns in fields.items():
+            field = "metadata" if table == "samples" else "evidence"
+            evidence = "yuan_evidence(OLD." + field + ") IS NOT yuan_evidence(NEW." + field + ")"
+            supervision = "yuan_" + ("sample" if table == "samples" else "pair") + "_supervision"
+            training = "(" + changed(columns) + " OR " + supervision + "(OLD." + field + ") IS NOT " + supervision + "(NEW." + field + "))"
+            content = changed(columns) + " OR " + evidence
+            if table == "samples":
+                invalid = "(OLD.audio_status IS NOT NEW.audio_status AND NEW.audio_status='invalid')"
+                training = "(" + training + " OR " + invalid + ")"
+                content += " OR " + invalid
+            for action in ("INSERT", "UPDATE", "DELETE"):
+                ref = "OLD" if action == "DELETE" else "NEW"
+                affected = group_splits(action)
+                body = bump("data_revision")
                 for split in ("train", "validation", "guard", "release"):
-                    body += bump("revision_" + split, "EXISTS(SELECT 1 FROM groups WHERE id IN (OLD.group_id,NEW.group_id) AND split='" + split + "')")
-                statements.append("CREATE TRIGGER IF NOT EXISTS availability_" + table + "_update AFTER UPDATE OF retry_at ON " + table + " WHEN OLD.retry_at IS NOT NEW.retry_at BEGIN " + body + " END;")
-            body = bump("data_revision") + bump("training_revision", "OLD.split='train' OR NEW.split='train'") + bump("evaluation_revision")
+                    body += bump("revision_" + split, "'" + split + "' IN " + affected)
+                learnable = "1" if table == "turn_pairs" else ref + ".generated=0 AND (" + ref + ".learnable=1 OR " + ref + ".dialogue_eligible=1)"
+                if table == "samples" and action == "UPDATE":
+                    learnable = "((OLD.generated=0 AND (OLD.learnable=1 OR OLD.dialogue_eligible=1)) OR (NEW.generated=0 AND (NEW.learnable=1 OR NEW.dialogue_eligible=1)))"
+                condition = "'train' IN " + affected + " AND (" + learnable + ")"
+                if action == "UPDATE":
+                    condition += " AND " + training
+                body += bump("training_addition_revision" if action == "INSERT" else "training_revision", condition)
+                body += bump("evaluation_revision", "EXISTS(SELECT 1 FROM " + affected + " WHERE split<>'train')")
+                name = "revision_" + table + "_" + action.lower()
+                statements.append("DROP TRIGGER IF EXISTS " + name + ";")
+                statements.append("CREATE TRIGGER " + name + " AFTER " + action + " ON " + table + (" WHEN " + content if action == "UPDATE" else "") + " BEGIN " + body + " END;")
+            name = "metadata_" + table + "_update"
+            statements.append("DROP TRIGGER IF EXISTS " + name + ";")
+            statements.append("CREATE TRIGGER " + name + " AFTER UPDATE OF " + field + " ON " + table + " WHEN OLD." + field + " IS NOT NEW." + field + " BEGIN " + bump("metadata_revision") + " END;")
+            availability = ("retry_at", "audio", "audio_status") if table == "samples" else ("retry_at",)
+            affected = group_splits("UPDATE")
+            body = bump("availability_revision") + bump("data_revision")
             for split in ("train", "validation", "guard", "release"):
-                body += bump("revision_" + split, "OLD.split='" + split + "' OR NEW.split='" + split + "'")
-            statements.append("CREATE TRIGGER IF NOT EXISTS revision_groups_update AFTER UPDATE OF split,source_key,origin ON groups WHEN OLD.split IS NOT NEW.split OR OLD.source_key IS NOT NEW.source_key OR OLD.origin IS NOT NEW.origin BEGIN " + body + " END;")
-            self.db.executescript("\n".join(statements))
+                body += bump("revision_" + split, "'" + split + "' IN " + affected)
+            body += bump("evaluation_revision", "EXISTS(SELECT 1 FROM " + affected + " WHERE split<>'train')")
+            name = "availability_" + table + "_update"
+            statements.append("DROP TRIGGER IF EXISTS " + name + ";")
+            statements.append("CREATE TRIGGER " + name + " AFTER UPDATE OF " + ",".join(availability) + " ON " + table + " WHEN " + changed(availability) + " BEGIN " + body + " END;")
+        body = bump("data_revision") + bump("training_revision", "OLD.split='train' OR NEW.split='train'") + bump("evaluation_revision")
+        for split in ("train", "validation", "guard", "release"):
+            body += bump("revision_" + split, "OLD.split='" + split + "' OR NEW.split='" + split + "'")
+        statements.append("DROP TRIGGER IF EXISTS revision_groups_update;")
+        statements.append("CREATE TRIGGER revision_groups_update AFTER UPDATE OF split,source_key,origin ON groups WHEN " + changed(("split", "source_key", "origin")) + " BEGIN " + body + " END;")
+        self.db.executescript("BEGIN IMMEDIATE;\n" + "\n".join(statements) + "\nCOMMIT;")
 
     def revisions(self):
-        keys = ("data_revision", "training_revision", "training_addition_revision", "evaluation_revision", "revision_train", "revision_validation", "revision_guard", "revision_release")
+        keys = ("data_revision", "training_revision", "training_addition_revision", "evaluation_revision", "availability_revision", "metadata_revision", "revision_train", "revision_validation", "revision_guard", "revision_release")
         rows = dict(self.db.execute("SELECT key,value FROM settings WHERE key IN (" + ",".join("?" for _ in keys) + ")", keys).fetchall())
         return {key: json.loads(rows[key]) if key in rows else None for key in keys}
 
@@ -4848,7 +4919,9 @@ class SpeechVerifier:
 
     @staticmethod
     def row_signature(row):
-        return payload_digest({key: row[key] for key in ("id", "group_id", "split", "source_key", "digest", "file_sha256", "audio_status", "dialogue_eligible", "generated", "metadata")})
+        values = {key: row[key] for key in ("id", "group_id", "split", "source_key", "digest", "file_sha256", "audio_status", "dialogue_eligible", "generated")}
+        values["metadata"] = AudioStore.evidence_metadata(json.loads(row["metadata"]))
+        return payload_digest(values)
 
     def quality(self, values):
         np = self.model.np
@@ -5006,18 +5079,35 @@ class SpeechVerifier:
 
     def assess(self, values, language, answers, generation, cancel):
         check(cancel)
-        if not self.ready(cancel) or not answers:
-            return {"passed": False, "semantic_passed": False, "reason": "semantic_evidence_missing", "scope": "annotated_answer_set"}
+        ready = self.ready(cancel)
+        base = {"scope": "annotated_answer_set", "semantic_method": "exact_annotated_answer_match", "recognizer_ready": ready,
+                "answer_evidence_ready": bool(answers), "recognition_scope": "independent_calibration_only", "open_dialogue_verified": False}
+        natural = generation.get("complete") is True and generation.get("natural") is True and generation.get("limited") is False
+        if not ready or not answers:
+            return {**base, "passed": False, "semantic_passed": False, "quality_passed": False, "natural": natural,
+                    "semantic_outcome": "unassessed", "assessment_status": "insufficient_evidence", "reason": "semantic_evidence_missing"}
         transcript = self.normalize_answer(self.transcribe(values))
         answers = tuple(self.normalize_answer(answer) for answer in answers)
+        if not transcript:
+            return {**base, "passed": False, "semantic_passed": False, "quality_passed": False, "natural": natural,
+                    "semantic_outcome": "unassessed", "assessment_status": "insufficient_evidence", "reason": "transcription_unavailable"}
         semantic = transcript in answers
         quality = self.quality(values)
         bounds = self.certificate.get("bounds", {}).get(language, {})
-        quality_ok = quality is not None and bool(bounds) and all(bounds[key][0] <= value <= bounds[key][1] for key, value in quality.items())
-        natural = generation.get("complete") is True and generation.get("natural") is True and generation.get("limited") is False
-        return {"passed": bool(semantic and quality_ok and natural), "semantic_passed": semantic, "quality_passed": bool(quality_ok),
+        quality_ok = quality is not None and isinstance(bounds, dict) and bool(bounds)
+        if quality_ok:
+            for key, value in quality.items():
+                bound = bounds.get(key)
+                if (not isinstance(bound, (list, tuple)) or len(bound) != 2
+                        or any(isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) for number in bound)
+                        or not bound[0] <= value <= bound[1]):
+                    quality_ok = False
+                    break
+        reasons = ([] if semantic else ["annotated_answer_not_matched"]) + ([] if quality_ok else ["audio_quality_not_verified"]) + ([] if natural else ["ending_not_verified"])
+        return {**base, "passed": bool(semantic and quality_ok and natural), "semantic_passed": semantic, "quality_passed": bool(quality_ok),
                 "natural": natural, "transcript": transcript, "answer_sha256": payload_digest(list(answers)), "quality": quality,
-                "error": min(self.error_rate(answer, transcript) for answer in answers), "scope": "annotated_answer_set"}
+                "error": min(self.error_rate(answer, transcript) for answer in answers), "semantic_outcome": "matched" if semantic else "not_matched",
+                "assessment_status": "passed" if not reasons else "not_verified", "reasons": reasons}
 
     def snapshot(self, directory, cancel):
         if not self.ready(cancel):
@@ -5711,6 +5801,51 @@ class NativeAudio:
         network.load_state_dict(weights, strict=True)
         return network.to(self.device, dtype=self.dtype).eval().requires_grad_(False)
 
+    @staticmethod
+    def _checkpoint_failure(exc):
+        current, seen = exc, set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if (isinstance(current, (Cancelled, MemoryError))
+                    or isinstance(current, OSError) and not isinstance(current, FileNotFoundError)
+                    or isinstance(current, YuanFault) and current.category in ("resource", "storage", "timeout")
+                    or isinstance(current, RuntimeError) and "out of memory" in str(current).casefold()):
+                raise exc
+            current = current.__cause__ or current.__context__
+        return concise_error(exc)
+
+    def _training_manifest(self, manifest):
+        if (not isinstance(manifest, dict) or manifest.get("identity") != self.identity()
+                or not is_digest(manifest.get("sha256")) or not isinstance(manifest.get("file"), str)
+                or Path(manifest["file"]).name != manifest["file"] or not manifest["file"].endswith(".pt")
+                or any(type(manifest.get(key)) is not int or manifest[key] < 0 for key in ("steps", "accepted"))):
+            raise YuanError("模型检查点记录无效 / Invalid model checkpoint record")
+        return manifest
+
+    def _quarantine_training(self, cancel):
+        directory = safe_path(self.state, "learning")
+        protected = set()
+        for name in ("release.json", "pending-review.json", "previous-release.json"):
+            pointer = read_json(directory / name)
+            try:
+                evaluation = read_json(safe_path(directory, pointer["evaluation_file"]))
+                protected.add(evaluation["model"]["file"])
+            except (KeyError, TypeError, YuanError):
+                continue
+        files = [path for pattern in ("model-*.pt", "model-*.json", "active.json", "previous.json") for path in directory.glob(pattern)
+                 if path.is_file() and not path.is_symlink() and path.name not in protected
+                 and not (path.suffix == ".json" and path.with_suffix(".pt").name in protected)]
+        if not files:
+            return
+        destination = safe_path(directory, "recovery/" + uuid.uuid4().hex)
+        destination.mkdir(parents=True, exist_ok=False)
+        for path in files:
+            check(cancel)
+            os.replace(path, destination / path.name)
+        sync_dir(destination)
+        sync_dir(directory)
+        StorageBudget(self.state).reclaim_recovery(cancel)
+
     def restore(self):
         directory = safe_path(self.state, "learning")
         directory.mkdir(parents=True, exist_ok=True)
@@ -5718,34 +5853,48 @@ class NativeAudio:
         if self._resume_training_activation(cancel=self.cancel):
             return
         failures = []
-        for name in ("active.json", "previous.json"):
-            path = directory / name
+        revisions = {}
+        if safe_path(self.state, "memory/memory.sqlite3").is_file():
+            store = AudioStore(self.state, recover=False)
+            try:
+                revisions = store.revisions()
+            finally:
+                store.close()
+        paths = [directory / name for name in ("active.json", "previous.json")]
+        paths.extend(sorted(directory.glob("model-*.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True))
+        for path in paths:
+            check(self.cancel)
             if not path.exists():
                 continue
             try:
-                manifest = checked_json(path)
+                manifest = self._training_manifest(checked_json(path))
+                if path.name not in ("active.json", "previous.json"):
+                    provenance = manifest.get("training_provenance", {})
+                    if (not isinstance(provenance, dict) or provenance.get("owner") != APP_NAME
+                            or provenance.get("external_model") is not False or provenance.get("text_to_speech") is not False
+                            or provenance.get("build_sha256") != build_digest() or path.with_suffix(".pt").name != manifest["file"]):
+                        raise YuanError("备用检查点缺少当前版本来源证明 / Fallback checkpoint lacks current-build provenance")
+                    metrics = manifest.get("metrics", {})
+                    if not isinstance(metrics, dict) or any(key in metrics and metrics[key] != revisions.get(key) for key in ("training_revision", "evaluation_revision")):
+                        raise YuanError("备用检查点依赖的数据已经修订 / Fallback checkpoint depends on revised data")
                 network = self._load_network(manifest, self.cancel)
-                steps, accepted = manifest.get("steps", 0), manifest.get("accepted", 0)
-                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (steps, accepted)):
-                    raise YuanError("模型训练计数无效 / Invalid model training counters")
-                if name != "active.json":
-                    current = directory / "active.json"
-                    atomic_json(current, manifest, self.cancel)
-                    self.emit("notice", key="model_recovered", file=manifest["file"], failures=failures)
-                self.network = network
-                self.steps, self.accepted = steps, accepted
-                self.acoustic_ready = manifest.get("acoustic_ready") is True
-                self.dialogue_trained = manifest.get("dialogue_trained") is True
-                self.active_digest = manifest["sha256"]
-                self.training_manifest = manifest
-                return
             except Cancelled:
                 raise
             except Exception as exc:
-                failures.append(concise_error(exc))
-                self.emit("notice", key="checkpoint_failure", file=name, reason=failures[-1])
+                failures.append(self._checkpoint_failure(exc))
+                self.emit("notice", key="checkpoint_failure", file=path.name, reason=failures[-1])
+                continue
+            check(self.cancel)
+            self._publish_training(manifest, None, network, self.cancel)
+            if path.name != "active.json":
+                self.emit("notice", key="model_recovered", file=manifest["file"], failures=failures)
+            return
         if failures or any(directory.glob("model-*.pt")):
-            raise YuanError("没有可安全恢复的模型，未重置或删除已有权重 / No model can be safely restored; existing weights were not reset or deleted")
+            self._quarantine_training(self.cancel)
+            self.emit("notice", key="native_bootstrap", recovery="no_usable_checkpoint", failures=failures, conversation_verified=False)
+        self.steps = self.accepted = 0
+        self.acoustic_ready = self.dialogue_trained = False
+        self.active_digest = None
         if self.owned_root is None:
             self._persist(self.network, {}, self.cancel, increment=False, task=None)
 
@@ -5839,17 +5988,50 @@ class NativeAudio:
                 return False
             store = AudioStore(self.state, recover=False)
         try:
-            record = store.setting("pending_training_activation")
-            if not record:
+            check(cancel)
+            row = store.db.execute("SELECT value FROM settings WHERE key='pending_training_activation'").fetchone()
+            if row is None:
                 return False
-            if not isinstance(record, dict) or not isinstance(record.get("manifest"), dict):
-                raise YuanError("模型提交记录无效，已保留原文件 / Invalid model commit record; originals retained")
-            manifest = record["manifest"]
-            network = self._load_network(manifest, cancel)
-            self._publish_training(manifest, record.get("previous"), network, cancel)
+            raw = row["value"]
+            try:
+                record = json.loads(raw, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+                if record is None:
+                    return False
+                if not isinstance(record, dict):
+                    raise YuanError("模型提交记录无效 / Invalid model commit record")
+                manifest = self._training_manifest(record.get("manifest"))
+                previous = record.get("previous")
+                if previous is not None:
+                    self._training_manifest(previous)
+                metrics = manifest.get("metrics", {})
+                if not isinstance(metrics, dict) or any(key in metrics and metrics[key] != store.setting(key) for key in ("training_revision", "evaluation_revision")):
+                    raise YuanError("待提交模型依赖的数据已经修订 / Pending model depends on revised data")
+                network = self._load_network(manifest, cancel)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                reason = self._checkpoint_failure(exc)
+                check(cancel)
+                with store.transaction():
+                    current = store.db.execute("SELECT value FROM settings WHERE key='pending_training_activation'").fetchone()
+                    if current is None or current["value"] != raw:
+                        raise YuanError("恢复期间模型提交记录发生变化 / Model commit record changed during recovery")
+                    store.set_setting("rejected_training_activation", {"sha256": hashlib.sha256(raw.encode()).hexdigest(), "reason": reason, "created": time.time()})
+                    store.set_setting("pending_training_activation", None)
+                self.emit("notice", key="checkpoint_failure", file="pending_training_activation", reason=reason)
+                return False
+            check(cancel)
             with store.transaction():
-                if store.setting("pending_training_activation") != record:
+                current = store.db.execute("SELECT value FROM settings WHERE key='pending_training_activation'").fetchone()
+                if current is None or current["value"] != raw:
                     raise YuanError("恢复期间模型提交记录发生变化 / Model commit record changed during recovery")
+                if any(key in metrics and metrics[key] != store.setting(key) for key in ("training_revision", "evaluation_revision")):
+                    reason = "恢复期间训练或评估数据已修订 / Training or evaluation data changed during recovery"
+                    store.set_setting("rejected_training_activation", {"sha256": hashlib.sha256(raw.encode()).hexdigest(), "reason": reason, "created": time.time()})
+                    store.set_setting("pending_training_activation", None)
+                    self.emit("notice", key="checkpoint_failure", file="pending_training_activation", reason=reason)
+                    return False
+                self._publish_training(manifest, previous, network, cancel)
                 store.set_setting("pending_training_activation", None)
             self.emit("notice", key="promotion_recovered", model=self.active_digest, serving_model=self.serving_digest)
             return True
@@ -5858,6 +6040,7 @@ class NativeAudio:
                 store.close()
 
     def _prune_models(self):
+        StorageBudget(self.state).reclaim_recovery(self.cancel)
         directory = safe_path(self.state, "learning")
         protected = set()
         for name in ("active.json", "previous.json"):
@@ -7180,6 +7363,8 @@ class AudioLearner:
         answers = SpeechVerifier.answers(evidence)
         if verifier is not None and answers and verifier.ready(cancel):
             assessment = verifier.assess(generated, evidence.get("language"), answers, record, cancel)
+            if assessment.get("assessment_status") == "insufficient_evidence":
+                raise IneligibleSample("生成结果缺少可判定的语义证据 / Generated output lacks assessable semantic evidence")
             score = assessment["error"] + float(not assessment.get("quality_passed")) + float(not assessment.get("natural"))
             record.update(task_assessment=assessment, semantic_acceptance=assessment.get("passed") is True, evaluation_kind="annotated_answer_task", reconstruction_diagnostic=distance + duration_error + ending_penalty)
         return score, record
@@ -7672,10 +7857,6 @@ class DatasetImporter:
                         raise YuanError("同一数据集文件不能更换录音来源身份 / A dataset file cannot change its recording identity")
                     changed = self.store.setting(key) not in (None, checksum)
                     if changed:
-                        prior_pairs = self.store.db.execute("SELECT id,evidence FROM turn_pairs WHERE group_id=?", (group,)).fetchall()
-                        for prior in prior_pairs:
-                            if json.loads(prior["evidence"]).get("annotation_id") == old_manifest.get("annotation_id", data["annotation_id"]):
-                                self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE id=?", (prior["id"],))
                         kind = ("content" if old_manifest.get("training_sha256") != fingerprints["training_sha256"] else
                                 "evaluation" if old_manifest.get("evaluation_sha256") != fingerprints["evaluation_sha256"] else "metadata")
                         self.store.revise(group, kind)
@@ -7746,6 +7927,11 @@ class DatasetImporter:
                                     specification["semantic"] = copy.deepcopy(controls[dimension]["semantic"])
                             evidence["contrasts"] = contrasts
                             self.store.add_pair(group, user["id"], sample, "annotated_human_audio", verified=True, evidence=evidence)
+                    retained_pairs = {(recorded[turn["reply_to"]][1]["id"], recorded[turn["id"]][1]["id"]) for turn in data["turns"] if turn["role"] == "assistant"}
+                    for prior in self.store.db.execute("SELECT id,user_sample,assistant_sample,evidence FROM turn_pairs WHERE group_id=?", (group,)).fetchall():
+                        if ((prior["user_sample"], prior["assistant_sample"]) not in retained_pairs
+                                and json.loads(prior["evidence"]).get("annotation_id") in (old_manifest.get("annotation_id"), data["annotation_id"])):
+                            self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE id=?", (prior["id"],))
                     retained = {sample[1]["id"] for sample in recorded.values()}
                     previous_rows = self.store.db.execute("SELECT id,metadata FROM samples WHERE group_id=?", (group,)).fetchall()
                     for previous in previous_rows:
@@ -10292,15 +10478,70 @@ class AnnotatedAcquisition:
                                "retry_at": min((item["retry_at"] for item in blocked), default=None), "coverage_guaranteed": False})
         return summary
 
-    def discover(self, cancel):
+    @staticmethod
+    def task_identity(task):
+        return payload_digest([task.get("language"), task.get("split"), task.get("scenario")])
+
+    def target_coverage(self, task):
+        report = AcceptancePolicy(self.model).coverage(self.store, self.model, splits=(task["split"],), fresh=True)
+        cell = next((cell for cell in report["cells"] if cell["language"] == task["language"] and cell["scenario"] == task["scenario"]), {})
+        return {"sources": cell.get("have", 0), "reference_sources": cell.get("reference_sources", 0),
+                "dialogue_sources": cell.get("dialogue_reference_sources", 0)}
+
+    @staticmethod
+    def target_gain(task, before, after):
+        needs = {"sources": "missing_sources", "reference_sources": "missing_reference_sources", "dialogue_sources": "missing_dialogue_sources"}
+        return {key: max(0, after.get(key, 0) - before.get(key, 0)) for key, need in needs.items() if task.get(need, 0) > 0}
+
+    def matches_task(self, manifest, task):
+        split, scenario = task.get("split"), task.get("scenario")
+        if manifest.get("language") != task.get("language") or split not in ("train", "validation", "guard", "release"):
+            return False
+        if manifest.get("split") not in (None, split):
+            return False
+        existing = self.store.db.execute("SELECT DISTINCT split FROM groups WHERE source_key=?", (manifest["recording_id"],)).fetchall()
+        if any(row["split"] != split for row in existing):
+            return False
+        turns = {turn["id"]: turn for turn in manifest["turns"]}
+        for turn in manifest["turns"]:
+            if turn["role"] != "assistant" or turn.get("response_verified") is not True:
+                continue
+            if split == "train":
+                return True
+            user = turns.get(turn.get("reply_to"), {})
+            if (scenario not in turn.get("scenarios", manifest.get("scenarios", [])) or scenario not in turn.get("contrasts", {})
+                    or turn.get("utterance_final") is not True or user.get("utterance_final") is not True):
+                continue
+            history = [value for value in manifest["turns"] if value["id"] != user.get("id") and value["start_seconds"] < user["start_seconds"]]
+            if scenario == "history" and not history:
+                continue
+            if task.get("missing_reference_sources", 0) > 0 and not all(turn.get("reference_checks", {}).get(key) is True for key in AcceptancePolicy.reference_checks):
+                continue
+            if task.get("missing_dialogue_sources", 0) > 0:
+                evidence = {**turn, "method": "human_audio_annotation", "recording_id": manifest["recording_id"],
+                            "scenarios": turn.get("scenarios", manifest.get("scenarios", []))}
+                if not {"user", "assistant"}.issubset({value["role"] for value in history}) or not CapabilityEvidence.dialogue_reference(evidence):
+                    continue
+            return True
+        return False
+
+    def discover(self, cancel, task=None):
         self.network.cancel = cancel
+        task = task or {}
+        identifier = self.task_identity(task)
         interval = self.model.policy.number("network", "annotation_catalog_seconds", 3600.0, 1.0, 86400.0)
-        if self.catalog.get("created", 0) + interval > time.time() and isinstance(self.catalog.get("repositories"), list):
+        entries = self.catalog.get("tasks", {})
+        entry = entries.get(identifier, {})
+        if entry.get("created", 0) + interval > time.time() and isinstance(self.catalog.get("repositories"), list):
             return self.catalog["repositories"]
         limit = self.model.policy.integer("network", "annotation_catalog_entries", max(1, available_resources(__import__("psutil"))["cpus"] * 4), 1, 256)
-        queries = ({"search": "annotated audio dialogue"}, {"search": "recorded conversation"}, {"search": "speech dialogue"}, {"filter": "yuan-paired-audio-v1"}, {"search": "yuan-paired-audio"})
-        cursor = int(self.store.setting("annotation_query_cursor", 0)) % len(queries)
-        self.store.set_setting("annotation_query_cursor", cursor + 1)
+        language = {"中文": "Chinese", "English": "English"}.get(task.get("language"), "")
+        queries = [{"search": " ".join(value for value in (language, "annotated audio dialogue") if value)},
+                   {"search": " ".join(value for value in (language, "recorded conversation") if value)},
+                   {"search": "speech dialogue"}, {"filter": "yuan-paired-audio-v1"}, {"search": "yuan-paired-audio"}]
+        cursor_key = "annotation_query_cursor_" + identifier
+        cursor = int(self.store.setting(cursor_key, 0)) % len(queries)
+        self.store.set_setting(cursor_key, cursor + 1)
         url = "https://huggingface.co/api/datasets?" + urllib.parse.urlencode({**queries[cursor], "limit": limit})
         rows = self.network.json(url)
         if not isinstance(rows, list):
@@ -10311,7 +10552,8 @@ class AnnotatedAcquisition:
             name = row.get("id", "") if isinstance(row, dict) else ""
             if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", name) and not row.get("gated") and not row.get("disabled"):
                 repositories.append(name)
-        self.catalog = {"created": time.time(), "repositories": sorted(set(repositories))}
+        entries[identifier] = {"created": time.time(), "query": queries[cursor]}
+        self.catalog = {"repositories": sorted(set(repositories)), "tasks": entries}
         atomic_json(self.root / "catalog.json", self.catalog, cancel)
         return self.catalog["repositories"]
 
@@ -10386,9 +10628,9 @@ class AnnotatedAcquisition:
             self.store.set_setting(key, {"revision": revision, "licenses": licenses, "created": time.time()})
         return revision, catalog
 
-    def import_export(self, repository, revision, item, catalog, root, cancel):
+    def import_export(self, repository, revision, item, catalog, root, cancel, task=None):
         path = self.fetch(repository, revision, item, root, cancel)
-        cursor_key = "annotation_cursor_" + payload_digest([repository, revision, item])
+        cursor_key = "annotation_cursor_" + payload_digest([repository, revision, item, self.task_identity(task) if task else None])
         position = int(self.store.setting(cursor_key, 0))
         for index, raw in enumerate(RecordedDialogueAdapter.records(path, cancel)):
             if index < position:
@@ -10400,6 +10642,12 @@ class AnnotatedAcquisition:
                     raise IneligibleSample("标注清单授权不符合要求 / Annotation manifest license is unsuitable")
                 DatasetImporter.validate_annotations(manifest)
                 DatasetImporter.validate_semantic(manifest)
+                if task is not None:
+                    if not self.matches_task(manifest, task):
+                        self.store.set_setting(cursor_key, index + 1)
+                        continue
+                    if manifest.get("split") is None:
+                        manifest["split"] = task["split"]
             except (YuanError, ValueError, TypeError, KeyError) as exc:
                 self.store.set_setting(cursor_key, index + 1)
                 self.emit("network", key="dataset_rejected", repository=repository, file=item["name"], record=index, reason=concise_error(exc))
@@ -10436,37 +10684,55 @@ class AnnotatedAcquisition:
 
     def acquire(self, task, cancel):
         self.network.cancel = cancel
-        candidates = self.discover(cancel)
+        before = self.target_coverage(task)
+        result = {"imported": 0, "before": before, "after": before, "gained": {}, "progressed": False}
+        candidates = self.discover(cancel, task)
+        requested = task.get("repositories")
+        if isinstance(requested, list) and requested:
+            candidates = [repository for repository in candidates if repository in requested]
         if not candidates:
-            return False
-        cursor = int(self.store.setting("annotation_repository_cursor", 0)) % len(candidates)
+            return result
+        identifier = self.task_identity(task)
+        cursor_key = "annotation_repository_cursor_" + identifier
+        cursor = int(self.store.setting(cursor_key, 0)) % len(candidates)
         candidates = candidates[cursor:] + candidates[:cursor]
         for repository in candidates:
             check(cancel)
-            self.store.set_setting("annotation_repository_cursor", cursor + 1)
+            self.store.set_setting(cursor_key, cursor + 1)
             cursor += 1
-            key = "annotation_repository_state_" + payload_digest(repository)
+            key = "annotation_repository_state_" + payload_digest([identifier, repository])
             state = self.store.setting(key, {})
             if state.get("retry_at", 0) > time.time():
                 continue
+            imported = 0
             try:
                 revision, catalog = self.repository(repository, cancel)
                 root = safe_path(self.root, payload_digest(repository) + "/" + revision)
                 root.mkdir(parents=True, exist_ok=True)
                 limit = self.model.policy.integer("network", "annotation_manifest_bytes", 16 * 1024 * 1024, 1024,
                                                   max(1024, available_resources(__import__("psutil"))["memory"] // 8))
-                for name, item in sorted(catalog.items()):
+                hints = ({"中文": ("zh", "chinese", "mandarin"), "English": ("en", "english")}.get(task["language"], ())
+                         + ((task["scenario"],) if task.get("scenario") else ()) + ("annotation", "dialogue", "conversation"))
+                items = sorted(catalog.items(), key=lambda pair: (-sum(word in Path(pair[0]).stem.casefold() for word in hints), pair[0]))
+                for name, item in items:
                     if Path(name).suffix.lower() not in (".json", ".jsonl") or item["size"] > limit:
                         continue
                     check(cancel)
                     try:
-                        if self.import_export(repository, revision, item, catalog, root, cancel):
+                        if self.import_export(repository, revision, item, catalog, root, cancel, task=task):
+                            imported += 1
+                            result["imported"] += 1
+                            result["after"] = self.target_coverage(task)
+                            result["gained"] = self.target_gain(task, before, result["after"])
+                            result["progressed"] = any(result["gained"].values())
                             self.store.set_setting(key, {"state": "active", "revision": revision})
-                            return True
+                            if result["progressed"]:
+                                return result
                     except (InvalidDownload, IneligibleSample, ValueError, TypeError, KeyError) as exc:
                         self.emit("network", key="dataset_rejected", repository=repository, file=name, reason=concise_error(exc))
                 delay = self.model.policy.number("network", "annotation_catalog_seconds", 3600.0, 1.0, 86400.0)
-                self.store.set_setting(key, {"state": "exhausted", "revision": revision, "retry_at": time.time() + delay})
+                self.store.set_setting(key, {"state": "active" if imported else "exhausted", "revision": revision,
+                                             "retry_at": 0 if imported else time.time() + delay})
             except Cancelled:
                 raise
             except (OSError, YuanError, ValueError, TypeError, KeyError) as exc:
@@ -10474,7 +10740,10 @@ class AnnotatedAcquisition:
                 self.store.set_setting(key, {"state": "retry", "failures": failures, "reason": concise_error(exc),
                                              "retry_at": time.time() + self.store.retry_delay(failures)})
                 self.emit("network", key="source_unavailable", repository=repository, reason=concise_error(exc))
-        return False
+        result["after"] = self.target_coverage(task)
+        result["gained"] = self.target_gain(task, before, result["after"])
+        result["progressed"] = any(result["gained"].values())
+        return result
 
     def step(self, plan, cancel):
         self.sync(plan)
@@ -10484,12 +10753,15 @@ class AnnotatedAcquisition:
         task = json.loads(row["task"])
         self.store.db.execute("UPDATE acquisition_tasks SET status='running',attempts=attempts+1,updated=? WHERE id=?", (time.time(), row["id"]))
         self.store.commit()
-        worked, state, reason = False, "needs_evidence", "未发现符合授权与标注要求的公开资源 / No public resource satisfies the license and annotation requirements"
+        worked, state, reason = False, "needs_evidence", "未发现补齐当前缺口的授权标注资源 / No licensed annotated resource fills the current gap"
+        result = {"imported": 0, "gained": {}, "progressed": False}
         try:
-            worked = self.acquire(task, cancel)
+            result = self.acquire(task, cancel)
+            worked = result["progressed"]
             if worked:
-                state = "pending"
-                reason = "资源已导入，完成状态由实际覆盖重新计算 / Resource imported; completion is recalculated from actual coverage"
+                state, reason = "pending", "目标独立来源覆盖增加，完成状态由实际覆盖重新计算 / Target independent-source coverage increased; completion is recalculated from actual coverage"
+            elif result["imported"]:
+                reason = "已导入有效数据，但未增加当前任务的独立覆盖 / Valid data imported without increasing independent coverage for this task"
         except Cancelled:
             self.store.db.execute("UPDATE acquisition_tasks SET status='pending',retry_at=0 WHERE id=?", (row["id"],))
             self.store.commit()
@@ -10502,8 +10774,11 @@ class AnnotatedAcquisition:
         self.store.commit()
         report = AcceptancePolicy(self.model).coverage(self.store, self.model, fresh=True)
         self.sync(AcceptancePolicy(self.model).acquisition_plan(report))
+        current = self.store.db.execute("SELECT status FROM acquisition_tasks WHERE id=?", (row["id"],)).fetchone()
+        state = current["status"] if current is not None else state
         status = self.store.setting("source_coverage_state", {})
-        self.emit("data_acquisition", key="data_sources_exhausted" if status.get("blocked") else "data_plan", task=task, state=state, worked=worked, reason=reason)
+        self.emit("data_acquisition", key="data_sources_exhausted" if status.get("blocked") else "data_plan", task=task, state=state,
+                  worked=worked, imported=result["imported"], gained=result["gained"], reason=reason)
         return worked
 
 class PublishedSpeech:
