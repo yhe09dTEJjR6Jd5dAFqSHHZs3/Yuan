@@ -2967,8 +2967,13 @@ class StorageBudget:
         with store.transaction():
             store.db.execute("DELETE FROM memories WHERE model_key<>?", (key,))
             store.db.execute("DELETE FROM memory_progress WHERE model_key<>?", (key,))
+        eligible = ("g.retention='training_cache' AND g.split='train' AND s.generated=0 AND s.audio_status IN ('ready','evicted') "
+                    "AND (s.visits>0 OR (s.learnable=0 AND COALESCE(json_extract(s.metadata,'$.transcript_verified'),0)=0 AND EXISTS(SELECT 1 FROM samples learned WHERE learned.audio=s.audio AND learned.generated=0 AND learned.visits>0)) "
+                    "OR EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.visits>0)) "
+                    "AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE p.group_id=g.id AND p.verified=1) "
+                    "AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.eligible=1 AND p.visits=0 AND " + store.training_pair_filter + ")")
         with store.audio_files(cancel):
-            rows = store.db.execute("SELECT s.* FROM samples s JOIN groups g ON g.id=s.group_id WHERE g.retention='training_cache' AND g.split='train' AND s.generated=0 AND s.audio_status IN ('ready','evicted') AND (s.visits>0 OR EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.visits>0)) AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE p.group_id=g.id AND p.verified=1) AND NOT EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.eligible=1 AND p.visits=0 AND " + store.training_pair_filter + ") ORDER BY s.visits DESC,s.created").fetchall()
+            rows = store.db.execute("SELECT s.audio FROM samples s JOIN groups g ON g.id=s.group_id WHERE " + eligible + " GROUP BY s.audio ORDER BY max(s.visits) DESC,min(s.created)").fetchall()
             for row in rows:
                 check(cancel)
                 if self.snapshot(required)["ready"]:
@@ -2977,15 +2982,16 @@ class StorageBudget:
                 if path.is_symlink():
                     continue
                 with store.transaction():
-                    if store.db.execute("SELECT 1 FROM samples WHERE audio=? AND id<>? AND audio_status<>'evicted'", (row["audio"], row["id"])).fetchone():
+                    protected = store.db.execute("SELECT 1 FROM samples s JOIN groups g ON g.id=s.group_id WHERE s.audio=? AND s.audio_status<>'evicted' AND NOT (" + eligible + ") LIMIT 1", (row["audio"],)).fetchone()
+                    if protected:
                         continue
-                    store.db.execute("UPDATE samples SET audio_status='evicted',retry_at=0,read_failures=0,audio_error='' WHERE id=?", (row["id"],))
-                try:
-                    size = path.stat().st_size
-                    path.unlink()
-                    removed += size
-                except FileNotFoundError:
-                    pass
+                    try:
+                        size = path.stat().st_size
+                    except FileNotFoundError:
+                        size = 0
+                    store.db.execute("UPDATE samples SET audio_status='evicted',retry_at=0,read_failures=0,audio_error='' WHERE audio=? AND audio_status<>'evicted'", (row["audio"],))
+                    path.unlink(missing_ok=True)
+                removed += size
                 store.integrity_cache.pop(row["audio"], None)
         if removed:
             sync_dir(store.audio)
@@ -3037,11 +3043,15 @@ class AudioStore:
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS groups(id TEXT PRIMARY KEY, split TEXT NOT NULL CHECK(split IN ('train','validation','guard','release')), origin TEXT NOT NULL, created REAL NOT NULL, source_key TEXT NOT NULL, retention TEXT NOT NULL DEFAULT 'protected' CHECK(retention IN ('protected','training_cache')), provenance TEXT NOT NULL DEFAULT '{}');
         CREATE INDEX IF NOT EXISTS group_source ON groups(source_key,split);
+        CREATE TABLE IF NOT EXISTS evaluation_group_revisions(group_id TEXT PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,revision INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, prompt TEXT NOT NULL, language TEXT NOT NULL, started REAL NOT NULL, ended REAL);
         CREATE TABLE IF NOT EXISTS samples(id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), role TEXT NOT NULL, task TEXT NOT NULL CHECK(task IN ('acoustic','generated_reply')), audio TEXT NOT NULL, seconds REAL NOT NULL, rate INTEGER NOT NULL, count INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, visits INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, digest TEXT NOT NULL, file_sha256 TEXT NOT NULL, audio_status TEXT NOT NULL DEFAULT 'ready' CHECK(audio_status IN ('ready','retry','invalid','evicted')), retry_at REAL NOT NULL DEFAULT 0, read_failures INTEGER NOT NULL DEFAULT 0, audio_error TEXT NOT NULL DEFAULT '', generated INTEGER NOT NULL CHECK(generated IN (0,1)), learnable INTEGER NOT NULL CHECK(learnable IN (0,1)), dialogue_eligible INTEGER NOT NULL CHECK(dialogue_eligible IN (0,1)), memory_eligible INTEGER NOT NULL DEFAULT 0 CHECK(memory_eligible IN (0,1)), memory_exclusion TEXT NOT NULL DEFAULT '', exclusion TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}');
         CREATE INDEX IF NOT EXISTS sample_group ON samples(group_id, created);
         CREATE INDEX IF NOT EXISTS sample_digest ON samples(digest);
-        CREATE UNIQUE INDEX IF NOT EXISTS eligible_digest ON samples(digest) WHERE learnable=1 OR dialogue_eligible=1;
+        DROP INDEX IF EXISTS eligible_digest;
+        CREATE UNIQUE INDEX IF NOT EXISTS acoustic_digest ON samples(digest) WHERE learnable=1;
+        CREATE TABLE IF NOT EXISTS audio_partitions(digest TEXT PRIMARY KEY, source_key TEXT NOT NULL, split TEXT NOT NULL CHECK(split IN ('train','validation','guard','release')));
+        INSERT OR IGNORE INTO audio_partitions(digest,source_key,split) SELECT s.digest,g.source_key,g.split FROM samples s JOIN groups g ON g.id=s.group_id WHERE s.generated=0 AND (s.learnable=1 OR s.dialogue_eligible=1) ORDER BY s.created,s.id;
         CREATE INDEX IF NOT EXISTS sample_learning ON samples(task,learnable,visits,created);
         CREATE INDEX IF NOT EXISTS sample_memory ON samples(memory_eligible,audio_status,group_id,created);
         CREATE TABLE IF NOT EXISTS turn_pairs(id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), user_sample TEXT NOT NULL REFERENCES samples(id), assistant_sample TEXT NOT NULL REFERENCES samples(id), source TEXT NOT NULL, quality REAL NOT NULL, verified INTEGER NOT NULL CHECK(verified IN (0,1)), eligible INTEGER NOT NULL DEFAULT 1 CHECK(eligible IN (0,1)), eligibility_error TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '{}', retry_at REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', cursor INTEGER NOT NULL DEFAULT 0, visits INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, UNIQUE(user_sample,assistant_sample));
@@ -3175,60 +3185,102 @@ class AudioStore:
         with self.audio_files(cancel):
             return self._add(group_id, role, waveform, rate, origin, cancel, generated, eligible, created, metadata, task, sample_id, prepared)
 
+    def audio_eligibility(self, group_id, checksum, eligible, generated):
+        if generated:
+            return False, "generated"
+        if not eligible:
+            return False, "capture_quality"
+        group = self.db.execute("SELECT source_key,split FROM groups WHERE id=?", (group_id,)).fetchone()
+        self.db.execute("INSERT OR IGNORE INTO audio_partitions(digest,source_key,split) VALUES(?,?,?)", (checksum, group["source_key"], group["split"]))
+        binding = self.db.execute("SELECT source_key,split FROM audio_partitions WHERE digest=?", (checksum,)).fetchone()
+        if binding["split"] != group["split"]:
+            return False, "duplicate_partition"
+        if binding["source_key"] != group["source_key"]:
+            return False, "duplicate_source"
+        return True, ""
+
+    def validate_transcript(self, checksum, sample_id, metadata):
+        if metadata.get("transcript_verified") is not True:
+            return
+        text = metadata.get("transcript")
+        if not isinstance(text, str) or not text.strip() or metadata.get("language") not in ("中文", "English", "mixed"):
+            raise IneligibleSample("已确认转写缺少文本或语言 / Verified transcript lacks text or language")
+        normalized = SpeechVerifier.normalize_text(text)
+        rows = self.db.execute("SELECT metadata FROM samples WHERE digest=? AND id<>? AND generated=0 AND dialogue_eligible=1 AND json_extract(metadata,'$.transcript_verified')=1", (checksum, sample_id)).fetchall()
+        for row in rows:
+            prior = json.loads(row["metadata"])
+            if SpeechVerifier.normalize_text(prior.get("transcript", "")) != normalized or prior.get("language") != metadata["language"]:
+                raise IneligibleSample("同一音频存在冲突的已确认转写 / Conflicting verified transcripts for the same audio")
+
+    def refresh_audio_owner(self, checksum, preferred=None):
+        owner = self.db.execute("SELECT id FROM samples WHERE digest=? AND generated=0 AND dialogue_eligible=1 AND task='acoustic' AND exclusion NOT LIKE 'acoustic:%' ORDER BY COALESCE(json_extract(metadata,'$.transcript_verified')=1 AND length(json_extract(metadata,'$.transcript'))>0,0) DESC,COALESCE(length(json_extract(metadata,'$.annotation_id'))>0,0) DESC,(json_type(metadata,'$.utterance_final') IN ('true','false')) DESC,learnable DESC,(id=?) DESC,created,id LIMIT 1", (checksum, preferred)).fetchone()
+        identifier = owner["id"] if owner else None
+        self.db.execute("UPDATE samples SET learnable=0 WHERE digest=? AND learnable=1 AND id IS NOT ?", (checksum, identifier))
+        if identifier is not None:
+            self.db.execute("UPDATE samples SET learnable=1 WHERE id=? AND learnable=0", (identifier,))
+
     def _add(self, group_id, role, waveform, rate, origin, cancel=None, generated=False, eligible=True, created=None, metadata=None, task="acoustic", sample_id=None, prepared=None):
         generated = bool(generated or (origin == "local" and role == "assistant"))
         task = "generated_reply" if generated else str(task)
         if task not in ("acoustic", "generated_reply"):
             raise YuanError("音频学习任务无效 / Invalid audio learning task")
+        explicit_time = created is not None
         created = time.time() if created is None else float(created)
         if not math.isfinite(created):
             raise YuanError("音频时间无效 / Invalid audio timestamp")
         metadata = dict(metadata or {})
-        encoded_metadata = json.dumps(metadata, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         own_preparation = prepared is None
         prepared = self.prepare_audio(waveform, rate, cancel, purpose="conversation" if origin == "local" else "learning") if prepared is None else prepared
         checksum = prepared["digest"]
         try:
             check(cancel)
-            existing = self.db.execute("SELECT id FROM samples WHERE digest=? AND group_id=? AND role=? AND task=?", (checksum, group_id, role, task)).fetchone()
-            if existing and origin == "public":
-                return existing[0]
-            sample_id = str(sample_id or uuid.uuid4().hex)
             with self.transaction():
+                if origin == "public":
+                    existing = self.db.execute("SELECT id FROM samples WHERE digest=? AND group_id=? AND role=? AND task=? ORDER BY created,id LIMIT 1", (checksum, group_id, role, task)).fetchone()
+                    if existing:
+                        sample_id = existing["id"]
+                sample_id = str(sample_id or uuid.uuid4().hex)
                 previous = self.db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
                 if previous is not None:
                     if (previous["digest"] != checksum or previous["group_id"] != group_id or previous["role"] != role
                             or previous["task"] != task or previous["rate"] != prepared["rate"] or previous["count"] != prepared["count"]):
                         raise YuanError("音频片段标识与内容不一致 / Audio sample identity does not match its content")
-                    if origin == "dataset" and (json.loads(previous["metadata"]) != metadata or previous["exclusion"] == "annotation_removed" or previous["created"] != created):
-                        prior_metadata = json.loads(previous["metadata"])
-                        changed = previous["exclusion"] == "annotation_removed" or previous["created"] != created or self.sample_supervision(prior_metadata) != self.sample_supervision(metadata)
-                        if changed:
-                            reason = self.memory_reason(metadata, eligible, generated)
-                            duplicate = self.db.execute("SELECT 1 FROM samples WHERE digest=? AND id<>? AND (learnable=1 OR dialogue_eligible=1)", (checksum, sample_id)).fetchone()
-                            dialogue_eligible = bool(eligible) and not generated and not duplicate
-                            learnable = dialogue_eligible and task == "acoustic"
-                            exclusion = "generated" if generated else "capture_quality" if not eligible else "duplicate_audio" if duplicate else ""
-                            self.db.execute("UPDATE samples SET metadata=?,created=?,cursor=0,visits=0,memory_eligible=?,memory_exclusion=?,learnable=?,dialogue_eligible=?,exclusion=? WHERE id=?",
-                                            (encoded_metadata, created, int(not reason), reason, int(learnable), int(dialogue_eligible), exclusion, sample_id))
-                            self.db.execute("DELETE FROM memories WHERE sample_id=?", (sample_id,))
-                            self.db.execute("DELETE FROM memory_progress WHERE sample_id=?", (sample_id,))
-                            self.db.execute("UPDATE turn_pairs SET eligible=0,verified=0,cursor=0,visits=0,retry_at=0,failures=0,error='' WHERE user_sample=? OR assistant_sample=?", (sample_id, sample_id))
-                            self.revise(group_id)
-                        else:
-                            self.db.execute("UPDATE samples SET metadata=? WHERE id=?", (encoded_metadata, sample_id))
-                            self.revise(group_id, "metadata")
-                    return sample_id
+                    if not explicit_time:
+                        created = previous["created"]
+                    prior_metadata = json.loads(previous["metadata"])
+                    if origin != "dataset":
+                        verified_update = metadata.get("transcript_verified") is True
+                        metadata = {**prior_metadata, **metadata}
+                        if prior_metadata.get("transcript_verified") is True and not verified_update:
+                            metadata.update({key: prior_metadata[key] for key in ("transcript", "transcript_verified", "language") if key in prior_metadata})
                 self.group(group_id, origin, source_key=metadata.get("recording_id") or metadata.get("source") or group_id,
                            retention="training_cache" if origin == "public" else "protected",
                            provenance={key: metadata[key] for key in ("source", "url", "license", "license_url", "attribution", "source_sha256", "source_sha1") if key in metadata})
-                duplicate = self.db.execute("SELECT 1 FROM samples WHERE digest=? AND generated=0 AND (learnable=1 OR dialogue_eligible=1)", (checksum,)).fetchone()
-                learnable = bool(eligible) and not generated and not duplicate and task == "acoustic"
-                dialogue_eligible = bool(eligible) and not generated and not duplicate
-                exclusion = "generated" if generated else "capture_quality" if not eligible else "duplicate_audio" if duplicate else ""
+                dialogue_eligible, exclusion = self.audio_eligibility(group_id, checksum, eligible, generated)
+                if dialogue_eligible:
+                    self.validate_transcript(checksum, sample_id, metadata)
+                encoded_metadata = json.dumps(metadata, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
                 memory_reason = self.memory_reason(metadata, eligible, generated)
+                if previous is not None:
+                    changed = (previous["exclusion"] == "annotation_removed" or previous["created"] != created
+                               or self.sample_supervision(prior_metadata) != self.sample_supervision(metadata)
+                               or bool(previous["dialogue_eligible"]) != dialogue_eligible
+                               or previous["memory_exclusion"] != memory_reason)
+                    if changed:
+                        self.db.execute("UPDATE samples SET metadata=?,created=?,cursor=0,visits=0,memory_eligible=?,memory_exclusion=?,learnable=0,dialogue_eligible=?,exclusion=? WHERE id=?",
+                                        (encoded_metadata, created, int(not memory_reason), memory_reason, int(dialogue_eligible), exclusion, sample_id))
+                        self.db.execute("DELETE FROM memories WHERE sample_id=?", (sample_id,))
+                        self.db.execute("DELETE FROM memory_progress WHERE sample_id=?", (sample_id,))
+                        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_training'").fetchone():
+                            self.db.execute("DELETE FROM speech_training WHERE sample=?", (sample_id,))
+                        self.db.execute("UPDATE turn_pairs SET eligible=0,verified=0,cursor=0,visits=0,retry_at=0,failures=0,error='' WHERE user_sample=? OR assistant_sample=?", (sample_id, sample_id))
+                        self.refresh_audio_owner(checksum, sample_id if previous["learnable"] else None)
+                    elif prior_metadata != metadata:
+                        self.db.execute("UPDATE samples SET metadata=? WHERE id=?", (encoded_metadata, sample_id))
+                    return sample_id
                 self.db.execute("INSERT INTO samples(id,group_id,role,task,audio,seconds,rate,count,created,digest,file_sha256,generated,learnable,dialogue_eligible,memory_eligible,memory_exclusion,exclusion,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (sample_id, group_id, role, task, prepared["audio"], prepared["count"] / prepared["rate"], prepared["rate"], prepared["count"], created, checksum, prepared["file_sha256"], int(generated), int(learnable), int(dialogue_eligible), int(not memory_reason), memory_reason, exclusion, encoded_metadata))
+                                (sample_id, group_id, role, task, prepared["audio"], prepared["count"] / prepared["rate"], prepared["rate"], prepared["count"], created, checksum, prepared["file_sha256"], int(generated), 0, int(dialogue_eligible), int(not memory_reason), memory_reason, exclusion, encoded_metadata))
+                self.refresh_audio_owner(checksum)
             return sample_id
         except BaseException:
             if own_preparation:
@@ -3244,6 +3296,8 @@ class AudioStore:
         if user_sample not in by_id or assistant_sample not in by_id or by_id[user_sample]["group_id"] != group_id or by_id[assistant_sample]["group_id"] != group_id:
             raise YuanError("对话配对来源不一致 / Dialogue pair provenance mismatch")
         user, assistant = by_id[user_sample], by_id[assistant_sample]
+        if user["digest"] == assistant["digest"]:
+            raise IneligibleSample("输入与回复不能引用同一音频 / Input and reply cannot reference the same audio")
         evidence = dict(evidence or {})
         if verified:
             required = ("reviewer", "annotation_id", "recording_id", "user_speaker", "assistant_speaker", "prompt")
@@ -3666,11 +3720,14 @@ class AudioStore:
                     " ON CONFLICT(key) DO UPDATE SET value=CAST(COALESCE(CAST(settings.value AS INTEGER),0)+1 AS TEXT);")
         def changed(columns):
             return " OR ".join("OLD." + col + " IS NOT NEW." + col for col in columns)
+        def group_bump(ids, condition="1"):
+            return ("INSERT INTO evaluation_group_revisions(group_id,revision) SELECT id,1 FROM groups WHERE id IN (" + ids + ") AND (" + condition + ") "
+                    "ON CONFLICT(group_id) DO UPDATE SET revision=evaluation_group_revisions.revision+1;")
         def group_splits(action):
             ids = "OLD.group_id,NEW.group_id" if action == "UPDATE" else ("OLD" if action == "DELETE" else "NEW") + ".group_id"
             return "(SELECT split FROM groups WHERE id IN (" + ids + "))"
         fields = {
-            "samples": ("group_id", "role", "task", "digest", "file_sha256", "rate", "count", "generated", "learnable", "dialogue_eligible", "created"),
+            "samples": ("group_id", "role", "task", "digest", "file_sha256", "rate", "count", "generated", "learnable", "dialogue_eligible", "memory_eligible", "created"),
             "turn_pairs": ("group_id", "user_sample", "assistant_sample", "source", "quality", "verified", "eligible")
         }
         statements = []
@@ -3687,7 +3744,8 @@ class AudioStore:
             for action in ("INSERT", "UPDATE", "DELETE"):
                 ref = "OLD" if action == "DELETE" else "NEW"
                 affected = group_splits(action)
-                body = bump("data_revision")
+                ids = "OLD.group_id,NEW.group_id" if action == "UPDATE" else ref + ".group_id"
+                body = bump("data_revision") + group_bump(ids)
                 for split in ("train", "validation", "guard", "release"):
                     body += bump("revision_" + split, "'" + split + "' IN " + affected)
                 learnable = "1" if table == "turn_pairs" else ref + ".generated=0 AND (" + ref + ".learnable=1 OR " + ref + ".dialogue_eligible=1)"
@@ -3707,18 +3765,107 @@ class AudioStore:
             availability = ("retry_at", "audio", "audio_status") if table == "samples" else ("retry_at",)
             affected = group_splits("UPDATE")
             body = bump("availability_revision") + bump("data_revision")
+            if table == "samples":
+                body += group_bump("OLD.group_id,NEW.group_id", "OLD.audio_status IS NOT NEW.audio_status")
             for split in ("train", "validation", "guard", "release"):
                 body += bump("revision_" + split, "'" + split + "' IN " + affected)
             body += bump("evaluation_revision", "EXISTS(SELECT 1 FROM " + affected + " WHERE split<>'train')")
             name = "availability_" + table + "_update"
             statements.append("DROP TRIGGER IF EXISTS " + name + ";")
             statements.append("CREATE TRIGGER " + name + " AFTER UPDATE OF " + ",".join(availability) + " ON " + table + " WHEN " + changed(availability) + " BEGIN " + body + " END;")
-        body = bump("data_revision") + bump("training_revision", "OLD.split='train' OR NEW.split='train'") + bump("evaluation_revision")
+        body = bump("data_revision") + bump("training_revision", "OLD.split='train' OR NEW.split='train'") + bump("evaluation_revision") + group_bump("OLD.id,NEW.id")
         for split in ("train", "validation", "guard", "release"):
             body += bump("revision_" + split, "OLD.split='" + split + "' OR NEW.split='" + split + "'")
         statements.append("DROP TRIGGER IF EXISTS revision_groups_update;")
-        statements.append("CREATE TRIGGER revision_groups_update AFTER UPDATE OF split,source_key,origin ON groups WHEN " + changed(("split", "source_key", "origin")) + " BEGIN " + body + " END;")
+        statements.append("CREATE TRIGGER revision_groups_update AFTER UPDATE OF split,source_key,origin,provenance ON groups WHEN " + changed(("split", "source_key", "origin", "provenance")) + " BEGIN " + body + " END;")
+        name = "revision_sessions_update"
+        statements.append("DROP TRIGGER IF EXISTS " + name + ";")
+        statements.append("CREATE TRIGGER " + name + " AFTER UPDATE OF prompt,language ON sessions WHEN " + changed(("prompt", "language"))
+                          + " BEGIN " + group_bump("OLD.id,NEW.id") + bump("data_revision") + bump("evaluation_revision")
+                          + bump("training_revision", "EXISTS(SELECT 1 FROM groups WHERE id IN (OLD.id,NEW.id) AND split='train')") + " END;")
         self.db.executescript("BEGIN IMMEDIATE;\n" + "\n".join(statements) + "\nCOMMIT;")
+
+    def evaluation_snapshot(self, rows):
+        rows = tuple(rows)
+        pending = {row["group_id"] for row in rows}
+        records, seen = [], set()
+        def references(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in ("sample", "user_sample", "assistant_sample") and isinstance(item, str):
+                        yield item
+                    elif key == "samples" and isinstance(item, list):
+                        yield from (entry for entry in item if isinstance(entry, str))
+                    else:
+                        yield from references(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from references(item)
+        with self.transaction():
+            for expected in rows:
+                keys = set(expected.keys())
+                if "id" not in keys:
+                    continue
+                pair = "user_sample" in keys
+                current = (self.db.execute("SELECT p.*,g.split,g.origin,g.source_key FROM turn_pairs p JOIN groups g ON g.id=p.group_id WHERE p.id=?", (expected["id"],)).fetchone()
+                           if pair else self.sample(expected["id"]))
+                fields = ("id", "group_id", "user_sample", "assistant_sample", "source", "quality", "verified", "eligible", "evidence", "split", "origin", "source_key") if pair else (
+                    "id", "group_id", "role", "task", "digest", "file_sha256", "rate", "count", "generated", "learnable", "memory_eligible", "dialogue_eligible", "audio_status", "created", "metadata", "split", "origin", "source_key")
+                for key in fields:
+                    if current is None:
+                        raise YuanError("评估选中记录已删除 / Selected evaluation record was removed")
+                    if key not in keys:
+                        continue
+                    before, after = expected[key], current[key]
+                    if key in ("metadata", "evidence"):
+                        before, after = (self.evidence_metadata(json.loads(value)) for value in (before, after))
+                    if before != after:
+                        raise YuanError("评估选中记录已修订 / Selected evaluation record was revised")
+            while pending:
+                group_id = min(pending)
+                pending.remove(group_id)
+                if group_id in seen:
+                    continue
+                seen.add(group_id)
+                group = self.db.execute("SELECT g.id,g.split,g.origin,g.source_key,g.provenance,COALESCE(r.revision,0) AS revision FROM groups g LEFT JOIN evaluation_group_revisions r ON r.group_id=g.id WHERE g.id=?", (group_id,)).fetchone()
+                if group is None:
+                    raise YuanError("评估来源已删除 / Evaluation source was removed")
+                samples = []
+                for row in self.db.execute("SELECT id,group_id,role,task,digest,file_sha256,rate,count,generated,learnable,memory_eligible,dialogue_eligible,audio_status,created,metadata FROM samples WHERE group_id=? ORDER BY id", (group_id,)):
+                    item = dict(row)
+                    item["metadata"] = self.evidence_metadata(json.loads(item["metadata"]))
+                    samples.append(payload_digest(item))
+                pairs = []
+                for row in self.db.execute("SELECT id,group_id,user_sample,assistant_sample,source,quality,verified,eligible,evidence FROM turn_pairs WHERE group_id=? ORDER BY id", (group_id,)):
+                    item = dict(row)
+                    item["evidence"] = self.evidence_metadata(json.loads(item["evidence"]))
+                    pairs.append(payload_digest(item))
+                    for sample_id in references(item):
+                        dependency = self.db.execute("SELECT group_id FROM samples WHERE id=?", (sample_id,)).fetchone()
+                        if dependency is None:
+                            raise YuanError("评估引用音频缺失 / Referenced evaluation audio is missing")
+                        if dependency[0] not in seen:
+                            pending.add(dependency[0])
+                session = self.db.execute("SELECT prompt,language FROM sessions WHERE id=?", (group_id,)).fetchone()
+                records.append({"id": group_id, "sha256": payload_digest([dict(group), samples, pairs, dict(session) if session else None])})
+            self.assert_independent(sorted(seen))
+        value = {"protocol": "yuan-evaluation-snapshot-v1", "groups": sorted(records, key=lambda item: item["id"])}
+        return {**value, "sha256": payload_digest(value)}
+
+    def snapshot_valid(self, snapshot):
+        try:
+            if (not isinstance(snapshot, dict) or snapshot.get("protocol") != "yuan-evaluation-snapshot-v1"
+                    or not snapshot.get("groups")
+                    or snapshot.get("sha256") != payload_digest({key: value for key, value in snapshot.items() if key != "sha256"})):
+                return False
+            current = self.evaluation_snapshot([{"group_id": item["id"]} for item in snapshot["groups"]])
+            return current == snapshot
+        except (KeyError, TypeError, ValueError, YuanError):
+            return False
+
+    def validation_current(self, record):
+        return (isinstance(record, dict) and record.get("training_revision") == self.setting("training_revision")
+                and self.snapshot_valid(record.get("evaluation_snapshot")))
 
     def revisions(self):
         keys = ("data_revision", "training_revision", "training_addition_revision", "evaluation_revision", "availability_revision", "metadata_revision", "revision_train", "revision_validation", "revision_guard", "revision_release")
@@ -4599,9 +4746,38 @@ class AcceptancePolicy:
             value = data.get(key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value < 1:
                 raise YuanError("验收置信度或风险边界无效 / Invalid acceptance confidence or risk bound")
+        for key in ("maximum_relative_regression", "maximum_absolute_regression"):
+            value = data.get(key, 0.0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise YuanError("回归容忍边界无效 / Invalid regression tolerance")
+        if data["confidence"] <= 0.5:
+            raise YuanError("比较置信度必须大于二分之一 / Comparison confidence must exceed one half")
         scenarios = data.get("scenarios")
         if not isinstance(scenarios, list) or set(scenarios) != set(cls.dimensions) or len(scenarios) != len(cls.dimensions):
             raise YuanError("验收必须覆盖提示词、输入与多轮历史 / Acceptance must cover prompt, input and multi-turn history")
+
+    def failure_bound(self, failures, total):
+        if type(failures) is not int or type(total) is not int or not 0 <= failures <= total or total < 1:
+            raise ValueError("失败计数无效 / Invalid failure count")
+        if failures == total:
+            return 1.0
+        if failures == 0:
+            return -math.expm1(math.log1p(-self.confidence) / total)
+        coefficients = [math.lgamma(total + 1) - math.lgamma(index + 1) - math.lgamma(total - index + 1) for index in range(failures + 1)]
+        low, high = failures / total, 1.0
+        target = math.log1p(-self.confidence)
+        while True:
+            middle = (low + high) / 2
+            if middle in (low, high):
+                return high
+            a, b = math.log(middle), math.log1p(-middle)
+            terms = [value + index * a + (total - index) * b for index, value in enumerate(coefficients)]
+            largest = max(terms)
+            probability = largest + math.log(sum(math.exp(value - largest) for value in terms))
+            if probability > target:
+                low = middle
+            else:
+                high = middle
 
     def coverage(self, store, model, splits=("train", "validation", "guard", "release"), controls=None, fresh=False):
         revisions = store.revisions()
@@ -4636,8 +4812,8 @@ class AcceptancePolicy:
 
     def _coverage_split(self, store, model, split, need_controls):
         query = ("SELECT p.*,g.split,g.origin,g.source_key,u.metadata AS user_metadata,a.metadata AS target_metadata,"
-                 "EXISTS(SELECT 1 FROM samples h WHERE h.group_id=p.group_id AND h.created<u.created AND h.generated=0 AND h.dialogue_eligible=1 AND h.audio_status='ready' AND h.count>0) AS has_history,"
-                 "EXISTS(SELECT 1 FROM samples h WHERE h.group_id=p.group_id AND h.created<u.created AND h.role='assistant' AND h.generated=0 AND h.dialogue_eligible=1 AND h.audio_status='ready' AND h.count>0) AS has_assistant_history "
+                 "EXISTS(SELECT 1 FROM samples h WHERE h.group_id=p.group_id AND h.created<u.created AND h.digest NOT IN (u.digest,a.digest) AND h.generated=0 AND h.dialogue_eligible=1 AND h.audio_status='ready' AND h.count>0) AS has_history,"
+                 "EXISTS(SELECT 1 FROM samples h WHERE h.group_id=p.group_id AND h.created<u.created AND h.digest NOT IN (u.digest,a.digest) AND h.role='assistant' AND h.generated=0 AND h.dialogue_eligible=1 AND h.audio_status='ready' AND h.count>0) AS has_assistant_history "
                  "FROM turn_pairs p JOIN groups g ON g.id=p.group_id JOIN samples u ON u.id=p.user_sample JOIN samples a ON a.id=p.assistant_sample "
                  "WHERE g.split=? AND p.eligible=1 AND p.retry_at<=? AND " + (store.training_pair_filter if split == "train" else "p.verified=1") +
                  " AND u.audio_status='ready' AND a.audio_status='ready' AND u.generated=0 AND a.generated=0 AND u.dialogue_eligible=1 AND a.dialogue_eligible=1 AND u.count>=? AND a.count>=? ORDER BY g.source_key,p.id")
@@ -4707,6 +4883,7 @@ class AcceptancePolicy:
         count = store.db.execute("SELECT count(*) FROM samples s JOIN groups g ON g.id=s.group_id WHERE g.split='train' AND s.learnable=1 AND s.audio_status='ready'").fetchone()[0]
         if not count:
             gaps.append({"kind": "raw_audio", "language": None, "split": "train", "have": 0, "need": 1})
+        gaps.extend(MemoryCalibration(model, store).selection(self)["missing"])
         return gaps
 
     def acquisition_plan(self, report):
@@ -4736,8 +4913,31 @@ class AcceptancePolicy:
             task.update(missing_dialogue_sources=max(0, cell["need"] - cell["have"]), requires="independent_human_multiturn_annotations",
                         gap_kind="dialogue_annotations", coverage_guaranteed=False)
         for gap in report.get("data_gaps", []):
+            if gap["kind"] == "retrieval_supervision":
+                tasks[(gap["language"], gap["split"], gap["kind"], gap["relevant"])] = {
+                    "language": gap["language"], "split": gap["split"], "scenario": None, "relevant": gap["relevant"],
+                    "missing_sources": gap["need"] - gap["have"], "evidence_scope": "retrieval_calibration",
+                    "automatic_source": "annotated_catalog", "requires": "independent_human_retrieval_annotations",
+                    "gap_kind": gap["kind"], "discovery_required": True, "coverage_guaranteed": False,
+                    "completion": "validated_independent_coverage"}
+                continue
             native = [item["repository"] for item in PublishedSpeech.specifications if gap["language"] in item["languages"]]
             tasks[(gap["language"], gap["split"], gap["kind"])] = {"language": gap["language"], "split": gap["split"], "scenario": None, "missing_sources": gap["need"] - gap["have"], "evidence_scope": "transcript_supervision" if native else "acoustic_training", "automatic_source": "native_speech" if native else "public_audio", "repositories": native, "requires": "publisher_human_transcriptions" if native else "licensed_audio", "gap_kind": gap["kind"], "discovery_required": False, "coverage_guaranteed": False, "completion": "validated_independent_coverage"}
+        for task in tasks.values():
+            if task["automatic_source"] == "annotated_catalog":
+                fields = ["human_recording", "recording_id", "license", "reviewer", "annotation_id", "speaker", "audio_sha256", "verified_reply_relation"]
+                if task.get("gap_kind") == "retrieval_supervision":
+                    fields.extend(("human_retrieval_relevance_v1", "historical_audio_reference", "relevant_label"))
+                else:
+                    fields.append("scenario:" + str(task.get("scenario")))
+                    if task["split"] != "train":
+                        fields.extend(("verified_contrasts", "utterance_final"))
+                    if task.get("missing_reference_sources", 0):
+                        fields.append("reference_checks")
+                    if task.get("missing_dialogue_sources", 0):
+                        fields.append("independent_multiturn_dialogue_annotation")
+                task["required_fields"] = fields
+                task["adapters"] = ["yuan-paired-audio-v1", "recorded-messages"]
         return sorted(tasks.values(), key=lambda task: (task["split"] != "train", -task["missing_sources"], task["language"] or "", task["scenario"] or "", task.get("gap_kind", "reference_checks")))
 
     def select(self, store, model, split="release", require_controls=None, fresh=False):
@@ -4764,6 +4964,7 @@ class SpeechVerifier:
         self.manifest = read_json(self.root / "current.json")
         self.training_revision = store.setting("training_revision")
         self.calibration_revision = None
+        self.calibration_checked = False
         self.certificate = {}
         self.dirty = False
         self.interval = max(1, math.isqrt(model.width * model.layers))
@@ -4771,6 +4972,14 @@ class SpeechVerifier:
     @staticmethod
     def normalize_text(value):
         return " ".join(unicodedata.normalize("NFC", str(value)).split())
+
+    @classmethod
+    def recognition_text(cls, value):
+        text = cls.normalize_text(value)
+        text = text.rstrip("。！？!?").rstrip()
+        if text.endswith(".") and not text.endswith(".."):
+            text = text[:-1].rstrip()
+        return text.casefold()
 
     @staticmethod
     def normalize_answer(value):
@@ -4843,13 +5052,18 @@ class SpeechVerifier:
             return ""
 
     def rows(self, split, limit=None):
-        sql = ("SELECT s.*,g.split,g.origin,g.source_key,COALESCE(v.visits,0) AS speech_visits FROM samples s JOIN groups g ON g.id=s.group_id "
-               "LEFT JOIN speech_training v ON v.sample=s.id WHERE g.split=? AND s.generated=0 AND s.dialogue_eligible=1 AND s.audio_status='ready' "
+        sql = ("WITH eligible AS (SELECT s.*,g.split,g.origin,g.source_key,COALESCE(v.visits,0) AS speech_visits,"
+               "ROW_NUMBER() OVER (PARTITION BY s.digest ORDER BY s.learnable DESC,s.created,s.id) AS transcript_position "
+               "FROM samples s JOIN groups g ON g.id=s.group_id LEFT JOIN speech_training v ON v.sample=s.id "
+               "WHERE g.split=? AND s.generated=0 AND s.dialogue_eligible=1 AND s.audio_status='ready' "
                "AND s.count>=? AND s.count<=? AND json_extract(s.metadata,'$.transcript_verified')=1 "
-               "AND (json_extract(s.metadata,'$.language') IN ('中文','English') OR (g.split='train' AND json_extract(s.metadata,'$.language')='mixed')) AND length(json_extract(s.metadata,'$.transcript'))>0 "
-               "AND COALESCE(v.retry_at,0)<=? ORDER BY speech_visits,s.id")
+               "AND (json_extract(s.metadata,'$.language') IN ('中文','English') OR (g.split='train' AND json_extract(s.metadata,'$.language')='mixed')) "
+               "AND length(json_extract(s.metadata,'$.transcript'))>0) "
+               "SELECT * FROM eligible WHERE transcript_position=1 AND COALESCE((SELECT retry_at FROM speech_training WHERE sample=eligible.id),0)<=? ORDER BY speech_visits,id")
         args = [split, self.model.hop, self.model.capacity(), time.time()]
         if limit is not None:
+            if type(limit) is not int or limit < 1:
+                raise ValueError("转写样本数量无效 / Invalid transcript sample limit")
             sql += " LIMIT ?"
             args.append(limit)
         return self.store.db.execute(sql, args).fetchall()
@@ -4883,6 +5097,7 @@ class SpeechVerifier:
                 if manifest.get("certificate", {}).get("passed") is True:
                     self.accepted = copy.deepcopy(self.network).eval().requires_grad_(False)
                     self.certificate = manifest["certificate"]
+                    self.calibration_checked = False
             except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 self.network = self.optimizer = self.accepted = None
                 self.manifest, self.certificate = {}, {}
@@ -4906,15 +5121,19 @@ class SpeechVerifier:
             self.accepted, self.certificate = None, {}
             return False
         revision = self.store.setting("evaluation_revision")
-        if revision != self.calibration_revision:
+        if revision != self.calibration_revision or not self.calibration_checked:
             records = self.certificate.get("records", [])
             for record in records:
                 row = self.store.sample(record["sample"])
                 if row is None or self.row_signature(row) != record["signature"] or row["split"] not in ("validation", "guard"):
                     self.accepted, self.certificate = None, {}
                     return False
+            if not self.store.snapshot_valid(self.certificate.get("evaluation_snapshot")):
+                self.accepted, self.certificate = None, {}
+                return False
             self.store.assert_independent([record["group"] for record in records])
             self.calibration_revision = revision
+            self.calibration_checked = True
         return bool(self.certificate.get("passed"))
 
     @staticmethod
@@ -4943,12 +5162,13 @@ class SpeechVerifier:
         acceptance = AcceptancePolicy(self.model)
         revisions = self.store.revisions()
         selected, observed = [], set()
+        source_limit = max(acceptance.minimum, math.isqrt(max(1, self.model.capacity() // self.model.hop)) * self.model.layers)
         for split in ("validation", "guard"):
             counts = {language: 0 for language in acceptance.languages}
             for row in (self.rows(split) if fixed is None else [item for item in fixed if item["split"] == split]):
                 metadata = json.loads(row["metadata"])
                 language, source = metadata["language"], row["source_key"]
-                if source in observed or counts[language] >= acceptance.minimum:
+                if language not in counts or source in observed or fixed is None and counts[language] >= source_limit:
                     continue
                 selected.append(row)
                 observed.add(source)
@@ -4956,6 +5176,7 @@ class SpeechVerifier:
             if any(value < acceptance.minimum for value in counts.values()):
                 return False
         self.store.assert_independent([row["group_id"] for row in selected])
+        snapshot = self.store.evaluation_snapshot(selected)
         records, qualities, measures = [], {language: [] for language in acceptance.languages}, {}
         self.network.eval()
         for row in selected:
@@ -4964,17 +5185,27 @@ class SpeechVerifier:
             metadata = json.loads(row["metadata"])
             expected = self.normalize_text(metadata["transcript"])
             observed = self.transcribe(values, self.network)
-            error = self.error_rate(expected, observed)
+            raw_error = self.error_rate(expected, observed)
+            normalized = self.recognition_text(expected)
+            error = self.error_rate(normalized, self.recognition_text(observed))
+            if not normalized:
+                return False
             key = row["split"] + ":" + metadata["language"]
             measures.setdefault(key, []).append(error)
             quality = self.quality(values)
             if not expected or quality is None:
                 return False
             qualities[metadata["language"]].append(quality)
-            records.append({"sample": row["id"], "group": row["group_id"], "signature": self.row_signature(row), "error": error})
-        passed = all(all(error == 0 for error in errors) for errors in measures.values())
+            records.append({"sample": row["id"], "group": row["group_id"], "signature": self.row_signature(row), "error": error, "raw_error": raw_error})
+        measurements = {}
+        for key, errors in measures.items():
+            failures = sum(error > 0 for error in errors)
+            upper = acceptance.failure_bound(failures, len(errors))
+            measurements[key] = {"sources": len(errors), "failures": failures, "mean_error": sum(errors) / len(errors),
+                                 "failure_rate_upper": upper, "passed": upper <= acceptance.maximum_failure}
+        passed = len(measurements) == len(acceptance.languages) * 2 and all(item["passed"] for item in measurements.values())
         self.emit("learning", key="semantic_verifier", stage="verifier_validation", passed=passed,
-                  measurements={key: {"sources": len(errors), "mean_error": sum(errors) / len(errors)} for key, errors in measures.items()}, conversation_verified=False)
+                  measurements=measurements, conversation_verified=False)
         if not passed:
             return False
         bounds = {}
@@ -4984,14 +5215,16 @@ class SpeechVerifier:
                 numbers = [row[key] for row in rows]
                 tolerance = max(self.model.np.finfo(self.model.np.float32).eps, (max(numbers) - min(numbers)) / math.sqrt(len(numbers)))
                 bounds[language][key] = [max(0.0, min(numbers) - tolerance), max(numbers) + tolerance]
-        current = self.store.revisions()
-        if any(current[key] != revisions[key] for key in ("training_revision", "evaluation_revision")):
+        if self.store.setting("training_revision") != revisions["training_revision"] or not self.store.snapshot_valid(snapshot):
             return False
         self.certificate = {"protocol": self.protocol, "passed": True, "identity": self.identity(), "acceptance_policy_sha256": acceptance.digest,
                             "training_revision": self.training_revision, "records": records, "bounds": bounds, "steps": self.steps,
-                            "scope": "exact human transcript recognition on independent sources; annotated-answer tasks only", "created": time.time()}
+                            "evaluation_snapshot": snapshot, "measurements": measurements,
+                            "normalization": "NFC whitespace terminal-sentence-punctuation casefold; task answers remain exact",
+                            "scope": "independent transcript content recognition within the acceptance risk bound; annotated-answer tasks only", "created": time.time()}
         self.accepted = copy.deepcopy(self.network).eval().requires_grad_(False)
-        self.calibration_revision = self.store.setting("evaluation_revision")
+        self.calibration_revision = revisions["evaluation_revision"]
+        self.calibration_checked = False
         return True
 
     def checkpoint(self, cancel):
@@ -5853,13 +6086,6 @@ class NativeAudio:
         if self._resume_training_activation(cancel=self.cancel):
             return
         failures = []
-        revisions = {}
-        if safe_path(self.state, "memory/memory.sqlite3").is_file():
-            store = AudioStore(self.state, recover=False)
-            try:
-                revisions = store.revisions()
-            finally:
-                store.close()
         paths = [directory / name for name in ("active.json", "previous.json")]
         paths.extend(sorted(directory.glob("model-*.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True))
         for path in paths:
@@ -5875,8 +6101,12 @@ class NativeAudio:
                             or provenance.get("build_sha256") != build_digest() or path.with_suffix(".pt").name != manifest["file"]):
                         raise YuanError("备用检查点缺少当前版本来源证明 / Fallback checkpoint lacks current-build provenance")
                     metrics = manifest.get("metrics", {})
-                    if not isinstance(metrics, dict) or any(key in metrics and metrics[key] != revisions.get(key) for key in ("training_revision", "evaluation_revision")):
-                        raise YuanError("备用检查点依赖的数据已经修订 / Fallback checkpoint depends on revised data")
+                    validation_store = AudioStore(self.state, recover=False)
+                    try:
+                        if not validation_store.validation_current(metrics):
+                            raise YuanError("备用检查点依赖的数据已经修订 / Fallback checkpoint depends on revised data")
+                    finally:
+                        validation_store.close()
                 network = self._load_network(manifest, self.cancel)
             except Cancelled:
                 raise
@@ -5944,8 +6174,7 @@ class NativeAudio:
                 if store is not None:
                     check(cancel)
                     with store.transaction():
-                        if (store.setting("training_revision") != metrics.get("training_revision")
-                                or store.setting("evaluation_revision") != metrics.get("evaluation_revision") or self.active_digest != baseline):
+                        if not store.validation_current(metrics) or self.active_digest != baseline:
                             return False
                         if store.setting("pending_training_activation"):
                             raise YuanError("上次模型更新尚未完成恢复 / The previous model update still needs recovery")
@@ -6004,7 +6233,7 @@ class NativeAudio:
                 if previous is not None:
                     self._training_manifest(previous)
                 metrics = manifest.get("metrics", {})
-                if not isinstance(metrics, dict) or any(key in metrics and metrics[key] != store.setting(key) for key in ("training_revision", "evaluation_revision")):
+                if not store.validation_current(metrics):
                     raise YuanError("待提交模型依赖的数据已经修订 / Pending model depends on revised data")
                 network = self._load_network(manifest, cancel)
             except Cancelled:
@@ -6025,7 +6254,7 @@ class NativeAudio:
                 current = store.db.execute("SELECT value FROM settings WHERE key='pending_training_activation'").fetchone()
                 if current is None or current["value"] != raw:
                     raise YuanError("恢复期间模型提交记录发生变化 / Model commit record changed during recovery")
-                if any(key in metrics and metrics[key] != store.setting(key) for key in ("training_revision", "evaluation_revision")):
+                if not store.validation_current(metrics):
                     reason = "恢复期间训练或评估数据已修订 / Training or evaluation data changed during recovery"
                     store.set_setting("rejected_training_activation", {"sha256": hashlib.sha256(raw.encode()).hexdigest(), "reason": reason, "created": time.time()})
                     store.set_setting("pending_training_activation", None)
@@ -6144,10 +6373,11 @@ class NativeAudio:
         if not isinstance(history, list) or "history" in evidence.get("scenarios", []) and not history:
             raise YuanError("听测历史音频已改变或缺失 / Listening history audio has changed or is missing")
         seen = set()
+        seen_audio = {user["digest"], assistant["digest"]}
         previous = None
         for item in history:
             row = store.sample(item.get("id")) if isinstance(item, dict) else None
-            if (row is None or row["id"] in seen or row["group_id"] != pair["group_id"] or row["generated"] or not row["dialogue_eligible"]
+            if (row is None or row["id"] in seen or row["digest"] in seen_audio or row["group_id"] != pair["group_id"] or row["generated"] or not row["dialogue_eligible"]
                     or row["id"] in (user["id"], assistant["id"]) or row["created"] >= user["created"] or row["digest"] != item.get("sha256") or row["role"] != item.get("role")):
                 raise YuanError("听测历史来源无效 / Invalid listening history provenance")
             order = (row["created"], row["id"])
@@ -6157,25 +6387,30 @@ class NativeAudio:
                 raise YuanError("听测历史顺序或范围无效 / Invalid listening history order or range")
             store.read_audio(row, start, min(samples, self.hop), cancel=cancel, verify=True)
             seen.add(row["id"])
+            seen_audio.add(row["digest"])
             previous = order
         return pair
 
     def review_history(self, store, pair, cancel):
         user = store.sample(pair["user_sample"])
-        rows = store.db.execute("SELECT * FROM samples WHERE group_id=? AND created<? AND generated=0 AND dialogue_eligible=1 AND id NOT IN (?,?) ORDER BY created DESC,id DESC",
+        target = store.sample(pair["assistant_sample"])
+        rows = store.db.execute("SELECT * FROM samples WHERE group_id=? AND created<? AND generated=0 AND dialogue_eligible=1 AND audio_status='ready' AND id NOT IN (?,?) ORDER BY created DESC,id DESC",
                                 (pair["group_id"], user["created"], pair["user_sample"], pair["assistant_sample"])).fetchall()
         remaining = max(0, self.capacity() // 2)
-        selected = []
+        selected, seen = [], {user["digest"], target["digest"]}
         for row in rows:
             check(cancel)
             if remaining <= 0:
                 break
+            if row["digest"] in seen:
+                continue
             take = min(row["count"], self.window(), remaining)
             if take <= 0:
                 continue
             start = row["count"] - take
             audio = store.read_audio(row, start, take, cancel=cancel, verify=True)
             selected.append(((self.context_role(row["role"], json.loads(row["metadata"])), audio), {"id": row["id"], "sha256": row["digest"], "role": row["role"], "start": start, "samples": take}))
+            seen.add(row["digest"])
             remaining -= len(audio)
         selected.reverse()
         return tuple(item[0] for item in selected), [item[1] for item in selected]
@@ -6406,7 +6641,7 @@ class NativeAudio:
                 held_review = bool(name == "pending-review.json" and held and held == pointer.get("model_sha256") == evaluated.get("model", {}).get("sha256"))
                 if ((evaluated.get("model", {}).get("sha256") == self.active_digest or held_review) and evaluated.get("evaluator_sha256") == behavior_digest()
                         and evaluated.get("protocol") == "yuan-native-listening-v4" and evaluated.get("identity") == self.identity()
-                        and all(evaluated.get("supervision_revisions", {}).get(key) == store.revisions()[key] for key in ("training_revision", "evaluation_revision"))):
+                        and store.validation_current(evaluated)):
                     cases = evaluated.get("cases", [])
                     if not cases:
                         raise YuanError("听测数据为空 / Listening cases are empty")
@@ -6424,6 +6659,8 @@ class NativeAudio:
         if not selected:
             return False
         store.assert_independent([row["group_id"] for row in selected])
+        snapshot = store.evaluation_snapshot(selected)
+        training_revision = store.setting("training_revision")
         required = sum((store.sample(row["user_sample"])["count"] + self.capacity()) * self.np.dtype(self.np.float32).itemsize for row in selected)
         free = shutil.disk_usage(self.state).free
         reserve = max(required, getattr(self, "model_bytes", 0) * 2)
@@ -6468,7 +6705,9 @@ class NativeAudio:
             evaluation = {"protocol": "yuan-native-listening-v4", "evaluator_sha256": behavior_digest(), "build_sha256": build_digest(), "identity": self.identity(),
                           "model": self.training_manifest, "dataset_sha256": payload_digest(dataset), "cases": cases, "created": time.time(),
                           "acceptance_policy_sha256": acceptance.digest, "minimum_independent_sources": acceptance.minimum,
-                          "supervision_revisions": store.revisions()}
+                          "supervision_revisions": store.revisions(), "training_revision": training_revision, "evaluation_snapshot": snapshot}
+            if not store.validation_current(evaluation):
+                return False
             evaluation_path = root / "evaluation.json"
             atomic_json(evaluation_path, evaluation, cancel)
             review = {"protocol": evaluation["protocol"], "evaluation_file": evaluation_path.relative_to(directory).as_posix(), "evaluation_sha256": digest_file(evaluation_path, cancel),
@@ -6793,7 +7032,7 @@ class NativeAudio:
             metrics = self.training_manifest.get("metrics", {})
             if (checksum != review.get("evaluation_sha256") or evaluation.get("model", {}).get("sha256") != self.active_digest
                     or metrics.get("training_validated") is not True or metrics.get("regression", {}).get("passed") is not True
-                    or any(metrics.get(key) != revisions[key] for key in ("training_revision", "evaluation_revision"))):
+                    or not store.validation_current(metrics) or not store.validation_current(evaluation)):
                 raise YuanError("候选缺少当前数据版本的独立训练验证 / Candidate lacks independent training validation for the current data revision")
             cases = evaluation.get("cases", [])
             acceptance = AcceptancePolicy(self)
@@ -6806,7 +7045,10 @@ class NativeAudio:
             rows = {split: acceptance.select(store, self, split, require_controls=True, fresh=True) for split in ("validation", "guard")}
             if any(not selected for selected in rows.values()):
                 raise IneligibleSample("独立验证或保护覆盖不足 / Independent validation or guard coverage is insufficient")
-            store.assert_independent([row["group_id"] for selected in rows.values() for row in selected])
+            selected_rows = [row for selected in rows.values() for row in selected]
+            selected_rows.extend(self._review_case(store, case, cancel) for case in cases)
+            selected_rows.extend(store.sample(item["sample"]) for item in verifier.certificate["records"])
+            data_snapshot = store.evaluation_snapshot(selected_rows)
             independent, improved = {}, self.serving_network is None
             for split, selected in rows.items():
                 comparison = assessor._evaluate(selected, "dialogue", cancel)
@@ -6814,7 +7056,7 @@ class NativeAudio:
                     raise IneligibleSample("独立版本比较无法完成 / Independent version comparison could not complete")
                 passed, before, after, margin = assessor._comparison(*comparison, require_improvement=False)
                 independent[split] = {"passed": passed, "before": before, "after": after, "margin": margin, "sources": len(comparison[0]),
-                                      "data_sha256": payload_digest([dict(row) for row in selected])}
+                                      "data_sha256": payload_digest([dict(row) for row in selected]), "comparison": dict(assessor.comparison_result)}
                 if not passed:
                     raise IneligibleSample("候选相对服务模型发生回归 / Candidate regressed relative to the serving model")
                 improved = improved or before - after > margin
@@ -6839,18 +7081,18 @@ class NativeAudio:
             improved = improved or scope_expanded
             if not improved:
                 raise IneligibleSample("候选保持现有能力但尚无独立改进证据 / Candidate preserves current ability but has no independent improvement evidence")
-            snapshot = verifier.snapshot(evaluation_path.parent, cancel)
+            verifier_snapshot = verifier.snapshot(evaluation_path.parent, cancel)
             audit = {"protocol": "yuan-independent-task-release-v1", "evaluator_sha256": behavior_digest(), "candidate_sha256": self.active_digest,
                      "serving_sha256": self.serving_digest, "evaluation_sha256": checksum, "independent": independent, "improvement": bool(improved),
-                     "acceptance_policy_sha256": acceptance.digest, "created": time.time(), "verifier": snapshot, "cases": measured,
-                     "baseline_tasks": baseline_tasks, "revisions": revisions, "scope": CapabilityEvidence.automatic_scope(measured), "scope_expanded": scope_expanded}
+                     "acceptance_policy_sha256": acceptance.digest, "created": time.time(), "verifier": verifier_snapshot, "cases": measured,
+                     "baseline_tasks": baseline_tasks, "revisions": revisions, "evaluation_snapshot": data_snapshot, "scope": CapabilityEvidence.automatic_scope(measured), "scope_expanded": scope_expanded}
             audit_path = evaluation_path.with_name("automatic.json")
             atomic_json(audit_path, audit, cancel)
             review["automatic"] = {"protocol": audit["protocol"], "audit_file": audit_path.relative_to(directory).as_posix(), "audit_sha256": digest_file(audit_path, cancel)}
             check(cancel)
-            current = store.revisions()
-            if any(current[key] != revisions[key] for key in ("training_revision", "evaluation_revision")):
-                raise YuanError("任务验收期间监督数据发生变化 / Supervision data changed during task acceptance")
+            if (store.setting("training_revision") != revisions["training_revision"] or not store.snapshot_valid(data_snapshot)
+                    or not store.validation_current(metrics) or not store.validation_current(evaluation) or not verifier.ready(cancel)):
+                raise YuanError("任务验收使用的监督数据发生变化 / Supervision used by task acceptance changed")
             checks = [CapabilityEvidence.task_checks(result, audit["scope"]) for result in measured]
             capabilities = CapabilityEvidence.build(evaluation, checks, audit["scope"])
             review.update(reviewer="Yuan / independently calibrated task verification", reviewed_at=time.time(), checks=checks, capabilities=capabilities)
@@ -6981,15 +7223,15 @@ class AudioLearner:
         self._discard_candidate()
         return True
 
-    def _refresh_data(self):
+    def _refresh_data(self, snapshot=None):
         revisions = self.store.revisions()
         revision, training_revision = revisions["data_revision"], revisions["training_revision"]
         evaluation_revision = revisions["evaluation_revision"]
         previous_evaluation = getattr(self, "evaluation_revision", evaluation_revision)
         if revision == self.data_revision and training_revision == self.training_revision and evaluation_revision == previous_evaluation:
-            return False
+            return snapshot is not None and not self.store.snapshot_valid(snapshot)
         discarded = training_revision != self.training_revision
-        invalidated = discarded or evaluation_revision != previous_evaluation
+        invalidated = discarded or (not self.store.snapshot_valid(snapshot) if snapshot is not None else evaluation_revision != previous_evaluation)
         if discarded:
             self._discard_candidate()
             self.training_loss = None
@@ -7170,10 +7412,15 @@ class AudioLearner:
         budget = max(0, self.model.capacity() // 2)
         used = 0
         context = []
-        rows = self.store.db.execute("SELECT * FROM samples WHERE group_id=? AND created<? AND audio_status='ready' AND memory_eligible=1 ORDER BY created DESC", (group_id, before_created))
+        seen = set()
+        for identifier in excluded:
+            row = self.store.sample(identifier)
+            if row is not None:
+                seen.add(row["digest"])
+        rows = self.store.db.execute("SELECT * FROM samples WHERE group_id=? AND created<? AND audio_status='ready' AND memory_eligible=1 ORDER BY created DESC,id DESC", (group_id, before_created))
         for previous in rows:
             check(cancel)
-            if previous["id"] in excluded:
+            if previous["id"] in excluded or previous["digest"] in seen:
                 continue
             remaining = budget - used
             if remaining < hop:
@@ -7185,6 +7432,7 @@ class AudioLearner:
                 values = self._audio(previous, cancel, previous["count"] - take, take)
                 role = "assistant" if previous["role"] == "assistant" else "user"
                 context.append((NativeAudio.context_role(role, json.loads(previous["metadata"])), values))
+                seen.add(previous["digest"])
                 used += len(values)
                 self.emit("learning_context", key="history_context", sample=previous["id"], generated_as_target=False)
             except (OSError, RuntimeError, ValueError, YuanError) as exc:
@@ -7428,31 +7676,101 @@ class AudioLearner:
             self.emit("phase", key="validating", current=index + 1, total=len(rows), unit="groups", split=row["split"], objective=task)
         return {group: total / weights[group] for group, total in before.items()}, {group: total / weights[group] for group, total in after.items()}
 
+    @staticmethod
+    def comparison_quantile(confidence, degrees):
+        if not 0.5 < confidence < 1 or type(degrees) is not int or degrees < 1:
+            raise YuanError("比较置信度或自由度无效 / Invalid comparison confidence or degrees of freedom")
+        epsilon = math.ulp(1.0)
+        tiny = sys.float_info.min / epsilon
+        def fraction(a, b, x):
+            c = 1.0
+            d = 1.0 - (a + b) * x / (a + 1)
+            d = 1.0 / (d if abs(d) >= tiny else math.copysign(tiny, d))
+            result = d
+            for index in range(1, sys.float_info.mant_dig ** 2):
+                twice = 2 * index
+                for coefficient in (index * (b - index) * x / ((a + twice - 1) * (a + twice)),
+                                    -(a + index) * (a + b + index) * x / ((a + twice) * (a + twice + 1))):
+                    d = 1.0 + coefficient * d
+                    c = 1.0 + coefficient / c
+                    d = 1.0 / (d if abs(d) >= tiny else math.copysign(tiny, d))
+                    c = c if abs(c) >= tiny else math.copysign(tiny, c)
+                    delta = d * c
+                    result *= delta
+                if abs(delta - 1.0) <= epsilon * 4:
+                    return result
+            raise YuanError("比较统计量未收敛 / Comparison statistic did not converge")
+        def beta(x, a, b):
+            if x <= 0:
+                return 0.0
+            if x >= 1:
+                return 1.0
+            factor = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x))
+            if x < (a + 1) / (a + b + 2):
+                return factor * fraction(a, b, x) / a
+            return 1.0 - factor * fraction(b, a, 1.0 - x) / b
+        def survival(value):
+            return beta(degrees / (degrees + value * value), degrees / 2.0, 0.5) / 2.0
+        target, lower, upper = 1.0 - confidence, 0.0, 1.0
+        while survival(upper) > target:
+            upper *= 2
+        while True:
+            middle = (lower + upper) / 2
+            if middle == lower or middle == upper or upper - lower <= epsilon * max(1.0, upper) * 4:
+                return upper
+            if survival(middle) > target:
+                lower = middle
+            else:
+                upper = middle
+
     def _comparison(self, before, after, require_improvement=True):
-        if not before or set(before) != set(after) or any(not math.isfinite(value) for values in (before, after) for value in values.values()):
+        try:
+            valid = (bool(before) and set(before) == set(after)
+                     and all(not isinstance(value, bool) and math.isfinite(value) for values in (before, after) for value in values.values()))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
             raise YuanError("回归比较需要对应的有限测量 / Regression comparison requires matching finite measurements")
-        keys = tuple(before)
-        improvements = [before[key] - after[key] for key in keys]
-        baseline = sum(before.values()) / len(before)
-        updated = sum(after.values()) / len(after)
-        mean = sum(improvements) / len(improvements)
-        variance = sum((value - mean) ** 2 for value in improvements) / max(1, len(improvements))
-        scale = max(1.0, abs(baseline))
-        margin = max(math.sqrt(self.model.torch.finfo(self.model.dtype).eps) * scale, math.sqrt(variance / max(1, len(improvements))))
-        worst = min(improvements)
-        if require_improvement:
-            passed = mean > margin and worst >= -margin * math.sqrt(max(1, len(improvements)))
-        else:
-            passed = updated <= baseline + margin and worst >= -margin * math.sqrt(max(1, len(improvements)))
-        return passed, baseline, updated, margin
+        count = len(before)
+        baseline = math.fsum(float(value) / count for value in before.values())
+        updated = math.fsum(float(value) / count for value in after.values())
+        changes = [float(after[key]) - float(before[key]) for key in before]
+        if not all(math.isfinite(value) for value in changes):
+            raise YuanError("回归变化量超出数值范围 / Regression changes exceed the numeric range")
+        acceptance = AcceptancePolicy(self.model)
+        relative = float(acceptance.data.get("maximum_relative_regression", 0.0))
+        absolute = float(acceptance.data.get("maximum_absolute_regression", 0.0))
+        epsilon = float(self.model.torch.finfo(self.model.dtype).eps)
+        tolerance = absolute + relative * abs(baseline) + epsilon * max(1.0, abs(baseline))
+        per_group = {key: absolute + relative * abs(float(value)) + epsilon * max(1.0, abs(float(value))) for key, value in before.items()}
+        mean = math.fsum(value / count for value in changes)
+        radius = 0.0
+        if count > 1:
+            scale = max(1.0, *(abs(value) for value in changes))
+            variance = math.fsum((value / scale - mean / scale) ** 2 for value in changes) / (count - 1)
+            radius = self.comparison_quantile(acceptance.confidence, count - 1) * math.sqrt(variance / count) * scale
+        upper = mean + radius
+        regressions = [key for key, value in zip(before, changes) if value > per_group[key]]
+        if not all(math.isfinite(value) for value in (baseline, updated, tolerance, mean, radius, upper)):
+            raise YuanError("回归统计量超出数值范围 / Regression statistics exceed the numeric range")
+        passed = count > 1 and not regressions and (upper < -tolerance if require_improvement else upper <= tolerance)
+        reason = ("passed" if passed else "insufficient_sources" if count < 2 else "group_regression" if regressions
+                  else "aggregate_regression" if mean > tolerance else "insufficient_improvement" if require_improvement else "uncertain")
+        self.comparison_result = {"protocol": "paired-source-t-v1", "passed": bool(passed), "reason": reason,
+                                  "sources": count, "confidence": acceptance.confidence, "mean_degradation": mean,
+                                  "uncertainty_radius": radius, "degradation_upper": upper, "allowed_degradation": tolerance,
+                                  "regressed_sources": len(regressions), "requires_improvement": bool(require_improvement),
+                                  "acceptance_policy_sha256": acceptance.digest}
+        return bool(passed), baseline, updated, radius + tolerance
 
     def _contrast_features(self, pair, features, dimension, control, cancel):
         alternative = dict(features)
+        excluded = {self.store.sample(pair[field])["digest"] for field in ("user_sample", "assistant_sample")}
         if dimension == "prompt":
             alternative["prompt"] = control["prompt"]
         elif dimension == "input":
             row = self.store.sample(control["sample"])
-            if row is None or row["group_id"] != pair["group_id"] or row["generated"] or not row["dialogue_eligible"] or row["role"] != "user" or row["id"] == pair["user_sample"]:
+            if row is None or row["group_id"] != pair["group_id"] or row["generated"] or not row["dialogue_eligible"] or row["role"] != "user" or row["digest"] in excluded:
                 raise IneligibleSample("输入对照来源不符合独立验收要求 / Input contrast provenance does not satisfy independent acceptance")
             self.store.read_audio(row, 0, min(row["count"], self.model.hop), cancel=cancel, verify=True)
             alternative["source"] = AudioSequence(row["count"], lambda offset, count: self._audio(row, cancel, offset, count))
@@ -7460,10 +7778,11 @@ class AudioLearner:
             context = []
             for identifier in control["samples"]:
                 row = self.store.sample(identifier)
-                if row is None or row["group_id"] != pair["group_id"] or row["generated"] or not row["dialogue_eligible"] or row["id"] in (pair["user_sample"], pair["assistant_sample"]):
+                if row is None or row["group_id"] != pair["group_id"] or row["generated"] or not row["dialogue_eligible"] or row["digest"] in excluded:
                     raise IneligibleSample("历史对照来源不符合独立验收要求 / History contrast provenance does not satisfy independent acceptance")
                 take = min(row["count"], self.model.window())
                 context.append((row["role"], self._audio(row, cancel, row["count"] - take, take)))
+                excluded.add(row["digest"])
             if not features["context"] and not context:
                 raise IneligibleSample("历史对照没有改变上下文 / History contrast does not change the context")
             alternative["context"] = tuple(context)
@@ -7566,6 +7885,13 @@ class AudioLearner:
         if train_row["group_id"] in validation_groups | guard_groups or validation_groups & guard_groups:
             raise YuanError("训练、验证与保护数据来源重叠 / Training, validation and guard sources overlap")
         self.store.assert_independent(list({train_row["group_id"]} | validation_groups | guard_groups))
+        preserve_task = "dialogue" if task == "acoustic" and self.model.dialogue_trained else "acoustic" if task == "dialogue" else None
+        preservation = {split: self._held_out(preserve_task, split) for split in ("validation", "guard")} if preserve_task is not None else {}
+        selected = [value for values in rows.values() for value in values]
+        selected.extend(value for values in preservation.values() for value in values)
+        if coverage is not None:
+            selected.extend(value for values in coverage["selected"].values() for value in values)
+        snapshot = self.store.evaluation_snapshot(selected)
         self.emit("learning", key="validating", objective=task, **self._state())
         comparisons = {split: self._evaluate(values, task, cancel) for split, values in rows.items()}
         if any(value is None for value in comparisons.values()):
@@ -7574,7 +7900,7 @@ class AudioLearner:
         metrics = {"train": self.training_loss, "groups": {}, "objective": "dialogue reply from real paired audio" if task == "dialogue" else "native acoustic continuation",
                    "conversation_verified": False, "semantic_acceptance": False,
                    "evidence_scope": "conditional_audio_training" if task == "dialogue" else "acoustic_training", "data_revision": self.data_revision,
-                   "training_revision": self.training_revision, "evaluation_revision": self.evaluation_revision}
+                   "training_revision": self.training_revision, "evaluation_revision": self.evaluation_revision, "evaluation_snapshot": snapshot}
         passed = True
         for split, (before, after) in comparisons.items():
             okay, baseline, updated, margin = self._comparison(before, after, True)
@@ -7582,10 +7908,9 @@ class AudioLearner:
             metrics["before" if split == "validation" else "guard_before"] = baseline
             metrics["after" if split == "validation" else "guard_after"] = updated
             metrics[split + "_margin"] = margin
+            metrics[split + "_comparison"] = dict(self.comparison_result)
             metrics["groups"][split] = {key: {"before": before[key], "after": after[key]} for key in before}
-        preserve_task = "dialogue" if task == "acoustic" and self.model.dialogue_trained else "acoustic" if task == "dialogue" else None
         if preserve_task is not None:
-            preservation = {split: self._held_out(preserve_task, split) for split in ("validation", "guard")}
             if any(not values for values in preservation.values()):
                 passed = False
             else:
@@ -7596,7 +7921,7 @@ class AudioLearner:
                     for split, (before, after) in preserve_checks.items():
                         okay, baseline, updated, margin = self._comparison(before, after, False)
                         passed = passed and okay
-                        metrics[preserve_task + "_" + split] = {"before": baseline, "after": updated, "margin": margin}
+                        metrics[preserve_task + "_" + split] = {"before": baseline, "after": updated, "margin": margin, "comparison": dict(self.comparison_result)}
         if coverage is not None:
             regression_rows = [value for values in coverage["selected"].values() for value in values]
             regression = self._regression(regression_rows, cancel)
@@ -7617,7 +7942,7 @@ class AudioLearner:
             suggested = max(1, int(math.ceil(self.validation_seconds / max(tick(), self.training_seconds))))
             self.validation_interval = max(1, int(round(math.sqrt(self.validation_interval * suggested))))
         check(cancel)
-        if self._refresh_data():
+        if self._refresh_data(snapshot):
             return False
         self._adapt(task, metrics, passed)
         if passed:
@@ -7860,6 +8185,15 @@ class DatasetImporter:
                         kind = ("content" if old_manifest.get("training_sha256") != fingerprints["training_sha256"] else
                                 "evaluation" if old_manifest.get("evaluation_sha256") != fingerprints["evaluation_sha256"] else "metadata")
                         self.store.revise(group, kind)
+                    retained_ids = {payload_digest([data["recording_id"], turn["id"]]) for turn in data["turns"]}
+                    retired_digests = set()
+                    previous_rows = self.store.db.execute("SELECT id,digest,metadata FROM samples WHERE group_id=?", (group,)).fetchall()
+                    for previous in previous_rows:
+                        if previous["id"] not in retained_ids and (previous["id"] in old_manifest.get("samples", []) or json.loads(previous["metadata"]).get("annotation_id") == data["annotation_id"]):
+                            self.store.db.execute("UPDATE samples SET learnable=0,dialogue_eligible=0,memory_eligible=0,exclusion='annotation_removed',memory_exclusion='annotation_removed' WHERE id=?", (previous["id"],))
+                            self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE user_sample=? OR assistant_sample=?", (previous["id"], previous["id"]))
+                            self.store.db.execute("DELETE FROM memories WHERE sample_id=?", (previous["id"],))
+                            retired_digests.add(previous["digest"])
                     recorded = {}
                     base_time = self.store.db.execute("SELECT created FROM groups WHERE id=?", (group,)).fetchone()[0]
                     for turn, prepared in staged:
@@ -7933,12 +8267,8 @@ class DatasetImporter:
                                 and json.loads(prior["evidence"]).get("annotation_id") in (old_manifest.get("annotation_id"), data["annotation_id"])):
                             self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE id=?", (prior["id"],))
                     retained = {sample[1]["id"] for sample in recorded.values()}
-                    previous_rows = self.store.db.execute("SELECT id,metadata FROM samples WHERE group_id=?", (group,)).fetchall()
-                    for previous in previous_rows:
-                        if previous["id"] not in retained and (previous["id"] in old_manifest.get("samples", []) or json.loads(previous["metadata"]).get("annotation_id") == data["annotation_id"]):
-                            self.store.db.execute("UPDATE samples SET learnable=0,dialogue_eligible=0,memory_eligible=0,exclusion='annotation_removed',memory_exclusion='annotation_removed' WHERE id=?", (previous["id"],))
-                            self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE user_sample=? OR assistant_sample=?", (previous["id"], previous["id"]))
-                            self.store.db.execute("DELETE FROM memories WHERE sample_id=?", (previous["id"],))
+                    for retired_digest in retired_digests:
+                        self.store.refresh_audio_owner(retired_digest)
                     self.store.assert_independent([group])
                     self.store.set_setting(file_key, key)
                     self.store.set_setting(key, checksum)
@@ -9017,7 +9347,7 @@ class ReplyCancel:
 
     def is_set(self):
         return (self.parent.is_set() or self.capture.stop_event.is_set() or self.capture.reply_epoch != self.epoch
-                or (self.capture.speaking and not self.allow_speaking) or not self.capture.connected)
+                or (self.capture.trusted_speaking and not self.allow_speaking) or not self.capture.connected)
 
     def wait(self, timeout):
         deadline = time.monotonic() + max(0.0, timeout)
@@ -10456,6 +10786,22 @@ class AnnotatedAcquisition:
         self.store.commit()
         self.catalog = read_json(self.root / "catalog.json")
         self.importers = {}
+        self.acquisition_diagnostics = {}
+
+    def rejection(self, code):
+        self.acquisition_diagnostics[code] = self.acquisition_diagnostics.get(code, 0) + 1
+
+    @staticmethod
+    def rejection_reason(diagnostics):
+        labels = {"no_source": "尚未发现候选来源 / No candidate source discovered",
+                  "unsupported_schema": "来源没有受支持的录音标注清单 / Source has no supported recording annotation manifest",
+                  "missing_annotations": "缺少当前任务必需标注 / Required task annotations are missing",
+                  "invalid_annotations": "录音标注未通过校验 / Recording annotations failed validation",
+                  "source_conflict": "录音来源与目标划分冲突 / Recording source conflicts with the target split",
+                  "resource_budget": "来源资源超过当前预算 / Source exceeds the current resource budget",
+                  "coverage_unchanged": "有效导入未增加独立覆盖 / Valid import did not increase independent coverage",
+                  "source_unavailable": "来源暂不可用 / Source temporarily unavailable"}
+        return " · ".join(labels[code] for code in sorted(diagnostics) if code in labels and diagnostics[code])
 
     def sync(self, plan):
         keys = set()
@@ -10463,7 +10809,7 @@ class AnnotatedAcquisition:
             for task in plan:
                 if task["automatic_source"] != "annotated_catalog":
                     continue
-                identifier = payload_digest([task["language"], task["split"], task["scenario"]])
+                identifier = self.task_identity(task)
                 keys.add(identifier)
                 encoded = json.dumps(task, ensure_ascii=False, sort_keys=True)
                 self.store.db.execute("INSERT INTO acquisition_tasks(id,task,status,updated) VALUES(?,?,'pending',?) ON CONFLICT(id) DO UPDATE SET task=excluded.task,status=CASE WHEN acquisition_tasks.status='done' THEN 'pending' ELSE acquisition_tasks.status END,retry_at=CASE WHEN acquisition_tasks.status='done' THEN 0 ELSE acquisition_tasks.retry_at END", (identifier, encoded, time.time()))
@@ -10480,9 +10826,15 @@ class AnnotatedAcquisition:
 
     @staticmethod
     def task_identity(task):
-        return payload_digest([task.get("language"), task.get("split"), task.get("scenario")])
+        return payload_digest([task.get("language"), task.get("split"), task.get("scenario"),
+                               "retrieval" if task.get("gap_kind") == "retrieval_supervision" else "dialogue", task.get("relevant")])
 
     def target_coverage(self, task):
+        if task.get("gap_kind") == "retrieval_supervision":
+            data = MemoryCalibration(self.model, self.store).selection(AcceptancePolicy(self.model))
+            cell = next((item for item in data["coverage"] if item["split"] == task["split"] and item["language"] == task["language"]
+                         and item["relevant"] is task.get("relevant")), {})
+            return {"sources": cell.get("have", 0), "reference_sources": 0, "dialogue_sources": 0}
         report = AcceptancePolicy(self.model).coverage(self.store, self.model, splits=(task["split"],), fresh=True)
         cell = next((cell for cell in report["cells"] if cell["language"] == task["language"] and cell["scenario"] == task["scenario"]), {})
         return {"sources": cell.get("have", 0), "reference_sources": cell.get("reference_sources", 0),
@@ -10506,9 +10858,23 @@ class AnnotatedAcquisition:
         for turn in manifest["turns"]:
             if turn["role"] != "assistant" or turn.get("response_verified") is not True:
                 continue
-            if split == "train":
-                return True
             user = turns.get(turn.get("reply_to"), {})
+            if task.get("gap_kind") == "retrieval_supervision":
+                annotation = turn.get("retrieval", {})
+                if (not isinstance(annotation, dict) or annotation.get("method") != "human_retrieval_relevance_v1"
+                        or annotation.get("verified") is not True or not isinstance(annotation.get("examples"), list)):
+                    continue
+                for example in annotation["examples"]:
+                    if not isinstance(example, dict) or type(example.get("relevant")) is not bool or example["relevant"] is not task.get("relevant"):
+                        continue
+                    candidate = turns.get(example.get("sample"))
+                    if candidate is not None and candidate["id"] not in (user.get("id"), turn["id"]) and candidate["start_seconds"] < user.get("start_seconds", 0):
+                        return True
+                continue
+            if split == "train":
+                if scenario is None or scenario in turn.get("scenarios", manifest.get("scenarios", [])):
+                    return True
+                continue
             if (scenario not in turn.get("scenarios", manifest.get("scenarios", [])) or scenario not in turn.get("contrasts", {})
                     or turn.get("utterance_final") is not True or user.get("utterance_final") is not True):
                 continue
@@ -10539,6 +10905,8 @@ class AnnotatedAcquisition:
         queries = [{"search": " ".join(value for value in (language, "annotated audio dialogue") if value)},
                    {"search": " ".join(value for value in (language, "recorded conversation") if value)},
                    {"search": "speech dialogue"}, {"filter": "yuan-paired-audio-v1"}, {"search": "yuan-paired-audio"}]
+        if task.get("gap_kind") == "retrieval_supervision":
+            queries = [{"search": language + " speech retrieval relevance"}, {"search": "annotated spoken memory"}, *queries]
         cursor_key = "annotation_query_cursor_" + identifier
         cursor = int(self.store.setting(cursor_key, 0)) % len(queries)
         self.store.set_setting(cursor_key, cursor + 1)
@@ -10607,14 +10975,17 @@ class AnnotatedAcquisition:
     def repository(self, repository, cancel):
         key = "annotation_pin_" + payload_digest(repository)
         pin = self.store.setting(key, {})
-        suffix = "/revision/" + pin["revision"] if re.fullmatch(r"[a-f0-9]{40}", str(pin.get("revision", ""))) else ""
+        interval = self.model.policy.number("network", "annotation_catalog_seconds", 3600.0, 1.0, 86400.0)
+        pinned = bool(re.fullmatch(r"[a-f0-9]{40}", str(pin.get("revision", ""))) and pin.get("checked_at", 0) + interval > time.time())
+        suffix = "/revision/" + pin["revision"] if pinned else ""
+        self.network.cancel = cancel
         data = self.network.json("https://huggingface.co/api/datasets/" + repository + suffix + "?blobs=true")
         revision = data.get("sha", "")
         licenses = (data.get("cardData") or {}).get("license", [])
         licenses = [licenses] if isinstance(licenses, str) else licenses
         if (data.get("gated") or data.get("disabled") or not isinstance(licenses, list)
                 or not set(licenses).intersection(self.licenses) or not re.fullmatch(r"[a-f0-9]{40}", str(revision))
-                or pin and revision != pin.get("revision")):
+                or pinned and revision != pin.get("revision")):
             raise IneligibleSample("来源版本、授权或访问条件不满足要求 / Source version, license or access conditions are unsuitable")
         catalog = {}
         for row in data.get("siblings", []):
@@ -10624,8 +10995,8 @@ class AnnotatedAcquisition:
                 catalog[item["name"]] = item
             except InvalidDownload:
                 continue
-        if not pin:
-            self.store.set_setting(key, {"revision": revision, "licenses": licenses, "created": time.time()})
+        if not pinned:
+            self.store.set_setting(key, {"revision": revision, "licenses": licenses, "created": pin.get("created", time.time()), "checked_at": time.time()})
         return revision, catalog
 
     def import_export(self, repository, revision, item, catalog, root, cancel, task=None):
@@ -10644,11 +11015,14 @@ class AnnotatedAcquisition:
                 DatasetImporter.validate_semantic(manifest)
                 if task is not None:
                     if not self.matches_task(manifest, task):
+                        conflict = self.store.db.execute("SELECT 1 FROM groups WHERE source_key=? AND split<>? LIMIT 1", (manifest["recording_id"], task["split"])).fetchone()
+                        self.rejection("source_conflict" if conflict else "missing_annotations")
                         self.store.set_setting(cursor_key, index + 1)
                         continue
                     if manifest.get("split") is None:
                         manifest["split"] = task["split"]
             except (YuanError, ValueError, TypeError, KeyError) as exc:
+                self.rejection("invalid_annotations")
                 self.store.set_setting(cursor_key, index + 1)
                 self.emit("network", key="dataset_rejected", repository=repository, file=item["name"], record=index, reason=concise_error(exc))
                 continue
@@ -10685,12 +11059,15 @@ class AnnotatedAcquisition:
     def acquire(self, task, cancel):
         self.network.cancel = cancel
         before = self.target_coverage(task)
-        result = {"imported": 0, "before": before, "after": before, "gained": {}, "progressed": False}
+        self.acquisition_diagnostics = {}
+        result = {"imported": 0, "before": before, "after": before, "gained": {}, "progressed": False, "blockers": self.acquisition_diagnostics}
         candidates = self.discover(cancel, task)
         requested = task.get("repositories")
         if isinstance(requested, list) and requested:
-            candidates = [repository for repository in candidates if repository in requested]
+            candidates = sorted({repository for repository in requested if isinstance(repository, str)
+                                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository)})
         if not candidates:
+            self.rejection("no_source")
             return result
         identifier = self.task_identity(task)
         cursor_key = "annotation_repository_cursor_" + identifier
@@ -10714,8 +11091,12 @@ class AnnotatedAcquisition:
                 hints = ({"中文": ("zh", "chinese", "mandarin"), "English": ("en", "english")}.get(task["language"], ())
                          + ((task["scenario"],) if task.get("scenario") else ()) + ("annotation", "dialogue", "conversation"))
                 items = sorted(catalog.items(), key=lambda pair: (-sum(word in Path(pair[0]).stem.casefold() for word in hints), pair[0]))
-                for name, item in items:
-                    if Path(name).suffix.lower() not in (".json", ".jsonl") or item["size"] > limit:
+                supported = [(name, item) for name, item in items if Path(name).suffix.lower() in (".json", ".jsonl")]
+                if not supported:
+                    self.rejection("unsupported_schema")
+                for name, item in supported:
+                    if item["size"] > limit:
+                        self.rejection("resource_budget")
                         continue
                     check(cancel)
                     try:
@@ -10728,7 +11109,9 @@ class AnnotatedAcquisition:
                             self.store.set_setting(key, {"state": "active", "revision": revision})
                             if result["progressed"]:
                                 return result
+                            self.rejection("coverage_unchanged")
                     except (InvalidDownload, IneligibleSample, ValueError, TypeError, KeyError) as exc:
+                        self.rejection("invalid_annotations")
                         self.emit("network", key="dataset_rejected", repository=repository, file=name, reason=concise_error(exc))
                 delay = self.model.policy.number("network", "annotation_catalog_seconds", 3600.0, 1.0, 86400.0)
                 self.store.set_setting(key, {"state": "active" if imported else "exhausted", "revision": revision,
@@ -10736,6 +11119,7 @@ class AnnotatedAcquisition:
             except Cancelled:
                 raise
             except (OSError, YuanError, ValueError, TypeError, KeyError) as exc:
+                self.rejection("source_unavailable")
                 failures = state.get("failures", 0) + 1
                 self.store.set_setting(key, {"state": "retry", "failures": failures, "reason": concise_error(exc),
                                              "retry_at": time.time() + self.store.retry_delay(failures)})
@@ -10762,6 +11146,8 @@ class AnnotatedAcquisition:
                 state, reason = "pending", "目标独立来源覆盖增加，完成状态由实际覆盖重新计算 / Target independent-source coverage increased; completion is recalculated from actual coverage"
             elif result["imported"]:
                 reason = "已导入有效数据，但未增加当前任务的独立覆盖 / Valid data imported without increasing independent coverage for this task"
+            elif result.get("blockers"):
+                reason = self.rejection_reason(result["blockers"]) or reason
         except Cancelled:
             self.store.db.execute("UPDATE acquisition_tasks SET status='pending',retry_at=0 WHERE id=?", (row["id"],))
             self.store.commit()
@@ -10778,7 +11164,7 @@ class AnnotatedAcquisition:
         state = current["status"] if current is not None else state
         status = self.store.setting("source_coverage_state", {})
         self.emit("data_acquisition", key="data_sources_exhausted" if status.get("blocked") else "data_plan", task=task, state=state,
-                  worked=worked, imported=result["imported"], gained=result["gained"], reason=reason)
+                  worked=worked, imported=result["imported"], gained=result["gained"], blockers=result.get("blockers", {}), reason=reason)
         return worked
 
 class PublishedSpeech:
@@ -11143,13 +11529,13 @@ class PublicAudioWorker:
                         if signature != plan_signature:
                             self.emit("data_plan", key="data_plan", tasks=plan, unsupported=[task for task in plan if task["automatic_source"] is None])
                             plan_signature = signature
+                        worked = scheduler.step("annotated_catalog", lambda: acquisition.step(plan, cancel), cancel) or worked
                         prioritized = any(task["automatic_source"] == "public_dialogue" for task in plan)
                         jobs = (*native_sources, dialogues, sources) if prioritized else (*native_sources, sources, dialogues)
                         for job in jobs:
                             check(cancel)
                             name = getattr(job, "repository", type(job).__name__)
                             worked = scheduler.step(name, lambda job=job: job.step(cancel), cancel) or worked
-                        worked = scheduler.step("annotated_catalog", lambda: acquisition.step(plan, cancel), cancel) or worked
                     else:
                         self.emit("network", key="learning_storage_pause", budget=budget)
                     failures = 0
@@ -11211,6 +11597,7 @@ class CaptureSession:
         self.wake = threading.Event()
         self.connected = False
         self.speaking = False
+        self.trusted_speaking = False
         self.reply_epoch = 0
         self.utterance_id = None
         self.chunk_index = 0
@@ -11255,7 +11642,7 @@ class CaptureSession:
                   "sequence": self.packet_sequence}
         packet["storage_queued"] = self.writer.enqueue(packet)
         self.saved += int(packet["storage_queued"])
-        if not metadata.get("final") and not self.is_set():
+        if not metadata.get("final") and not self.is_set() and metadata.get("capture_quality", {}).get("user_speech") is True:
             accepted, dropped = self.inference.put(packet, replace_oldest=True, preserve_utterance=True)
             self.inference_dropped += len(dropped) + int(not accepted)
             if dropped or not accepted:
@@ -11301,7 +11688,7 @@ class CaptureSession:
                     self.emit("status", key="capture_recover", id=self.session_id)
                     self.emit("notice", key="capture_recover", reason=concise_error(exc))
                 finally:
-                    self.connected = self.speaking = False
+                    self.connected = self.speaking = self.trusted_speaking = False
                     self.emit("audio", id=self.session_id, continuous=False, speech_active=False, level=0.0)
                     self.reply_epoch += 1
                     self.devices.abort()
@@ -11313,7 +11700,7 @@ class CaptureSession:
             self.failure = exc
             self.emit("notice", key="capture_incomplete", reason=concise_error(exc), id=self.session_id)
         finally:
-            self.connected = self.speaking = False
+            self.connected = self.speaking = self.trusted_speaking = False
             self.inference.close()
             self.emit("audio", id=self.session_id, continuous=False, level=0.0, recorded=0.0)
             self.emit("capture_stopped", key="capture_stopped" if self.failure is None else "capture_incomplete", id=self.session_id, tail_complete=self.failure is None)
@@ -11381,8 +11768,14 @@ class CaptureSession:
                 before = gate.active
                 result = gate.push(frame, timestamp)
                 quality["user_speech"] = bool(gate.active and (not overlap or echo.double_talk and residual_clean))
-                if not before and (gate.active or result is not None):
+                trusted = bool(gate.active and (self.trusted_speaking or quality["user_speech"]))
+                if trusted and not self.trusted_speaking:
                     self.reply_epoch += 1
+                    if before:
+                        self.utterance_id = uuid.uuid4().hex
+                        self.chunk_index = 0
+                self.trusted_speaking = trusted
+                if not before and (gate.active or result is not None):
                     self.utterance_id = uuid.uuid4().hex
                     self.chunk_index = 0
                     segment_quality = list(quality_frames)
@@ -11400,7 +11793,7 @@ class CaptureSession:
                 if now - last_levels >= math.sqrt(gate.frame_seconds):
                     last_levels = now
                     self.emit("audio", id=self.session_id, level=float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))), probability=gate.confidence, noise_state=gate.noise_state, faults=devices.faults + devices.ring.overflows,
-                              input_faults=devices.input_faults + devices.ring.overflows, output_faults=devices.output_faults, recorded=sum(len(value) for value in gate.frames) / model.rate, continuous=True, speech_active=gate.active,
+                              input_faults=devices.input_faults + devices.ring.overflows, output_faults=devices.output_faults, recorded=sum(len(value) for value in gate.frames) / model.rate, continuous=True, speech_active=gate.active, trusted_speech_active=self.trusted_speaking,
                               pending=self.inference.pending(), pending_storage=self.writer.queue.pending(), dropped_samples=devices.ring.dropped, echo_correlation=echo.correlation, echo_reduction=echo.reduction, echo_state=echo.reference_state, double_talk=echo.double_talk, echo_paths=len(echo.paths), playback_overlap=overlap)
         def ingest(raw, timestamp, gap):
             nonlocal resampler, gate, echo, pending, origin, position, segment_gap, segment_overlap, segment_start, overlap_until, quality_frames, segment_quality
@@ -11421,7 +11814,7 @@ class CaptureSession:
                 segment_overlap = False
                 segment_start = None
                 overlap_until = -math.inf
-                self.speaking = False
+                self.speaking = self.trusted_speaking = False
                 self.reply_epoch += 1
                 self.emit("notice", key="capture_gap", faults=devices.input_faults + devices.ring.overflows, dropped_samples=devices.ring.dropped, discontinuities=devices.ring.discontinuities, timestamp=timestamp)
             if origin is None:
@@ -11452,7 +11845,7 @@ class CaptureSession:
             if origin is not None:
                 consume(resampler.process(np.empty(0, dtype=np.float32), final=True), final=True, interrupted=True)
                 save(gate.flush(), segment_start if segment_start is not None else origin + position / model.rate, final=True)
-            self.speaking = False
+            self.speaking = self.trusted_speaking = False
 
 def concise_error(exc):
     seen = set()
@@ -11465,7 +11858,7 @@ def concise_error(exc):
     return redact(" ← ".join(values))
 
 class MemoryCalibration:
-    protocol = "yuan-memory-relevance-v1"
+    protocol = "yuan-memory-relevance-v2"
 
     def __init__(self, model, store):
         self.model, self.store = model, store
@@ -11474,80 +11867,119 @@ class MemoryCalibration:
     def model_key(cls, model):
         return payload_digest([cls.protocol, model.serving_digest or model.active_digest or model.identity(), behavior_digest(), model.rate, model.hop, model.width])
 
+    def selection(self, acceptance, cancel=None):
+        revisions = self.store.revisions()
+        version = (revisions["evaluation_revision"], revisions["training_revision"], self.model.window(), self.model.rate, acceptance.digest)
+        cached = getattr(self.store, "retrieval_selection_cache", None)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        selected = {split: {language: {True: {}, False: {}} for language in acceptance.languages} for split in ("validation", "guard")}
+        rows = self.store.db.execute("SELECT p.*,g.split,g.source_key FROM turn_pairs p JOIN groups g ON g.id=p.group_id WHERE g.split IN ('validation','guard') AND p.verified=1 AND p.eligible=1 AND json_extract(p.evidence,'$.retrieval.verified')=1 ORDER BY g.source_key,p.id")
+        for pair in rows:
+            check(cancel)
+            evidence = json.loads(pair["evidence"])
+            language = evidence.get("language")
+            annotation = evidence.get("retrieval", {})
+            if language not in acceptance.languages or not isinstance(annotation, dict) or annotation.get("method") != "human_retrieval_relevance_v1":
+                continue
+            query = self.store.sample(pair["user_sample"])
+            if (query is None or query["audio_status"] != "ready" or query["generated"] or not query["dialogue_eligible"]
+                    or query["count"] < 1 or query["count"] / query["rate"] > self.model.window() / self.model.rate):
+                continue
+            examples = annotation.get("examples")
+            if not isinstance(examples, list):
+                continue
+            for example in examples:
+                if not isinstance(example, dict) or type(example.get("relevant")) is not bool:
+                    continue
+                relevant = example["relevant"]
+                items = selected[pair["split"]][language][relevant]
+                if len(items) >= acceptance.minimum or pair["source_key"] in items:
+                    continue
+                sample_id = example.get("sample")
+                if not isinstance(sample_id, str):
+                    continue
+                candidate = self.store.sample(sample_id)
+                start, end = example.get("start"), example.get("end")
+                if (candidate is None or candidate["split"] != pair["split"] or candidate["audio_status"] != "ready" or candidate["generated"]
+                        or not candidate["dialogue_eligible"] or candidate["id"] in (query["id"], pair["assistant_sample"])
+                        or candidate["group_id"] == query["group_id"] and candidate["created"] >= query["created"]
+                        or type(start) is not int or type(end) is not int or not 0 <= start < end <= candidate["count"]
+                        or (end - start) / candidate["rate"] > self.model.window() / self.model.rate):
+                    continue
+                items[pair["source_key"]] = (pair, query, candidate, example)
+        coverage = [{"kind": "retrieval_supervision", "language": language, "split": split, "relevant": relevant,
+                     "have": len(items), "need": acceptance.minimum}
+                    for split, languages in selected.items() for language, labels in languages.items() for relevant, items in labels.items()]
+        result = {"selected": selected, "coverage": coverage, "missing": [item for item in coverage if item["have"] < item["need"]]}
+        self.store.retrieval_selection_cache = (version, result)
+        return result
+
     def certificate(self):
         value = self.store.setting("memory_calibration", {})
         if not isinstance(value, dict) or value.get("protocol") != self.protocol:
             return {}
-        expected = {"model_key": self.model_key(self.model), "evaluator_sha256": behavior_digest(), "evaluation_revision": self.store.setting("evaluation_revision"), "acceptance_policy_sha256": AcceptancePolicy(self.model).digest}
+        expected = {"model_key": self.model_key(self.model), "evaluator_sha256": behavior_digest(), "acceptance_policy_sha256": AcceptancePolicy(self.model).digest}
         threshold = value.get("threshold")
         if (value.get("passed") is not True or any(value.get(key) != item for key, item in expected.items())
                 or isinstance(threshold, bool) or not isinstance(threshold, (float, int)) or not math.isfinite(threshold)
-                or value.get("sha256") != payload_digest({key: item for key, item in value.items() if key != "sha256"})):
+                or value.get("sha256") != payload_digest({key: item for key, item in value.items() if key != "sha256"})
+                or not self.store.snapshot_valid(value.get("evaluation_snapshot"))):
             return {}
         return value
 
     def refresh(self, cancel):
         acceptance = AcceptancePolicy(self.model)
-        identity = {"model_key": self.model_key(self.model), "evaluator_sha256": behavior_digest(), "evaluation_revision": self.store.setting("evaluation_revision"), "acceptance_policy_sha256": acceptance.digest}
-        signature = payload_digest(identity)
-        if self.certificate() or self.store.setting("memory_calibration_attempt") == signature:
+        identity = {"model_key": self.model_key(self.model), "evaluator_sha256": behavior_digest(), "acceptance_policy_sha256": acceptance.digest}
+        if self.certificate():
             return False
-        selected, groups = {split: {True: {}, False: {}} for split in ("validation", "guard")}, []
-        rows = self.store.db.execute("SELECT p.*,g.split,g.source_key FROM turn_pairs p JOIN groups g ON g.id=p.group_id WHERE g.split IN ('validation','guard') AND p.verified=1 AND p.eligible=1 AND json_extract(p.evidence,'$.retrieval.verified')=1 ORDER BY g.source_key,p.id")
-        for pair in rows:
-            check(cancel)
-            annotation = json.loads(pair["evidence"]).get("retrieval", {})
-            if annotation.get("method") != "human_retrieval_relevance_v1":
-                continue
-            query = self.store.sample(pair["user_sample"])
-            if query is None or query["audio_status"] != "ready" or query["generated"]:
-                continue
-            for example in annotation.get("examples", []):
-                relevant = example.get("relevant")
-                if type(relevant) is not bool or len(selected[pair["split"]][relevant]) >= acceptance.minimum:
-                    continue
-                candidate = self.store.sample(example.get("sample", ""))
-                if (candidate is None or candidate["split"] != pair["split"] or candidate["audio_status"] != "ready" or candidate["generated"]
-                        or candidate["id"] == query["id"]):
-                    continue
-                selected[pair["split"]][relevant].setdefault(pair["source_key"], (pair["id"], query, candidate, example))
-        if any(len(items) < acceptance.minimum for labels in selected.values() for items in labels.values()):
+        data = self.selection(acceptance, cancel)
+        selected = data["selected"]
+        rows = [row for languages in selected.values() for labels in languages.values() for items in labels.values()
+                for pair, query, candidate, example in items.values() for row in (pair, query, candidate)]
+        snapshot = self.store.evaluation_snapshot(rows)
+        signature = payload_digest([identity, snapshot["sha256"], data["coverage"]])
+        if self.store.setting("memory_calibration_attempt") == signature:
+            return False
+        if data["missing"]:
             self.store.set_setting("memory_calibration_attempt", signature)
-            self.store.set_setting("memory_calibration", {**identity, "passed": False, "reason": "independent_retrieval_labels_missing"})
+            self.store.set_setting("memory_calibration", {**identity, "protocol": self.protocol, "passed": False,
+                                   "reason": "independent_retrieval_labels_missing", "missing": data["missing"], "coverage": data["coverage"]})
             return False
         measurements, records = {split: {True: [], False: []} for split in selected}, []
         np = self.model.np
-        for split, labels in selected.items():
-            for relevant, items in labels.items():
-                for source, (pair, query, candidate, example) in items.items():
-                    check(cancel)
-                    start, end = example["start"], example["end"]
-                    if (type(start) is not int or type(end) is not int or not 0 <= start < end <= candidate["count"]
-                            or query["count"] / query["rate"] > self.model.window() / self.model.rate
-                            or (end - start) / candidate["rate"] > self.model.window() / self.model.rate):
-                        self.store.set_setting("memory_calibration_attempt", signature)
-                        return False
-                    vectors = []
-                    for row, offset, count in ((query, 0, query["count"]), (candidate, start, end-start)):
-                        values = self.store.read_audio(row, offset, count, cancel=cancel, verify=True)
-                        if row["rate"] != self.model.rate:
-                            values = self.model.normalize(values, row["rate"])
-                        vectors.append(self.model.memory_vector(values, "assistant" if row["role"] == "assistant" else "user", cancel))
-                    denominator = float(np.linalg.norm(vectors[0]) * np.linalg.norm(vectors[1]))
-                    score = float(np.dot(vectors[0], vectors[1]) / denominator) if denominator > np.finfo(np.float32).eps else math.nan
-                    if not math.isfinite(score):
-                        self.store.set_setting("memory_calibration_attempt", signature)
-                        return False
-                    measurements[split][relevant].append(score)
-                    records.append({"source": source, "pair": pair, "query": query["id"], "query_sha256": query["digest"], "candidate": candidate["id"], "candidate_sha256": candidate["digest"], "start": start, "end": end, "relevant": relevant, "similarity": score, "split": split})
-                    groups.extend((query["group_id"], candidate["group_id"]))
-        self.store.assert_independent(list(set(groups)))
+        for split, languages in selected.items():
+            for language, labels in languages.items():
+                for relevant, items in labels.items():
+                    for source, (pair, query, candidate, example) in items.items():
+                        check(cancel)
+                        start, end = example["start"], example["end"]
+                        vectors = []
+                        for row, offset, count in ((query, 0, query["count"]), (candidate, start, end - start)):
+                            values = self.store.read_audio(row, offset, count, cancel=cancel, verify=True)
+                            if row["rate"] != self.model.rate:
+                                values = self.model.normalize(values, row["rate"])
+                            vectors.append(self.model.memory_vector(values, "assistant" if row["role"] == "assistant" else "user", cancel))
+                        denominator = float(np.linalg.norm(vectors[0]) * np.linalg.norm(vectors[1]))
+                        score = float(np.dot(vectors[0], vectors[1]) / denominator) if denominator > np.finfo(np.float32).eps else math.nan
+                        if not math.isfinite(score):
+                            self.store.set_setting("memory_calibration_attempt", signature)
+                            self.store.set_setting("memory_calibration", {**identity, "protocol": self.protocol, "passed": False,
+                                                   "reason": "invalid_retrieval_embedding", "coverage": data["coverage"]})
+                            return False
+                        measurements[split][relevant].append(score)
+                        records.append({"source": source, "pair": pair["id"], "language": language, "query": query["id"], "query_sha256": query["digest"],
+                                        "candidate": candidate["id"], "candidate_sha256": candidate["digest"], "start": start, "end": end,
+                                        "relevant": relevant, "similarity": score, "split": split})
         threshold = max(measurements["validation"][False])
         passed = all(score > threshold for labels in measurements.values() for score in labels[True]) and all(score <= threshold for score in measurements["guard"][False])
         check(cancel)
-        if self.store.setting("evaluation_revision") != identity["evaluation_revision"]:
+        if not self.store.snapshot_valid(snapshot) or self.model_key(self.model) != identity["model_key"]:
             return False
-        value = {**identity, "protocol": self.protocol, "passed": passed, "threshold": threshold, "records": records, "scope": "independently_annotated_retrieval"}
+        value = {**identity, "protocol": self.protocol, "passed": passed, "threshold": threshold, "records": records, "coverage": data["coverage"],
+                 "evaluation_snapshot": snapshot, "scope": "independently_annotated_bilingual_historical_retrieval"}
+        if not passed:
+            value["reason"] = "retrieval_relevance_not_separated"
         value["sha256"] = payload_digest(value)
         self.store.set_setting("memory_calibration", value)
         self.store.set_setting("memory_calibration_attempt", signature)
@@ -11638,7 +12070,7 @@ class Engine:
                   "capture": {"id": None, "continuous": False, "speech_active": False, "pending": 0}}
         if self.devices and self.devices.capture:
             capture = self.devices.capture
-            values["capture"] = {"id": capture.session_id, "continuous": capture.connected, "speech_active": capture.speaking, "pending": capture.inference.pending(), "pending_storage": capture.writer.queue.pending()}
+            values["capture"] = {"id": capture.session_id, "continuous": capture.connected, "speech_active": capture.speaking, "trusted_speech_active": capture.trusted_speaking, "pending": capture.inference.pending(), "pending_storage": capture.writer.queue.pending()}
         if self.devices:
             values["audio_clocks"] = {key: {"source": "hardware" if row["hardware"] else "sample_count", "arrival": row["arrival"]}
                                       for key, row in getattr(self.devices, "clock_states", {}).copy().items()}
@@ -12427,6 +12859,8 @@ class Engine:
                 "missing": report["missing"], "sources": report["sources"], "coverage": report["cells"], "data_gaps": report["data_gaps"],
                 "acquisition_plan": AcceptancePolicy(self.model).acquisition_plan(report), "acquisition_state": self.store.setting("acquisition_summary", {}),
                 "source_state": self.store.setting("source_coverage_state", {}),
+                "memory_calibration": {key: value for key, value in self.store.setting("memory_calibration", {}).items()
+                                       if key in ("passed", "reason", "coverage", "missing", "scope")},
                 "reference_missing": report["reference_missing"], "reference_ready": report["reference_ready"],
                 "dialogue_missing": report["dialogue_missing"], "dialogue_reference_ready": report["dialogue_reference_ready"],
                 "review_pending": bool(pointer.get("review_file")), "review_model": pointer.get("model_sha256"),
