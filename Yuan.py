@@ -70,8 +70,8 @@ TEXT = {
     "acceptance_data_missing": ("对话未就绪 · 独立验证或发布场景数据不足", "Conversation not ready · independent validation or release scenario data missing"),
     "reference_data_missing": ("对话未就绪 · 缺少完整能力标注的独立参考回复", "Conversation not ready · independently annotated reference replies missing"),
     "fault_resource": ("设备可用资源不足", "Insufficient available device resources"),
-    "resource_restored": ("可用内存已稳定恢复 · 继续准备", "Available memory recovered steadily · resuming preparation"),
-    "resource_check": ("复查可用内存与模型需求", "Checking available memory against model requirements"),
+    "resource_restored": ("所需设备资源已稳定恢复 · 继续准备", "Required device resources recovered steadily · resuming preparation"),
+    "resource_check": ("复查目标设备资源与模型需求", "Checking target-device resources against model requirements"),
     "semantic_evidence_missing": ("对话未就绪 · 语义能力证据不足，波形复现不作为能力通过", "Conversation not ready · semantic evidence missing; waveform reconstruction is not capability acceptance"),
     "data_plan": ("自主学习数据缺口与获取计划", "Autonomous learning data gaps and acquisition plan"),
     "action_resource": ("可用资源不足 · 已暂停准备并保留状态", "Available resources are insufficient · preparation paused and state preserved"),
@@ -88,7 +88,7 @@ TEXT = {
     "retry_total_exhausted": ("启动失败总次数达到上限", "Total startup failure limit reached"),
     "retry_same_fault_exhausted": ("同类故障达到自动重试上限", "Automatic retry limit for this fault reached"),
     "retry_import_unchanged": ("单组件导入复检仍未完成，已停止重复启动", "Isolated import recheck also timed out; repeated startup stopped"),
-    "retry_requires_change": ("等待运行条件变化或手动重新检查", "Waiting for changed conditions or a manual recheck"),
+    "retry_requires_change": ("等待运行条件变化；保留阻塞原因与已有进度", "Waiting for changed runtime conditions; blocker and progress retained"),
     "no_startup_task": ("当前没有正在执行的启动任务", "No startup task is currently running"),
     "waiting_conditions": ("仅检查恢复条件，不重复启动", "Checking recovery conditions only; startup is not repeated"),
     "retry_next_action": ("到时将从可用检查点恢复准备，不重复已校验的安装", "Preparation will resume from a usable checkpoint without repeating verified installation"),
@@ -123,7 +123,7 @@ TEXT = {
     "process_idle": ("未运行子进程", "No child process running"),
     "owned_source_found": ("已发现自有模型交付来源，尚待完整验收", "Owned model delivery source found; full acceptance still required"),
     "owned_source_absent": ("首次运行将自动创建本地模型，随后自主学习并验证对话能力", "First launch creates a local model, then learns and validates conversation ability automatically"),
-    "owned_source_invalid": ("自有模型来源配置需修正；运行环境准备仍继续", "Owned model source configuration needs correction; runtime preparation continues"),
+    "owned_source_invalid": ("自有模型来源未通过校验；保留原配置与原因，未加载该来源", "Owned model source did not pass verification; original configuration and reason retained; source not loaded"),
     "open_fault": ("查看处理方法", "View recovery action"),
     "operation_begin": ("开始", "Started"),
     "operation_complete": ("完成", "Completed"),
@@ -144,15 +144,15 @@ TEXT = {
     "recheck_requested": ("已请求重新检查", "Recheck requested"),
     "conditions_changed": ("运行条件已改变 · 重新检查", "Runtime conditions changed · checking again"),
     "network_restored": ("目标来源恢复可达 · 继续准备", "Target source reachable again · resuming preparation"),
-    "retry_budget_exhausted": ("自动重试次数或执行预算已用尽 · 处理原因后点击「重新检查」", "Automatic retry count or execution budget exhausted · address the cause and select Recheck"),
-    "action_network": ("检查目标来源、网络、代理或证书；连接恢复后在预算内继续", "Check the target source, network, proxy or certificates; resume within budget when reachable"),
-    "action_timeout": ("阶段已超时；检查运行条件后重新检查", "Stage timed out; review runtime conditions, then recheck"),
-    "action_storage": ("释放所选目录的磁盘空间或恢复写权限后重新检查", "Free workspace disk space or restore write access, then recheck"),
-    "action_integrity": ("校验未通过；检查组件来源或证书，不会跳过校验", "Verification failed; check the component source or certificates; verification remains required"),
-    "action_resolution": ("包源没有提供可确认的兼容候选；检查包源配置后重新检查", "No confirmed compatible candidate from the index; review index configuration and recheck"),
-    "action_configuration": ("运行配置无效；修正所选目录中的配置后重新检查", "Runtime configuration invalid; correct the workspace configuration and recheck"),
-    "action_compatibility": ("没有通过验证的解释器；检查组件和解释器兼容性后重新检查", "No interpreter passed verification; review component and interpreter compatibility, then recheck"),
-    "action_unknown": ("已停止无变化的重复启动；查看当前阻塞原因后重新检查", "Unchanged restart attempts stopped; review the current blocker, then recheck"),
+    "retry_budget_exhausted": ("自动重试预算已用尽；保留状态并监测运行条件变化", "Automatic retry budget exhausted; state retained while monitoring runtime conditions"),
+    "action_network": ("目标来源尚未恢复连接；保留进度并在预算内复查可达性", "Target connection has not recovered; progress retained while reachability is rechecked within budget"),
+    "action_timeout": ("阶段已超时；保留检查点与诊断，停止无变化的重复启动", "Stage timed out; checkpoint and diagnostics retained; unchanged restarts stopped"),
+    "action_storage": ("所选目录空间或写权限受限；状态已保留，监测存储条件变化", "Workspace space or write access is restricted; state retained while monitoring storage conditions"),
+    "action_integrity": ("校验未通过；保留具体原因，不跳过校验，不加载未验证资产", "Verification failed; reason retained; checks remain required and unverified assets are not loaded"),
+    "action_resolution": ("尚未找到可确认的兼容组件；保留查询结果与阻塞原因", "No confirmed compatible component found; query results and blocker retained"),
+    "action_configuration": ("运行配置未通过校验；保留原文件与具体原因，停止使用无效配置", "Runtime configuration failed validation; original file and reason retained; invalid configuration is not used"),
+    "action_compatibility": ("现有候选未通过运行验证；保留诊断与进度，等待可验证的运行条件", "Current candidates did not pass runtime verification; diagnostics and progress retained pending verifiable runtime conditions"),
+    "action_unknown": ("已停止无变化的重复启动；保留诊断并监测运行条件变化", "Unchanged restarts stopped; diagnostics retained while monitoring runtime conditions"),
     "fault_record": ("故障记录", "Fault record"),
     "recovery_action": ("下一步", "Next action"),
     "recovery_attempts": ("同类失败", "Matching failures"),
@@ -350,8 +350,6 @@ TEXT = {
     "prefill": ("提示词 + 音频直接进入 Yuan 模型", "Prompt + audio entering the Yuan model directly"),
     "generating": ("Yuan 模型直接生成音频", "Yuan model generating audio directly"),
     "activity": ("运行状态", "Activity"),
-    "all_activity": ("展开记录", "View activity"),
-    "older": ("较早", "Earlier"), "newer": ("较新", "Later"), "live": ("实时", "Live"),
     "runtime_message": ("运行组件反馈", "Runtime component feedback"),
     "journal_failure": ("运行状态保存失败 · 正在保留当前服务", "Runtime state save failed · preserving current service"),
     "backoff": ("自动恢复倒计时", "Automatic recovery countdown"),
@@ -360,7 +358,6 @@ TEXT = {
     "memory_pause": ("内存余量不足 · 暂停学习并自动复查", "Memory headroom is low · learning paused with automatic checks"),
     "source_skipped": ("公开音频暂不适用", "Public audio is not currently usable"),
     "recovered": ("运行条件已恢复", "Runtime conditions recovered"),
-    "recording_resumed": ("运行记录写入已恢复", "Activity recording has resumed"),
     "resource_failure": ("资源监测暂不可用", "Resource monitoring is temporarily unavailable"),
     "learn_yield": ("学习已暂停，优先对话", "Learning yielded to conversation"),
     "started": ("对话已开始", "Conversation started"),
@@ -2138,16 +2135,16 @@ class RuntimeInstaller:
         if system == "Darwin":
             return ["native"]
         if nvidia:
-            version = self.hardware.get("cuda")
-            maximum = tuple(map(int, version.split("."))) if version else None
+            version = str(self.hardware.get("cuda") or "")
+            maximum_major = int(version.split(".", 1)[0]) if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version) else None
             capabilities = [float(value) for value in self.hardware.get("compute_capabilities", []) if re.fullmatch(r"[0-9]+\.[0-9]+", str(value))]
             channels = []
             for capability in sorted(set(capabilities), reverse=True) or [None]:
                 compatible = (["cu128", "cu130"] if capability is not None and capability >= 10 else
-                              ["cu126"] if capability is not None and capability < 7.5 else ["cu126", "cu128", "cu130"])
+                              ["cu126", "cu118"] if capability is not None and capability < 7.5 else ["cu126", "cu128", "cu130", "cu118"])
                 channels.extend(channel for channel in compatible if channel not in channels)
-            if maximum is not None:
-                channels = [channel for channel in channels if (int(channel[2:-1]), int(channel[-1])) <= maximum]
+            if maximum_major is not None:
+                channels = [channel for channel in channels if int(channel[2:-1]) <= maximum_major]
             if system == "Windows":
                 channels.append("directml")
             if channels:
@@ -2164,6 +2161,10 @@ class RuntimeInstaller:
                 raise YuanFault("正在匹配图形计算驱动 / Matching the graphics compute driver", category="compatibility", code="accelerator_driver_match", hardware=self.hardware)
         return ["cpu"]
 
+    @staticmethod
+    def torch_version(backend):
+        return {"directml": "2.4.1", "cu118": "2.7.1"}.get(backend, "2.10.0")
+
 
     def required_packages(self):
         if self.compute_backend == "directml":
@@ -2171,7 +2172,7 @@ class RuntimeInstaller:
         return PACKAGES
 
     def runtime_signature(self):
-        return payload_digest(["yuan-runtime-v6", self.required_packages(), self.hardware, self.compute_backend, PYTHON_REQUIREMENT, "torch==2.10.0", "metadata-first-resume-v6"])
+        return payload_digest(["yuan-runtime-v7", self.required_packages(), self.hardware, self.compute_backend, PYTHON_REQUIREMENT, self.torch_version(self.compute_backend), "metadata-first-resume-v6"])
 
     def _platform_key(self, python):
         script = "import json,platform,sys,sysconfig;print(json.dumps([platform.system(),platform.machine(),sys.version_info[:2],sys.implementation.name,sysconfig.get_config_var('SOABI')],separators=(',',':')))"
@@ -2452,10 +2453,10 @@ class RuntimeInstaller:
 
     def torch_requirement(self, python, runtime):
         backend = self.compute_backend or ("cpu" if platform.system() in ("Linux", "Windows") else "native")
+        version = self.torch_version(backend)
         if backend == "native":
-            return "torch==2.10.0"
+            return "torch==" + version
         channel = "cpu" if backend == "directml" else backend
-        version = "2.4.1" if backend == "directml" else "2.10.0"
         if channel not in ("cpu", "xpu") and not re.fullmatch(r"(?:cu\d{2,4}|rocm\d+\.\d+(?:\.\d+)?)", channel):
             raise YuanFault("计算后端标识无效 / Invalid compute backend identifier", category="compatibility", code="backend_identifier")
         index = "https://download.pytorch.org/whl/" + channel + "/torch/"
@@ -2792,7 +2793,7 @@ class RuntimeInstaller:
         for request in self.interpreter_candidates():
             check(self.cancel)
             key = payload_digest([request, sys.executable if request == "host" else None, sys.version if request == "host" else None,
-                                  PACKAGES, "torch==2.10.0", self.hardware, "yuan-runtime-pinned-v6", self.network_config.index_urls])
+                                  PACKAGES, [[backend, self.torch_version(backend)] for backend in self.backend_candidates()], self.hardware, "yuan-runtime-pinned-v7", self.network_config.index_urls])
             record = records.get(key, {})
             if record.get("failed_at", 0) + interval > time.time():
                 attempted.append({"interpreter": request, "cached_failure": True, "reason": record.get("reason")})
@@ -3329,6 +3330,7 @@ class StorageBudget:
 
 class AudioStore:
     file_lock = threading.RLock()
+    file_leases = {}
     training_pair_filter = "(p.verified=1 OR (p.source='published_dialogue_turns' AND json_extract(p.evidence,'$.method')='published_stereo_dialogue_v1' AND json_extract(p.evidence,'$.training_only')=1))"
 
     @staticmethod
@@ -3356,30 +3358,50 @@ class AudioStore:
         self.audio.mkdir(exist_ok=True)
         self.db = sqlite3.connect(str(database_path(self.root, "memory.sqlite3")), timeout=math.sqrt(os.cpu_count() or 1))
         self.db.row_factory = sqlite3.Row
-        try:
-            tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            expected = (1, build_digest())
-            if tables:
-                row = self.db.execute("SELECT schema_version,build_sha256 FROM workspace_identity WHERE singleton=1").fetchone() if "workspace_identity" in tables else None
-                if row is None or tuple(row) != expected:
-                    raise YuanFault("数据库版本身份不匹配，已拒绝读取旧数据 / Database build identity mismatch; old data will not be read", category="integrity", code="database_build_mismatch")
-            self.db.execute("CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,build_sha256 TEXT NOT NULL)")
-            self.db.execute("INSERT OR IGNORE INTO workspace_identity VALUES(1,?,?)", expected)
-            self.db.commit()
-        except BaseException:
-            self.db.close()
-            raise
-        self.db.create_function("yuan_sample_supervision", 1, lambda value: payload_digest(self.sample_supervision(json.loads(value))), deterministic=True)
-        self.db.create_function("yuan_pair_supervision", 1, lambda value: payload_digest(self.pair_supervision(json.loads(value))), deterministic=True)
-        self.db.create_function("yuan_evidence", 1, lambda value: payload_digest(self.evidence_metadata(json.loads(value))), deterministic=True)
         self.transaction_depth = 0
         self.integrity_cache = {}
         self.coverage_cache = {}
-        self.policy = AdaptivePolicy(state)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA recursive_triggers=ON")
-        self.db.executescript("""
+        self.repair_iterator = None
+        self.repair_epoch = None
+        try:
+            self.policy = AdaptivePolicy(state)
+            self.db.create_function("yuan_sample_supervision", 1, lambda value: payload_digest(self.sample_supervision(json.loads(value))), deterministic=True)
+            self.db.create_function("yuan_pair_supervision", 1, lambda value: payload_digest(self.pair_supervision(json.loads(value))), deterministic=True)
+            self.db.create_function("yuan_evidence", 1, lambda value: payload_digest(self.evidence_metadata(json.loads(value))), deterministic=True)
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA foreign_keys=ON")
+            self.db.execute("PRAGMA recursive_triggers=ON")
+            self._initialize_schema()
+            if recover:
+                with self.transaction():
+                    self.db.execute("UPDATE sessions SET ended=? WHERE ended IS NULL", (time.time(),))
+                    prior = self.setting("audio_repair", {})
+                    if not isinstance(prior, dict) or prior.get("phase") not in ("samples", "files"):
+                        self.set_setting("audio_repair", {"phase": "samples", "after": 0,
+                                         "through": self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM samples").fetchone()[0],
+                                         "started_ns": time.time_ns()})
+        except BaseException:
+            self.db.close()
+            raise
+
+    def _initialize_schema(self):
+        expected = (1, build_digest())
+        def ready():
+            tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not tables:
+                return False
+            row = self.db.execute("SELECT schema_version,build_sha256 FROM workspace_identity WHERE singleton=1").fetchone() if "workspace_identity" in tables else None
+            if row is None or tuple(row) != expected:
+                raise YuanFault("数据库版本身份不匹配，已拒绝读取旧数据 / Database build identity mismatch; old data will not be read", category="integrity", code="database_build_mismatch")
+            return "settings" in tables and self.setting("schema_ready") == expected[1]
+        if ready():
+            return
+        with self.transaction():
+            if ready():
+                return
+            self.db.execute("CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,build_sha256 TEXT NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO workspace_identity VALUES(1,?,?)", expected)
+            schema = """
         CREATE TABLE IF NOT EXISTS groups(id TEXT PRIMARY KEY, split TEXT NOT NULL CHECK(split IN ('train','validation','guard','release')), origin TEXT NOT NULL, created REAL NOT NULL, source_key TEXT NOT NULL, retention TEXT NOT NULL DEFAULT 'protected' CHECK(retention IN ('protected','training_cache')), provenance TEXT NOT NULL DEFAULT '{}');
         CREATE INDEX IF NOT EXISTS group_source ON groups(source_key,split);
         CREATE TABLE IF NOT EXISTS evaluation_group_revisions(group_id TEXT PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,revision INTEGER NOT NULL DEFAULT 0);
@@ -3387,7 +3409,7 @@ class AudioStore:
         CREATE TABLE IF NOT EXISTS samples(id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), role TEXT NOT NULL, task TEXT NOT NULL CHECK(task IN ('acoustic','generated_reply')), audio TEXT NOT NULL, seconds REAL NOT NULL, rate INTEGER NOT NULL, count INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, visits INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, digest TEXT NOT NULL, file_sha256 TEXT NOT NULL, audio_status TEXT NOT NULL DEFAULT 'ready' CHECK(audio_status IN ('ready','retry','invalid','evicted')), retry_at REAL NOT NULL DEFAULT 0, read_failures INTEGER NOT NULL DEFAULT 0, audio_error TEXT NOT NULL DEFAULT '', generated INTEGER NOT NULL CHECK(generated IN (0,1)), learnable INTEGER NOT NULL CHECK(learnable IN (0,1)), dialogue_eligible INTEGER NOT NULL CHECK(dialogue_eligible IN (0,1)), memory_eligible INTEGER NOT NULL DEFAULT 0 CHECK(memory_eligible IN (0,1)), memory_exclusion TEXT NOT NULL DEFAULT '', exclusion TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}');
         CREATE INDEX IF NOT EXISTS sample_group ON samples(group_id, created);
         CREATE INDEX IF NOT EXISTS sample_digest ON samples(digest);
-        DROP INDEX IF EXISTS eligible_digest;
+        CREATE INDEX IF NOT EXISTS sample_audio ON samples(audio);
         CREATE UNIQUE INDEX IF NOT EXISTS acoustic_digest ON samples(digest) WHERE learnable=1;
         CREATE TABLE IF NOT EXISTS audio_partitions(digest TEXT PRIMARY KEY, source_key TEXT NOT NULL, split TEXT NOT NULL CHECK(split IN ('train','validation','guard','release')));
         INSERT OR IGNORE INTO audio_partitions(digest,source_key,split) SELECT s.digest,g.source_key,g.split FROM samples s JOIN groups g ON g.id=s.group_id WHERE s.generated=0 AND (s.learnable=1 OR s.dialogue_eligible=1) ORDER BY s.created,s.id;
@@ -3415,25 +3437,76 @@ class AudioStore:
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS final_acceptance_runs(id TEXT PRIMARY KEY,identity_sha256 TEXT NOT NULL UNIQUE,receipt TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('reserved','evaluating','accepted','rejected','stale')),updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS final_acceptance_sources(source TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES final_acceptance_runs(id));
-        """)
-        self._revision_triggers()
-        if recover:
-            self.db.execute("UPDATE sessions SET ended=? WHERE ended IS NULL", (time.time(),))
-            self.commit()
-            for path in self.audio.glob("*.partial"):
-                path.unlink(missing_ok=True)
-            self.repair()
+            """
+            statement = ""
+            for line in schema.splitlines():
+                statement += line + "\n"
+                if sqlite3.complete_statement(statement):
+                    self.db.execute(statement)
+                    statement = ""
+            if statement.strip():
+                raise YuanError("数据库结构定义不完整 / Incomplete database schema")
+            self._revision_triggers()
+            self.set_setting("schema_ready", expected[1])
 
-    def repair(self):
-        for row in self.db.execute("SELECT * FROM samples WHERE audio_status<>'evicted'").fetchall():
+    def repair(self, cancel=None):
+        check(cancel)
+        state = self.setting("audio_repair", {})
+        if not isinstance(state, dict) or state.get("phase") not in ("samples", "files"):
+            return False
+        cpus = max(1, os.cpu_count() or 1)
+        limit = self.policy.integer("storage", "repair_batch", cpus, 1, cpus * cpus)
+        processed = 0
+        if state["phase"] == "samples":
+            rows = self.db.execute("SELECT rowid AS repair_rowid,* FROM samples WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?",
+                                   (state["after"], state["through"], limit)).fetchall()
             try:
-                safe_path(self.root, row["audio"]).stat()
-            except (OSError, YuanError) as exc:
-                self.audio_failure(row, exc)
-        tracked = {row[0] for row in self.db.execute("SELECT audio FROM samples")}
-        for path in self.audio.glob("*.flac"):
-            if path.relative_to(self.root).as_posix() not in tracked and len(path.stem) == hashlib.sha256().digest_size * 2:
-                path.unlink(missing_ok=True)
+                for row in rows:
+                    check(cancel)
+                    if row["audio_status"] == "ready":
+                        try:
+                            info = safe_path(self.root, row["audio"]).stat()
+                            if not stat.S_ISREG(info.st_mode):
+                                raise InvalidAudio("历史音频不是普通文件 / Historical audio is not a regular file")
+                        except (OSError, YuanError) as exc:
+                            self.audio_failure(row, exc)
+                    state["after"] = row["repair_rowid"]
+                    processed += 1
+                if len(rows) < limit or state["after"] >= state["through"]:
+                    state["phase"] = "files"
+            finally:
+                self.set_setting("audio_repair", state)
+        else:
+            with self.audio_files(cancel):
+                if self.repair_iterator is None or self.repair_epoch != state["started_ns"]:
+                    if self.repair_iterator is not None:
+                        self.repair_iterator.close()
+                    self.repair_iterator = os.scandir(self.audio)
+                    self.repair_epoch = state["started_ns"]
+                try:
+                    for _ in range(limit):
+                        check(cancel)
+                        entry = next(self.repair_iterator)
+                        processed += 1
+                        if not re.fullmatch(r"[a-f0-9]{64}\.flac|[a-f0-9]{64}-[a-f0-9]{32}\.partial", entry.name):
+                            continue
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                            if not stat.S_ISREG(info.st_mode) or max(info.st_mtime_ns, info.st_ctime_ns) >= state["started_ns"]:
+                                continue
+                            relative = "audio/" + entry.name
+                            if self.db.execute("SELECT 1 FROM samples WHERE audio=? LIMIT 1", (relative,)).fetchone() is None:
+                                Path(entry.path).unlink(missing_ok=True)
+                        except FileNotFoundError:
+                            pass
+                except StopIteration:
+                    self.repair_iterator.close()
+                    self.repair_iterator = None
+                    state["phase"] = "done"
+                    state["completed_ns"] = time.time_ns()
+                finally:
+                    self.set_setting("audio_repair", state)
+        return bool(processed)
 
     def setting(self, key, default=None):
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -3854,6 +3927,9 @@ class AudioStore:
 
     def close(self):
         try:
+            if self.repair_iterator is not None:
+                self.repair_iterator.close()
+                self.repair_iterator = None
             self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
         finally:
             self.db.close()
@@ -3983,11 +4059,39 @@ class AudioStore:
     def audio_files(self, cancel=None):
         while not self.file_lock.acquire(timeout=math.sqrt(tick())):
             check(cancel)
+        acquired = False
         try:
             check(cancel)
+            identity = str(self.root.resolve())
+            record = self.file_leases.get(identity)
+            if record is None:
+                while True:
+                    check(cancel)
+                    try:
+                        lease = WorkspaceLease(safe_path(self.root, "audio.lock"))
+                        break
+                    except YuanError as exc:
+                        cause = exc.__context__
+                        if not isinstance(cause, OSError) or cause.errno not in (errno.EACCES, errno.EAGAIN):
+                            raise
+                        if cancel is None:
+                            time.sleep(math.sqrt(tick()))
+                        else:
+                            cancel.wait(math.sqrt(tick()))
+                record = [lease, 0]
+                self.file_leases[identity] = record
+            record[1] += 1
+            acquired = True
             yield
         finally:
-            self.file_lock.release()
+            try:
+                if acquired:
+                    record[1] -= 1
+                    if not record[1]:
+                        self.file_leases.pop(identity, None)
+                        record[0].close()
+            finally:
+                self.file_lock.release()
 
 
     def exclude_task(self, row, task, reason):
@@ -4167,10 +4271,14 @@ class AudioStore:
         statements.append("CREATE TRIGGER revision_groups_update AFTER UPDATE OF split,source_key,origin,provenance ON groups WHEN " + changed(("split", "source_key", "origin", "provenance")) + " BEGIN " + body + " END;")
         name = "revision_sessions_update"
         statements.append("DROP TRIGGER IF EXISTS " + name + ";")
+        body = group_bump("OLD.id,NEW.id") + bump("data_revision") + bump("evaluation_revision")
+        body += bump("training_revision", "EXISTS(SELECT 1 FROM groups WHERE id IN (OLD.id,NEW.id) AND split='train')")
+        for split in ("train", "validation", "guard", "release"):
+            body += bump("revision_" + split, "EXISTS(SELECT 1 FROM groups WHERE id IN (OLD.id,NEW.id) AND split='" + split + "')")
         statements.append("CREATE TRIGGER " + name + " AFTER UPDATE OF prompt,language ON sessions WHEN " + changed(("prompt", "language"))
-                          + " BEGIN " + group_bump("OLD.id,NEW.id") + bump("data_revision") + bump("evaluation_revision")
-                          + bump("training_revision", "EXISTS(SELECT 1 FROM groups WHERE id IN (OLD.id,NEW.id) AND split='train')") + " END;")
-        self.db.executescript("BEGIN IMMEDIATE;\n" + "\n".join(statements) + "\nCOMMIT;")
+                          + " BEGIN " + body + " END;")
+        for statement in statements:
+            self.db.execute(statement)
 
     def evaluation_snapshot(self, rows):
         rows = tuple(rows)
@@ -5568,7 +5676,11 @@ class CooperativeCompute:
         check(cancel)
         began = time.monotonic()
         result = operation()
-        compute_sync(self.model.torch, self.device)
+        module = getattr(self.model.torch, self.device.type, None)
+        if self.device.type in ("cuda", "xpu") and module is not None and hasattr(module, "current_stream"):
+            module.current_stream(self.device).synchronize()
+        else:
+            compute_sync(self.model.torch, self.device)
         elapsed = elapsed_seconds(began)
         check(cancel)
         self.model.policy.observe(self.section, "seconds_per_frame", elapsed / max(1, frames))
@@ -6248,6 +6360,8 @@ class ModelResources:
         if estimate["required_bytes"] > budget:
             raise YuanFault("当前资源不足，模型结构与权重保持不变 / Current resources are insufficient; architecture and weights are preserved",
                             category="resource", code="model_memory_insufficient", stage="stage_configuration",
+                            resource_kind="system_memory", device="cpu", operation="model_configuration", retryable=True,
+                            runtime_resident_bytes=int(psutil.Process().memory_info().rss),
                             available_bytes=limits["memory"], required_bytes=math.ceil(estimate["required_bytes"] / fraction),
                             model_budget_bytes=budget, model_required_bytes=estimate["required_bytes"])
         return config, estimate
@@ -6439,6 +6553,61 @@ def memory_probe_entry(state, request):
     atomic_json(result_path, result)
 
 
+def memory_failure(exc):
+    return isinstance(exc, MemoryError) or any(value in str(exc).casefold() for value in
+        ("out of memory", "not enough memory", "insufficient memory", "cannot allocate memory", "can't allocate memory", "defaultcpuallocator"))
+
+def device_memory_snapshot(torch, device):
+    device = torch.device(device)
+    result = {"device": str(device), "identity_sha256": compute_device_identity(torch, device),
+              "available_bytes": None, "total_bytes": None, "memory_evidence": "unmeasured"}
+    module = getattr(torch, device.type, None)
+    try:
+        if device.type in ("cuda", "xpu") and module is not None and hasattr(module, "mem_get_info"):
+            free, total = module.mem_get_info(device)
+            if 0 <= int(free) <= int(total) and int(total) > 0:
+                result.update(available_bytes=int(free), total_bytes=int(total), memory_evidence="device_api")
+        elif device.type == "mps" and all(hasattr(module, key) for key in ("recommended_max_memory", "driver_allocated_memory")):
+            total = int(module.recommended_max_memory())
+            if total > 0:
+                result.update(available_bytes=max(0, total - int(module.driver_allocated_memory())), total_bytes=total,
+                              memory_evidence="recommended_device_budget")
+    except (AttributeError, OSError, RuntimeError, ValueError, TypeError, OverflowError):
+        pass
+    return result
+
+def runtime_resource_snapshot(state, details=None):
+    import psutil
+    details = details if isinstance(details, dict) else {}
+    result = {**available_resources(psutil), "process_rss": int(psutil.Process().memory_info().rss), "devices": []}
+    if details.get("resource_kind") != "device_memory":
+        return result
+    import torch
+    device_name = details.get("device")
+    if not isinstance(device_name, str) or not re.fullmatch(r"(?:cuda|xpu|mps|privateuseone)(?::[0-9]+)?", device_name):
+        raise ValueError("目标设备标识无效 / Invalid target device identifier")
+    if device_name.split(":", 1)[0] == "privateuseone":
+        import torch_directml
+        device = torch_directml.device(int(device_name.partition(":")[2] or 0))
+    else:
+        device = torch.device(device_name)
+    snapshot = device_memory_snapshot(torch, device)
+    if snapshot["identity_sha256"] != details.get("device_identity"):
+        result["topology_changed"] = True
+        return result
+    if snapshot["memory_evidence"] == "recommended_device_budget":
+        snapshot["available_bytes"] = min(available_resources(psutil)["memory"], snapshot["available_bytes"])
+    required = details.get("required_bytes")
+    if snapshot["available_bytes"] is None and type(required) is int and required > 0 and isinstance(details.get("configuration"), dict):
+        config = ModelResources.configuration(details["configuration"])
+        verified = probe_device_memory(state, device, config, required, None, AdaptivePolicy(state), lambda *args, **kwargs: None)
+        snapshot.update(allocation_verified=verified.get("verified") is True,
+                        tested_allocation_bytes=verified.get("allocation_bytes"), memory_evidence="allocation_probe")
+    result["devices"].append(snapshot)
+    result["process_rss"] = int(psutil.Process().memory_info().rss)
+    result["memory"] = available_resources(psutil)["memory"]
+    return result
+
 class NativeAudio:
     def __init__(self, state, cancel, emit, owned_root=None, dependencies=None):
         dependencies = dependencies if dependencies is not None else load_runtime_modules(state, emit, cancel)
@@ -6477,10 +6646,25 @@ class NativeAudio:
             torch.set_num_threads(threads)
         self.output_rate = self.rate
         with operation(emit, "stage_build"):
+            runtime_resident = int(psutil.Process().memory_info().rss)
+            network = None
             try:
-                self.network = self._build().to(self.device, dtype=self.dtype)
+                network = self._build()
+                self.network = network.to(self.device, dtype=self.dtype)
             except (RuntimeError, MemoryError) as exc:
-                raise YuanFault("模型尚未完成设备分配，保留当前加速后端 / Model device allocation is incomplete; selected backend retained", category="resource" if "memory" in str(exc).casefold() else "compatibility", code="model_device_allocation", device=str(self.device)) from exc
+                shortage = memory_failure(exc)
+                host = network is None or self.device.type == "cpu"
+                config = {key: getattr(self, key) for key in ("rate", "hop", "width", "layers")}
+                estimate = ModelResources.estimate(config)
+                snapshot = {} if host else device_memory_snapshot(torch, self.device)
+                weights = sum(value.numel() * value.element_size() for value in network.parameters()) if network is not None else estimate["weight_bytes"]
+                raise YuanFault("模型尚未完成设备分配，保留当前加速后端 / Model device allocation is incomplete; selected backend retained",
+                                category="resource" if shortage else "compatibility", code="model_device_allocation", stage="stage_build",
+                                resource_kind="system_memory" if host else "device_memory", device="cpu" if host else str(self.device),
+                                device_identity=snapshot.get("identity_sha256"), configuration=config, operation="model_allocation", retryable=shortage,
+                                required_bytes=weights + estimate["working_bytes"],
+                                available_bytes=available_resources(psutil)["memory"] if host else snapshot.get("available_bytes"),
+                                runtime_resident_bytes=runtime_resident) from exc
         self.performance_section = self.performance_identity()
         with operation(emit, "stage_restore"):
             self.restore()
@@ -6729,11 +6913,10 @@ class NativeAudio:
                     summary = summary + condition[-1].unsqueeze(1)
                 _, hidden = self.dialogue_core(summary, hidden)
                 return hidden, audio_state
-            def memory(self, frames, role):
+            def memory(self, frames, role, hidden=None):
                 values = self.frame_encoder(self.codec_encoder(frames)) + self.roles.weight[role].reshape(1, 1, -1)
-                encoded, hidden = self.audio_encoder(values)
-                pooled = self.memory_projection((encoded.mean(dim=1) + hidden[-1]) / 2)
-                return torch.nn.functional.normalize(pooled, dim=-1)
+                encoded, hidden = self.audio_encoder(values, hidden)
+                return encoded.sum(dim=1), hidden
             def reconstruct(self, frames):
                 return self.codec_decoder(self.codec_encoder(frames))
             def decode(self, previous, hidden, condition=None):
@@ -7008,28 +7191,35 @@ class NativeAudio:
             raise InvalidAudio("音频记忆输入为空 / Audio memory input is empty")
         block_samples = max(1, self.width) * self.hop
         pending = np.empty(0, dtype=np.float32)
-        total, count = None, 0
+        total, hidden, count = None, None, 0
+        role = self.role_index(role)
+        def encode(frames, state):
+            check(cancel)
+            return network.memory(frames, role, state)
+        def accumulate(values, total, hidden, count):
+            frames, _ = self._frames(values)
+            if torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+                vector, state = checkpoint(encode, frames, hidden, use_reentrant=False)
+            else:
+                vector, state = encode(frames, hidden)
+            vector, state = gradient_checkpoint((vector, state), cancel)
+            return vector if total is None else total + vector, state, count + frames.shape[1]
         for values in self.audio_blocks(waveform, cancel):
             check(cancel)
             values = np.concatenate((pending, values)) if len(pending) else values
             complete = len(values) // block_samples * block_samples
             for start in range(0, complete, block_samples):
                 check(cancel)
-                frames, _ = self._frames(values[start:start + block_samples])
-                vector = gradient_checkpoint(network.memory(frames, self.role_index(role)), cancel)
-                total = vector if total is None else total + vector
-                count += 1
+                total, hidden, count = accumulate(values[start:start + block_samples], total, hidden, count)
             pending = values[complete:].copy()
         if len(pending):
-            check(cancel)
-            frames, _ = self._frames(pending)
-            vector = gradient_checkpoint(network.memory(frames, self.role_index(role)), cancel)
-            total = vector if total is None else total + vector
-            count += 1
+            total, hidden, count = accumulate(pending, total, hidden, count)
         if total is None:
             raise InvalidAudio("音频记忆输入为空 / Audio memory input is empty")
         check(cancel)
-        return torch.nn.functional.normalize(total / count, dim=-1)
+        pooled = network.memory_projection((total / count + hidden[-1]) / 2)
+        return torch.nn.functional.normalize(pooled, dim=-1)
 
     @supervised('memory_encoding', 'runtime')
     def memory_vector(self, waveform, role="user", cancel=None):
@@ -10537,105 +10727,106 @@ class PublicAudio:
             return False
 
 class SampleRing:
-    def __init__(self, capacity, rate=1):
+    def __init__(self, capacity, rate):
         import numpy as np
         self.rate = float(rate)
         if not math.isfinite(self.rate) or self.rate <= 0:
             raise ValueError("采样率无效 / Invalid sample rate")
         self.np = np
         self.buffer = np.empty(max(1, int(capacity)), dtype=np.float32)
-        self.read_index = self.write_index = self.count = 0
-        self.lock = threading.Lock()
+        self.blocks = queue.SimpleQueue()
+        self.released = queue.SimpleQueue()
+        self.write_index = 0
+        self.reserved = 0
+        self.published = self.consumed = 0
+        self.current = None
+        self.offset = 0
         self.overflows = self.dropped = self.discontinuities = 0
         self.timestamp = 0.0
-        self.segments = deque()
         self.expected = None
         self.gap_pending = False
 
-    def _discard(self, size):
-        self.read_index = (self.read_index + size) % len(self.buffer)
-        self.count -= size
-        remaining = size
-        while remaining:
-            segment = self.segments[0]
-            take = min(remaining, segment[0])
-            segment[0] -= take
-            segment[1] += take / self.rate
-            remaining -= take
-            if not segment[0]:
-                self.segments.popleft()
-        if self.segments:
-            self.timestamp = self.segments[0][1]
+    @property
+    def count(self):
+        consumed = self.consumed
+        return max(0, self.published - consumed)
+
+    def available(self):
+        while True:
+            try:
+                self.reserved -= self.released.get_nowait()
+            except queue.Empty:
+                return len(self.buffer) - self.reserved
 
     def write(self, values, timestamp=None, discontinuity=False):
         size = len(values)
         if not size:
             self.gap_pending = self.gap_pending or bool(discontinuity)
-            return
-        if not self.lock.acquire(blocking=False):
+            return 0
+        timestamp = time.monotonic() if timestamp is None else float(timestamp)
+        if not math.isfinite(timestamp):
             self.overflows += 1
             self.dropped += size
             self.gap_pending = True
-            return
-        try:
-            timestamp = time.monotonic() if timestamp is None else float(timestamp)
-            if not math.isfinite(timestamp):
-                self.overflows += 1
-                self.dropped += size
-                self.gap_pending = True
-                return
-            gap = self.gap_pending or bool(discontinuity)
-            self.gap_pending = False
-            if size > len(self.buffer):
-                discarded = size - len(self.buffer)
-                values = values[discarded:]
-                timestamp += discarded / self.rate
-                self.overflows += 1
-                self.dropped += discarded
-                size = len(values)
-                gap = True
-            tolerance = max(0.5 / self.rate, math.ulp(timestamp) * 2)
-            gap = gap or self.expected is not None and abs(timestamp - self.expected) > tolerance
-            missing = max(0, size - (len(self.buffer) - self.count))
-            if missing:
-                self.overflows += 1
-                self.dropped += missing
-                self._discard(missing)
-                if self.segments:
-                    self.segments[0][2] = True
-                else:
-                    gap = True
-            if gap:
-                self.discontinuities += 1
-            first = min(size, len(self.buffer) - self.write_index)
-            self.buffer[self.write_index:self.write_index + first] = values[:first]
-            self.buffer[:size - first] = values[first:]
-            self.write_index = (self.write_index + size) % len(self.buffer)
-            self.count += size
-            if self.segments and not gap:
-                self.segments[-1][0] += size
-            else:
-                self.segments.append([size, timestamp, bool(gap)])
-            self.expected = timestamp + size / self.rate
-            self.timestamp = self.segments[0][1]
-        finally:
-            self.lock.release()
+            return 0
+        tolerance = max(0.5 / self.rate, math.ulp(timestamp) * 2)
+        gap = self.gap_pending or bool(discontinuity) or self.expected is not None and abs(timestamp - self.expected) > tolerance
+        take = min(size, self.available())
+        if take:
+            start = self.write_index
+            first = min(take, len(self.buffer) - start)
+            self.buffer[start:start + first] = values[:first]
+            self.buffer[:take - first] = values[first:take]
+            self.write_index = (start + take) % len(self.buffer)
+            self.reserved += take
+            self.published += take
+            self.discontinuities += int(bool(gap))
+            self.blocks.put((start, take, timestamp, bool(gap)))
+        missing = size - take
+        if missing:
+            self.overflows += 1
+            self.dropped += missing
+        self.gap_pending = bool(missing) or bool(gap and not take)
+        self.expected = timestamp + size / self.rate
+        return take
+
+    def read_into(self, result):
+        requested = min(len(self.buffer), len(result))
+        filled = 0
+        timestamp = self.timestamp
+        gap = False
+        while filled < requested:
+            if self.current is None:
+                try:
+                    self.current = self.blocks.get_nowait()
+                except queue.Empty:
+                    break
+                self.offset = 0
+            start, size, stamp, discontinuity = self.current
+            current_stamp = stamp + self.offset / self.rate
+            current_gap = discontinuity and self.offset == 0
+            if filled and current_gap:
+                break
+            if not filled:
+                timestamp, gap = current_stamp, current_gap
+            take = min(requested - filled, size - self.offset)
+            index = (start + self.offset) % len(self.buffer)
+            first = min(take, len(self.buffer) - index)
+            result[filled:filled + first] = self.buffer[index:index + first]
+            result[filled + first:filled + take] = self.buffer[:take - first]
+            self.offset += take
+            filled += take
+            self.timestamp = stamp + self.offset / self.rate
+            if self.offset == size:
+                self.current = None
+                self.offset = 0
+            self.consumed += take
+            self.released.put(take)
+        return filled, timestamp, bool(gap)
 
     def read_block(self, size):
-        requested = min(len(self.buffer), max(0, int(size)))
-        result = self.np.empty(requested, dtype=self.np.float32)
-        with self.lock:
-            take = min(requested, self.segments[0][0] if self.segments else 0)
-            timestamp = self.segments[0][1] if self.segments else self.timestamp
-            gap = bool(take and self.segments[0][2])
-            first = min(take, len(self.buffer) - self.read_index)
-            result[:first] = self.buffer[self.read_index:self.read_index + first]
-            result[first:take] = self.buffer[:take - first]
-            if take:
-                self.segments[0][2] = False
-                self._discard(take)
-                if not self.segments:
-                    self.timestamp = timestamp + take / self.rate
+        result = self.np.empty(min(len(self.buffer), max(0, int(size))), dtype=self.np.float32)
+        take, timestamp, gap = self.read_into(result)
         return result[:take], timestamp, gap
 
     def read(self, size):
@@ -10922,19 +11113,26 @@ class StreamingPlayback:
         self.prebuffer = max(1, min(self.capacity, int(prebuffer_samples)))
         self._reference = np.empty(max(1, int(reference_samples)), dtype=np.float32)
         self.reference_count = 0
-        self.items = deque()
+        self.samples = SampleRing(self.capacity, self.rate)
         self.lock = threading.Lock()
-        self.buffered = self.offset = self.cursor = 0
+        self.timing_lock = threading.Lock()
+        self.cursor = 0
         self.started_at = self.drain_at = None
         self.interrupted = self.discontinuous = self.done = self.ready = False
         self.underruns = 0
-        self.submitted = deque()
+        self.submitted = queue.SimpleQueue()
+        self.audible = deque()
         self.audible_base = 0
         self.output_reference = OutputReference(self.rate, max(self.capacity, int(timeline_samples)) if timeline_samples is not None else max(self.capacity, math.ceil(reference_samples * self.rate / self.reference_rate)))
 
     @property
     def reference(self):
         return self._reference[:self.reference_count]
+
+    @property
+    def buffered(self):
+        cursor = self.cursor
+        return max(0, min(self.capacity, self.samples.published - cursor))
 
     def append_reference(self, values):
         size = len(values)
@@ -10945,68 +11143,57 @@ class StreamingPlayback:
 
     def push(self, values):
         with self.lock:
-            if self.cancel.is_set() or self.interrupted or self.done or len(values) > self.capacity - self.buffered:
+            if self.cancel.is_set() or self.interrupted or self.done or len(values) > self.samples.available():
                 return False
-            if len(values):
-                self.items.append(values)
-                self.buffered += len(values)
-            if self.buffered >= self.prebuffer:
-                self.ready = True
+            size = len(values)
+            if size:
+                self.samples.write(values, self.samples.published / self.rate)
         return True
 
     def finish(self):
         with self.lock:
             self.done = True
-            self.ready = True
 
     def render(self, outdata, frames, timestamp):
         outdata.fill(0)
-        if not self.lock.acquire(False):
-            if self.started_at is not None:
-                self.discontinuous = True
-                self.underruns += 1
-            self.output_reference.write(outdata[:, 0], timestamp)
-            return
         try:
             if self.cancel.is_set() or self.interrupted:
                 self.interrupted = True
                 return
-            now = time.monotonic()
-            while self.submitted and self.submitted[0][1] + self.submitted[0][2] / self.rate <= now:
-                start, _, size = self.submitted.popleft()
-                self.audible_base = start + size
+            if not self.ready:
+                self.ready = self.samples.count >= self.prebuffer or self.done
             if not self.ready:
                 return
-            filled = 0
-            while filled < frames and self.items:
-                values = self.items[0]
-                size = min(frames - filled, len(values) - self.offset)
-                outdata[filled:filled + size, :] = values[self.offset:self.offset + size, None]
-                self.offset += size
-                self.buffered -= size
-                filled += size
-                if self.offset == len(values):
-                    self.items.popleft()
-                    self.offset = 0
+            filled, _, gap = self.samples.read_into(outdata[:frames, 0])
             if filled:
+                if outdata.shape[1] > 1:
+                    outdata[:filled, 1:] = outdata[:filled, :1]
                 if self.started_at is None:
                     self.started_at = timestamp
-                self.submitted.append((self.cursor, timestamp, filled))
-                self.cursor += filled
                 self.drain_at = timestamp + filled / self.rate
+                self.submitted.put((self.cursor, timestamp, filled))
+                self.cursor += filled
+            self.discontinuous = self.discontinuous or gap
             if filled < frames and not self.done:
                 self.discontinuous = True
                 self.underruns += 1
                 self.ready = False
         finally:
-            self.lock.release()
             self.output_reference.write(outdata[:, 0], timestamp)
 
     def played(self):
-        with self.lock:
-            total = self.audible_base
+        with self.timing_lock:
+            while True:
+                try:
+                    self.audible.append(self.submitted.get_nowait())
+                except queue.Empty:
+                    break
             now = time.monotonic()
-            for start, timestamp, count in self.submitted:
+            while self.audible and self.audible[0][1] + self.audible[0][2] / self.rate <= now:
+                start, _, count = self.audible.popleft()
+                self.audible_base = start + count
+            total = self.audible_base
+            for start, timestamp, count in self.audible:
                 take = max(0, min(count, int((now - timestamp) * self.rate)))
                 total = max(total, start + take)
                 if take < count:
@@ -11024,8 +11211,7 @@ class StreamingPlayback:
                               self.discontinuous, self.underruns, error, self.started_at)
 
     def drained(self):
-        with self.lock:
-            return self.done and self.buffered == 0 and (self.drain_at is None or time.monotonic() >= self.drain_at)
+        return self.done and self.buffered == 0 and (self.drain_at is None or time.monotonic() >= self.drain_at)
 
 class OutputReference:
     def __init__(self, rate, capacity):
@@ -11148,6 +11334,31 @@ class EchoSuppressor:
         self.paths = ()
         self.double_talk = False
         self.reference_state = "inactive"
+        self.nearend_candidate = False
+        self.nearend_seconds = 0.0
+        self.nearend_until = None
+
+    def confirm_nearend(self, overlap, voiced, timestamp, duration):
+        if not math.isfinite(timestamp) or not math.isfinite(duration) or duration <= 0:
+            self.nearend_seconds = 0.0
+            self.nearend_until = None
+            return False
+        clean = bool(self.reference_complete and self.residual_correlation is not None
+                     and math.isfinite(self.residual_correlation) and self.residual_correlation < self.policy.echo_correlation)
+        if not voiced or overlap and not (self.double_talk and clean or self.nearend_candidate):
+            self.nearend_seconds = 0.0
+            self.nearend_until = None
+            return False
+        if not overlap or self.double_talk and clean:
+            self.nearend_seconds = 0.0
+            self.nearend_until = None
+            return True
+        tolerance = max(1 / self.rate, math.ulp(timestamp) * 4)
+        if self.nearend_until is None or abs(timestamp - self.nearend_until) > tolerance:
+            self.nearend_seconds = 0.0
+        self.nearend_seconds += duration
+        self.nearend_until = timestamp + duration
+        return self.nearend_seconds + tolerance >= max(duration, self.policy.onset_seconds)
 
     def process(self, frame, timestamp, playback):
         import numpy as np
@@ -11155,6 +11366,7 @@ class EchoSuppressor:
         self.residual_correlation = None
         self.reference_complete = False
         self.double_talk = False
+        self.nearend_candidate = False
         self.reference_state = "inactive"
         if playback is None or playback.started_at is None or len(frame) < 2:
             return frame, False
@@ -11168,6 +11380,8 @@ class EchoSuppressor:
             self.reference_epoch = epoch
             self.gain = self.delay = None
             self.paths = ()
+            self.nearend_seconds = 0.0
+            self.nearend_until = None
         self.reference_state = "missing"
         n = len(frame)
         lag = max(0, int(math.ceil(self.policy.echo_seconds * self.rate)))
@@ -11278,6 +11492,9 @@ class EchoSuppressor:
             self.delay, self.gain = max(fitted, key=lambda item: abs(item[1]))
             self.reference_state = "echo"
         if not self.paths:
+            self.nearend_candidate = bool(self.reference_complete and not indices and math.isfinite(self.correlation)
+                                          and self.correlation < self.policy.echo_correlation)
+            self.reference_state = "nearend_unverified" if self.nearend_candidate else "calibrating"
             return frame, True
         prediction = np.zeros(n, dtype=np.float64)
         for delay, gain in self.paths:
@@ -12333,17 +12550,54 @@ class AudioWriter:
                     "lost_seconds": self.lost_seconds, "error": self.failure, "recoverable": self.fatal is None, "restarts": self.restarts}
 
 class RecordedDialogueAdapter:
+    suffixes = (".json", ".jsonl", ".ndjson", ".parquet")
+
     @staticmethod
     def records(path, cancel):
-        if path.suffix.lower() == ".jsonl":
+        path = Path(path)
+        suffix = path.suffix.lower()
+        def reject_constant(value):
+            raise ValueError("标注包含非有限数值 / Annotation contains a non-finite number: " + value)
+        if suffix == ".parquet":
+            import psutil
+            import pyarrow.parquet as pq
+            memory = max(1, available_resources(psutil)["memory"] // 8)
+            with path.open("rb") as stream:
+                size = path.stat().st_size
+                if size < 12 or stream.read(4) != b"PAR1":
+                    raise InvalidDownload("标注分片头部无效 / Invalid annotation shard header")
+                stream.seek(-8, 2)
+                footer = stream.read(8)
+                if footer[4:] != b"PAR1" or not 0 < int.from_bytes(footer[:4], "little") <= min(memory, size - 12):
+                    raise InvalidDownload("标注分片尾部无效 / Invalid annotation shard footer")
+            with pq.ParquetFile(str(path), memory_map=True, pre_buffer=False, thrift_string_size_limit=memory,
+                                thrift_container_size_limit=max(1, memory // 64), page_checksum_verification=True) as reader:
+                names = set(reader.schema_arrow.names)
+                if not ("messages" in names or {"format", "turns"}.issubset(names)):
+                    raise InvalidDownload("标注分片缺少录音对话字段 / Annotation shard lacks recorded-dialogue fields")
+                for group in range(reader.num_row_groups):
+                    check(cancel)
+                    if reader.metadata.row_group(group).total_byte_size * 3 > memory:
+                        raise MemoryError("标注行组超过当前内存预算 / Annotation row group exceeds the current memory budget")
+                    for batch in reader.iter_batches(batch_size=1, row_groups=[group], use_threads=False):
+                        check(cancel)
+                        for row in batch.to_pylist():
+                            for key in ("messages", "annotation", "turns"):
+                                if isinstance(row.get(key), str):
+                                    row[key] = json.loads(row[key], parse_constant=reject_constant)
+                            yield row
+            return
+        if suffix in (".jsonl", ".ndjson"):
             with path.open("r", encoding="utf-8-sig") as stream:
                 for line in stream:
                     check(cancel)
                     if line.strip():
-                        yield json.loads(line)
+                        yield json.loads(line, parse_constant=reject_constant)
             return
+        if suffix != ".json":
+            raise InvalidDownload("不支持的录音标注文件格式 / Unsupported recorded-annotation file format")
         with path.open("r", encoding="utf-8-sig") as stream:
-            data = json.load(stream, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+            data = json.load(stream, parse_constant=reject_constant)
         values = data if isinstance(data, list) else data.get("conversations", [data]) if isinstance(data, dict) else ()
         if not isinstance(values, list):
             raise InvalidDownload("对话导出格式无效 / Invalid conversation export format")
@@ -12414,13 +12668,13 @@ class SourceRegistry:
             return "schema_wait"
         if blockers.get("missing_annotations") or blockers.get("invalid_annotations") or blockers.get("no_source"):
             return "annotation_wait"
-        if exc is not None and isinstance(exc, (InvalidDownload, IneligibleSample, ValueError, TypeError, KeyError)):
+        if exc is not None and isinstance(exc, (InvalidDownload, IneligibleSample, ValueError, TypeError, KeyError, ImportError)):
             return "schema_wait"
         return "network_wait" if exc is not None or blockers.get("source_unavailable") else "annotation_wait"
 
-    def preflight(self, model, jobs, cancel, emit):
+    def preflight(self, model, jobs, cancel, emit, tasks=()):
         candidates = {job.repository: job for job in jobs}
-        rows = self.store.db.execute("SELECT * FROM bootstrap_sources WHERE retry_at<=? ORDER BY status='path_verified',attempts,updated,repository", (time.time(),)).fetchall()
+        rows = self.store.db.execute("SELECT * FROM bootstrap_sources WHERE retry_at<=? ORDER BY status IN ('path_verified','sample_verified','import_verified'),attempts,updated,repository", (time.time(),)).fetchall()
         for row in rows:
             job = candidates.get(row["repository"])
             if job is None:
@@ -12428,6 +12682,7 @@ class SourceRegistry:
             check(cancel)
             contract = json.loads(row["contract"])
             attempts = row["attempts"] + 1
+            sample_count = 0
             try:
                 job.catalog_query(cancel)
                 catalog = job.catalog
@@ -12440,20 +12695,30 @@ class SourceRegistry:
                     raise InvalidDownload("启动来源没有可校验的数据路径 / Bootstrap source has no verifiable data path")
                 contract.update(revision=catalog["revision"], license_revision=catalog.get("license_revision", catalog["revision"]),
                                 manifest_sha256=payload_digest(items), files=len(items), integrity="pinned_revision_and_file_digests",
-                                schema_validation="performed_before_each_import", semantic_acceptance=False)
-                state, reason = "path_verified", ""
-                delay = model.policy.number("network", "bootstrap_recheck_seconds", 86400.0, 1.0, 30 * 86400.0)
+                                schema_validation="sample_import_pending", sample_import_verified=False, semantic_acceptance=False)
+                self.run_source(model, job, tasks, cancel)
+                check(cancel)
+                sample_count = self.store.db.execute("SELECT count(*) FROM samples WHERE generated=0 AND audio_status='ready' AND count>=? AND json_extract(metadata,'$.corpus')=? AND json_extract(metadata,'$.revision')=?",
+                                                    (model.hop, job.repository, catalog["revision"])).fetchone()[0]
+                verified_tasks = [AnnotatedAcquisition.task_identity(task) for task in tasks if any(
+                    proof["repository"] == job.repository and proof["revision"] == catalog["revision"] for proof in self.matching(task))]
+                contract.update(sample_import_verified=sample_count > 0, sample_count=sample_count, verified_tasks=verified_tasks,
+                                schema_validation="decoded_and_imported_sample" if sample_count else "sample_import_pending")
+                state = "sample_verified" if sample_count else "path_verified"
+                reason = "" if sample_count else "来源路径已核验，小样本尚未完成有效导入 / Source path verified; a valid sample import is still pending"
+                delay = (model.policy.number("network", "bootstrap_recheck_seconds", 86400.0, 1.0, 30 * 86400.0) if sample_count
+                         else self.store.retry_delay(attempts, True))
             except Cancelled:
                 raise
-            except (OSError, YuanError, ValueError, TypeError, KeyError, MemoryError) as exc:
+            except (OSError, YuanError, ValueError, TypeError, KeyError, MemoryError, ImportError) as exc:
                 state, reason = self.failure_state(exc), concise_error(exc)
                 delay = self.store.retry_delay(attempts, state != "network_wait")
             self.store.db.execute("UPDATE bootstrap_sources SET contract=?,status=?,attempts=?,retry_at=?,updated=?,reason=? WHERE repository=?",
                                   (json.dumps(contract, sort_keys=True), state, attempts, time.time() + delay, time.time(), reason, row["repository"]))
             self.store.commit()
             emit("bootstrap_source", repository=row["repository"], status=state, reason=reason, revision=contract.get("revision"),
-                 manifest_sha256=contract.get("manifest_sha256"), capability_verified=False)
-            return state == "path_verified"
+                 manifest_sha256=contract.get("manifest_sha256"), sample_import_verified=sample_count > 0, capability_verified=False)
+            return sample_count > 0
         return False
 
     def remember(self, repository, revision, task, result):
@@ -12494,7 +12759,7 @@ class SourceRegistry:
             if kind == "public_dialogue" and contract["repository"] != PublicDialogue.repository:
                 continue
             proof = next((item for item in self.matching(task) if item["repository"] == row["repository"] and item["revision"] == contract.get("revision")), None)
-            candidates.append({**contract, "status": "import_verified" if proof is not None else row["status"],
+            candidates.append({**contract, "status": "import_verified" if proof is not None else "sample_verified" if contract.get("sample_import_verified") is True else row["status"],
                                "import_evidence": json.loads(proof["contract"]) if proof is not None else None,
                                "reason": row["reason"], "semantic_acceptance": False})
         return candidates
@@ -12505,7 +12770,7 @@ class SourceRegistry:
             candidates = self.candidates(task)
             enriched.append({**task, "source_candidates": candidates,
                              "source_contract_ready": any(item.get("status") == "import_verified" for item in candidates),
-                             "source_path_accessible": any(item.get("status") in ("path_verified", "import_verified") for item in candidates),
+                             "source_path_accessible": any(item.get("status") in ("path_verified", "sample_verified", "import_verified") for item in candidates),
                              "stage": "training_data" if task.get("split") == "train" else "final_acceptance_data" if task.get("split") == "release" else "development_data"})
         training = [task for task in enriched if task["stage"] == "training_data"]
         development = [task for task in enriched if task["stage"] == "development_data"]
@@ -12974,7 +13239,7 @@ class AnnotatedAcquisition:
                 hints = ({"中文": ("zh", "chinese", "mandarin"), "English": ("en", "english")}.get(task["language"], ())
                          + ((task["scenario"],) if task.get("scenario") else ()) + ("annotation", "dialogue", "conversation"))
                 items = sorted(catalog.items(), key=lambda pair: (-sum(word in Path(pair[0]).stem.casefold() for word in hints), pair[0]))
-                supported = [(name, item) for name, item in items if Path(name).suffix.lower() in (".json", ".jsonl")]
+                supported = [(name, item) for name, item in items if Path(name).suffix.lower() in RecordedDialogueAdapter.suffixes]
                 if not supported:
                     self.rejection("unsupported_schema")
                 for name, item in supported:
@@ -13037,7 +13302,7 @@ class AnnotatedAcquisition:
             self.store.db.execute("UPDATE acquisition_tasks SET status='pending',retry_at=0 WHERE id=?", (row["id"],))
             self.store.commit()
             raise
-        except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as exc:
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error, MemoryError, ImportError) as exc:
             state, reason = SourceRegistry.failure_state(exc), concise_error(exc)
         attempts = row["attempts"] + 1
         initial = self.store.retry_delay(attempts, state in ("schema_wait", "annotation_wait", "independence_wait"))
@@ -13414,9 +13679,10 @@ class PublicAudioWorker:
                         acceptance = AcceptancePolicy(self.model)
                         report = acceptance.coverage(store, self.model)
                         tasks = acceptance.acquisition_plan(report)
-                        acquisition.registry.plan(self.model, report, tasks)
-                        acquisition.registry.preflight(self.model, (*native_sources, dialogues), cancel, self.emit)
                         plan = acquisition.registry.plan(self.model, report, tasks)
+                        worked = acquisition.registry.preflight(self.model, (*native_sources, dialogues), cancel, self.emit, tasks=plan) or worked
+                        report = acceptance.coverage(store, self.model, fresh=True)
+                        plan = acquisition.registry.plan(self.model, report, acceptance.acquisition_plan(report))
                         signature = payload_digest(plan)
                         if signature != plan_signature:
                             self.emit("data_plan", key="data_plan", tasks=plan, unsupported=[task for task in plan if task["automatic_source"] is None])
@@ -13647,7 +13913,8 @@ class CaptureSession:
                                "overlap_frames": len(overlapping),
                                "reference_complete": bool(overlapping) and all(item["reference_complete"] for item in overlapping),
                                "residual_clean": bool(overlapping) and all(item["residual_clean"] for item in overlapping),
-                               "user_speech": any(item["user_speech"] for item in segment_quality)}
+                               "user_speech": any(item["user_speech"] for item in segment_quality),
+                               "interruption_speech": any(item.get("interruption_speech", False) for item in segment_quality)}
             metadata = {"capture_quality": capture_quality, "utterance_confirmed": self.utterance_confirmed, "reply_epoch": self.reply_epoch, "utterance_id": self.utterance_id, "chunk_index": self.chunk_index,
                         "utterance_final": None if final else not gate.active, "playback_overlap": segment_overlap, "capture_gap": segment_gap, "limited": gate.limited, "final": final,
                         "last_voice_at": gate.last_voice_at, "endpoint_at": gate.ended_at if not gate.active else None,
@@ -13680,15 +13947,17 @@ class CaptureSession:
                     overlap_until = timestamp + gate.preroll.maxlen * gate.frame_seconds
                 before = gate.active
                 result = gate.push(frame, timestamp)
-                quality["user_speech"] = bool((before or gate.active or result is not None) and gate.noise_state == "speech"
-                                              and (not overlap or echo.double_talk and residual_clean))
+                voiced = bool((before or gate.active or result is not None) and gate.noise_state == "speech")
+                quality["user_speech"] = bool(voiced and (not overlap or echo.double_talk and residual_clean))
+                interrupted_speech = echo.confirm_nearend(overlap, voiced, timestamp, take / model.rate)
+                quality["interruption_speech"] = interrupted_speech
                 if not before and (gate.active or result is not None):
                     self.utterance_id = uuid.uuid4().hex
                     self.chunk_index = 0
                     self.utterance_confirmed = False
                     segment_quality = list(quality_frames)
                     segment_start = timestamp + take / model.rate - (sum(len(value) for value in gate.frames) if result is None else len(result)) / model.rate
-                if quality["user_speech"] and not self.utterance_confirmed:
+                if interrupted_speech and not self.utterance_confirmed:
                     self.reply_epoch += 1
                     if before:
                         self.utterance_id = uuid.uuid4().hex
@@ -13712,7 +13981,7 @@ class CaptureSession:
                     last_levels = now
                     self.emit("audio", id=self.session_id, level=float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))), probability=gate.confidence, noise_state=gate.noise_state, faults=devices.faults + devices.ring.overflows,
                               input_faults=devices.input_faults + devices.ring.overflows, output_faults=devices.output_faults, recorded=sum(len(value) for value in gate.frames) / model.rate, continuous=True, speech_active=gate.active, trusted_speech_active=self.trusted_speaking,
-                              pending=self.inference.pending(), pending_storage=self.writer.queue.pending(), dropped_samples=devices.ring.dropped, echo_correlation=echo.correlation, echo_reduction=echo.reduction, echo_state=echo.reference_state, double_talk=echo.double_talk, echo_paths=len(echo.paths), playback_overlap=overlap)
+                              pending=self.inference.pending(), pending_storage=self.writer.queue.pending(), dropped_samples=devices.ring.dropped, echo_correlation=echo.correlation, echo_reduction=echo.reduction, echo_state=echo.reference_state, double_talk=echo.double_talk, echo_paths=len(echo.paths), nearend_candidate=echo.nearend_candidate, nearend_seconds=echo.nearend_seconds, playback_overlap=overlap)
         def ingest(raw, timestamp, gap):
             nonlocal resampler, gate, echo, pending, origin, position, segment_gap, segment_overlap, segment_start, overlap_until, quality_frames, segment_quality
             if gap:
@@ -13777,7 +14046,7 @@ def concise_error(exc):
     return redact(" ← ".join(values))
 
 class MemoryCalibration:
-    protocol = "yuan-memory-relevance-v2"
+    protocol = "yuan-memory-relevance-v3-sequential"
 
     def __init__(self, model, store):
         self.model, self.store = model, store
@@ -13792,7 +14061,7 @@ class MemoryCalibration:
             raise YuanError("检索监督数据划分无效 / Invalid retrieval supervision split")
         revisions = self.store.revisions()
         window = self.model.memory_window()
-        version = (revisions["evaluation_revision"], revisions["training_revision"], window, self.model.rate, acceptance.digest)
+        version = (tuple((split, revisions["revision_" + split]) for split in splits), window, self.model.rate, acceptance.digest)
         caches = getattr(self.store, "retrieval_selection_cache", {})
         cached = caches.get(splits) if isinstance(caches, dict) else None
         if cached is not None and cached[0] == version:
@@ -14254,9 +14523,7 @@ class LearningSession:
         def progress(stage):
             baseline = max(5.0, model.chunk_seconds * 2, model.policy.measured("learning_control", stage + "_seconds", 0.0) * 2)
             self.emit("pause_progress", request_id=request_id, stage=stage, budget_seconds=baseline)
-        progress("sources")
         sources.pause()
-        sources.wait_idle(self.cancel)
         progress("offload")
         offload_at = time.monotonic()
         model.training_placement(model.torch.device("cpu"), learner)
@@ -14264,12 +14531,20 @@ class LearningSession:
         model.policy.observe("learning_control", "pause_seconds", elapsed_seconds(began))
         self.emit("paused_ack", request_id=request_id, training_active=False, training_state="paused", resources_released=True,
                   process_isolated=True, pid=os.getpid(), pause_seconds=elapsed_seconds(began), persistence_state="pending",
+                  compute_stopped=True, source_state="paused" if sources.idle.is_set() else "pausing",
                   **training_checkpoint_status(model, learner, verify=False))
-        saved_at = time.monotonic()
+        saved_at = None
         persistence_cancel = AnyCancel(self.cancel, self.persistence_interrupt)
         state, failure = "saved", None
         status = None
+        source_at = time.monotonic()
         try:
+            try:
+                sources.wait_idle(persistence_cancel)
+            finally:
+                model.policy.observe("learning_control", "sources_seconds", elapsed_seconds(source_at))
+            check(persistence_cancel)
+            saved_at = time.monotonic()
             learner.checkpoint(persistence_cancel, force=True)
             model.verifier.checkpoint(persistence_cancel)
             check(persistence_cancel)
@@ -14279,10 +14554,12 @@ class LearningSession:
             state = "deferred"
         except Exception as exc:
             state, failure = "failed", concise_error(exc)
-            self.emit("notice", key="checkpoint_failure", reason=failure, in_memory_progress_retained=True,
+            self.emit("notice", key="source_paused" if saved_at is None else "checkpoint_failure", reason=failure, in_memory_progress_retained=True,
                       **training_checkpoint_status(model, learner, verify=False))
-        model.policy.observe("learning_control", "checkpoint_seconds", elapsed_seconds(saved_at))
+        if saved_at is not None:
+            model.policy.observe("learning_control", "checkpoint_seconds", elapsed_seconds(saved_at))
         self.emit("learning_snapshot", training_active=False, training_state="paused", persistence_state=state,
+                  source_state="paused" if sources.idle.is_set() else "pausing",
                   checkpoint_error=failure, **(status or training_checkpoint_status(model, learner, verify=False)))
         while self.paused.is_set() and not self.cancel.is_set():
             self.wake.wait(math.sqrt(tick()))
@@ -14309,11 +14586,12 @@ class LearningSession:
             sources.resume()
 
     def run(self):
-        threading.Thread(target=self.control, daemon=True, name="YuanLearningControl").start()
         model = learner = store = sources = None
         try:
             supervisor = StageSupervisor(self.state, self.emit)
             deps = {name: import_runtime_module(name, self.state, self.emit, self.cancel, supervisor, {}) for name in ("numpy", "psutil", "torch")}
+            threading.Thread(target=self.control, daemon=True, name="YuanLearningControl").start()
+            check(self.cancel)
             owned = os.environ.get("YUAN_TRAINING_OWNED_ROOT")
             model = NativeAudio(self.state, self.cancel, self.emit, owned_root=owned, dependencies=deps)
             store = AudioStore(self.state, recover=False)
@@ -14349,8 +14627,9 @@ class LearningSession:
                         if space["ready"]:
                             sources.resume()
                             store.recheck_audio(work_cancel)
+                            worked = store.repair(work_cancel)
                             model.refresh_release()
-                            worked = helper.index_memory(work_cancel)
+                            worked = helper.index_memory(work_cancel) or worked
                             memory = model.training_budget(learner)
                             if memory["ready"]:
                                 pending = (FinalAcceptance.current(model, store, AcceptancePolicy(model))
@@ -15137,13 +15416,14 @@ class Engine:
                 raise EngineFault("会话结束未完成，重启音频引擎 / Session cleanup incomplete; restarting audio engine") from cleanup_failure
 
     def run(self):
-        receiver = threading.Thread(target=self.receive, daemon=True, name="YuanControl")
-        receiver.start()
         model = None
         learner = None
         try:
             owned_release_preflight(self.state, self.emit)
             dependencies = load_runtime_modules(self.state, self.emit, self.shutdown)
+            receiver = threading.Thread(target=self.receive, daemon=True, name="YuanControl")
+            receiver.start()
+            check(self.shutdown)
             psutil = dependencies["psutil"]
             self.metrics_period = math.sqrt(available_resources(psutil)["cpus"])
             startup_preflight(self.state, emit=self.emit)
@@ -15576,6 +15856,11 @@ def runtime_entry(state):
                 value = line.rstrip("\r\n")
                 if events.cancel.is_set():
                     return
+                if value.strip():
+                    try:
+                        emit("runtime_message", key="runtime_message", detail=value, pid=os.getpid())
+                    except EngineFault:
+                        return
     recorder = threading.Thread(target=capture, daemon=True, name="YuanRuntimeCapture")
     recorder.start()
     import logging
@@ -15602,33 +15887,6 @@ def engine_entry(state):
         except Exception as exc:
             emit("error", key="failure", reason=concise_error(exc), fatal=True, fault=fault_event(exc))
 
-class LiveStatus:
-    def __init__(self, state):
-        self.lock = threading.RLock()
-        self.closed = False
-        self.sequence = 0
-        self.latest = {}
-
-    def add(self, event):
-        kind = event.get("type")
-        if kind not in ("status", "error", "notice", "deployment", "learning", "network", "storage_state", "recovery"):
-            return
-        with self.lock:
-            if self.closed:
-                return
-            self.sequence += 1
-            value = {key: event[key] for key in ("at", "type", "key", "reason", "action_key") if key in event}
-            self.latest[kind] = (self.sequence, value)
-
-    def page(self, before=None, limit=None):
-        with self.lock:
-            rows = sorted((row for row in self.latest.values() if before is None or row[0] < before), key=lambda row: row[0])
-            return rows[-max(1, int(limit or len(rows) or 1)):] if not self.closed else []
-
-    def close(self):
-        with self.lock:
-            self.latest.clear()
-            self.closed = True
 
 def event_text(event, language, compact=False):
     moment = time.strftime("%H:%M:%S", time.localtime(event.get("at", time.time())))
@@ -16005,20 +16263,55 @@ class RecoveryGate:
         self.save()
         return self.last
 
+    @staticmethod
+    def resource_available(fault, resources):
+        if not isinstance(fault, dict) or not isinstance(resources, dict):
+            return None
+        details = fault.get("details", {})
+        if not isinstance(details, dict):
+            return None
+        kind = details.get("resource_kind", "system_memory" if fault.get("code") == "model_memory_insufficient" else None)
+        if kind == "device_memory":
+            rows = resources.get("devices", [])
+            identity = details.get("device_identity")
+            if not is_digest(identity) or not isinstance(rows, list):
+                return None
+            for row in rows:
+                if not isinstance(row, dict) or row.get("device") != details.get("device") or row.get("identity_sha256") != identity:
+                    continue
+                available = row.get("available_bytes")
+                if type(available) is int and available >= 0:
+                    return available
+                tested = row.get("tested_allocation_bytes")
+                if row.get("allocation_verified") is True and type(tested) is int and tested > 0:
+                    return tested
+            return None
+        if kind != "system_memory":
+            return None
+        available = resources.get("memory")
+        resident = details.get("runtime_resident_bytes", 0)
+        probe_resident = resources.get("process_rss", 0)
+        if any(type(value) is not int or value < 0 for value in (available, resident, probe_resident)):
+            return None
+        return max(0, available - max(0, resident - probe_resident))
+
     def resource_ready(self, fault, resources):
-        required = fault.get("details", {}).get("required_bytes")
-        available = resources.get("memory") if isinstance(resources, dict) else None
-        resident = fault.get("details", {}).get("runtime_resident_bytes", 0)
-        probe_resident = resources.get("process_rss", 0) if isinstance(resources, dict) else 0
-        if type(available) is int and type(resident) is int and type(probe_resident) is int:
-            available = max(0, available - max(0, resident - probe_resident))
-        valid = (fault.get("code") == "model_memory_insufficient" and type(required) is int and required > 0
-                 and type(available) is int and available >= required)
+        details = fault.get("details", {}) if isinstance(fault, dict) else {}
+        details = details if isinstance(details, dict) else {}
+        required = details.get("required_bytes")
+        available = self.resource_available(fault, resources)
+        valid = (isinstance(fault, dict) and fault.get("category") == "resource" and details.get("retryable", True) is True
+                 and type(required) is int and required > 0 and type(available) is int and available >= required)
         if not valid:
             self.resource_since = None
+            self.resource_token = None
             return False
+        token = payload_digest([details.get("resource_kind"), details.get("device_identity"), details.get("device"), required])
+        if getattr(self, "resource_token", None) != token:
+            self.resource_since = None
+            self.resource_token = token
         now = self.clock()
-        if self.resource_since is None:
+        if self.resource_since is None or now < self.resource_since:
             self.resource_since = now
         return now - self.resource_since >= self.resource_stable_seconds
 
@@ -16075,11 +16368,9 @@ class Launcher:
         self.send_lock = threading.Lock()
         self.commands = queue.Queue()
         self.sender = threading.Thread(target=self.send_loop, daemon=True, name="YuanCommands")
-        self.activity = LiveStatus(workspace_state(self.workspace))
         self.phase_at = time.monotonic()
         self.phase_key = "setup"
         self.retry_until = None
-        self.activity_error = None
         self.event_lock = threading.RLock()
         self.event_sequence = 0
         self.attempt_id = None
@@ -16111,20 +16402,6 @@ class Launcher:
                 values.setdefault("phase_id", self.phase_id)
             event = {"at": time.time(), **values, "type": kind, "generation": self.generation, "attempt_id": self.attempt_id,
                      "attempt_number": self.attempt_number, "event_sequence": self.event_sequence}
-            try:
-                self.activity.add(event)
-                if self.activity_error:
-                    recovered = {"type": "notice", "generation": self.generation, "at": time.time(), "key": "recording_resumed",
-                                 "attempt_id": self.attempt_id, "attempt_number": self.attempt_number}
-                    self.activity.add(recovered)
-                    self.post_event(recovered)
-                    self.activity_error = None
-            except (sqlite3.Error, OSError, ValueError) as exc:
-                reason = concise_error(exc)
-                if reason != self.activity_error:
-                    self.post_event({"type": "notice", "generation": self.generation, "at": time.time(), "key": "journal_failure", "reason": reason,
-                                      "attempt_id": self.attempt_id, "attempt_number": self.attempt_number})
-                self.activity_error = reason
             self.post_event(event)
 
     def post_event(self, event):
@@ -16173,7 +16450,7 @@ class Launcher:
         self.retry_requested.set()
         return True
 
-    def probe_resources(self, cancel, installer=None):
+    def probe_resources(self, cancel, installer=None, fault=None):
         state = workspace_state(self.workspace)
         candidates = []
         for name in ("runtime-current.json", "runtime-build.json"):
@@ -16189,7 +16466,9 @@ class Launcher:
         if executable is None:
             return None
         check(cancel)
-        process = spawn([str(executable), "-B", str(Path(__file__).resolve()), "--probe-resources", str(state)],
+        details = fault.get("details", {}) if isinstance(fault, dict) else {}
+        request = {key: details[key] for key in ("resource_kind", "device", "device_identity", "configuration", "required_bytes") if key in details}
+        process = spawn([str(executable), "-B", str(Path(__file__).resolve()), "--probe-resources", str(state), json.dumps(request, allow_nan=False)],
                         workspace_environment(self.workspace), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + self.gate.probe_seconds
         try:
@@ -16277,7 +16556,7 @@ class Launcher:
                 began = time.monotonic()
                 resources = None
                 try:
-                    resources = self.probe_resources(interrupted, installer)
+                    resources = self.probe_resources(interrupted, installer, fault)
                 except Cancelled:
                     continue
                 except (OSError, ValueError, TypeError, YuanError) as exc:
@@ -16287,7 +16566,8 @@ class Launcher:
                     self.gate.save()
                 ready = self.gate.resource_ready(fault, resources)
                 self.emit("condition_check", key="resource_check", resource_probe_complete=resources is not None,
-                          available_bytes=resources.get("memory") if resources else None, required_bytes=fault.get("details", {}).get("required_bytes"),
+                          available_bytes=self.gate.resource_available(fault, resources), required_bytes=fault.get("details", {}).get("required_bytes"),
+                          resource_kind=fault.get("details", {}).get("resource_kind"), device=fault.get("details", {}).get("device"),
                           stable_seconds=0.0 if self.gate.resource_since is None else max(0.0, self.gate.clock() - self.gate.resource_since),
                           required_stable_seconds=self.gate.resource_stable_seconds)
                 if ready and self.gate.resume_fault("resource_restored"):
@@ -16650,7 +16930,6 @@ class YuanApp:
             self.progress_value = {}
             self.source_values = {}
             self.phase_values = {}
-            self.activity_window = None
             self.learning_window = self.review_window = None
             self.recent_activity = deque()
             self.pipeline_verified = False
@@ -16868,30 +17147,44 @@ class YuanApp:
         panel.grid(row=6, column=0, sticky="nsew", pady=(self.unit, 0))
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(1, weight=1)
-        self.label(panel, key="activity", fg=self.palette["accent"], font=self.bold_font).grid(row=0, column=0, sticky="w")
-        self.button(panel, self.show_activity, key="all_activity", pady=self.unit//2).grid(row=0, column=1, sticky="e")
+        self.label(panel, key="activity", fg=self.palette["accent"], font=self.bold_font).grid(row=0, column=0, columnspan=2, sticky="w")
         self.activity_text = self.tk.Text(panel, height=1, width=1, wrap="word", bg=self.palette["field"], fg=self.palette["text"], relief="flat", bd=0, font=self.small_font, padx=self.unit, pady=self.unit, state="disabled")
-        self.activity_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(self.unit, 0))
+        self.activity_text.grid(row=1, column=0, sticky="nsew", pady=(self.unit, 0))
+        scrollbar = self.ttk.Scrollbar(panel, orient="vertical", style="Yuan.Vertical.TScrollbar", command=self.activity_text.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns", pady=(self.unit, 0))
+        self.activity_text.configure(yscrollcommand=scrollbar.set)
+        self.activity_dirty = False
 
 
     def record_activity(self, event):
-        if event.get("type") not in ("status", "error", "notice", "deployment", "learning", "network", "recovery"):
+        kind = event.get("type")
+        if kind == "operation":
+            if event.get("scope") not in ("startup", "import", "runtime_probe") and event.get("outcome") != "failed":
+                return
+            if event.get("outcome") not in ("begin", "complete", "cancelled", "failed"):
+                return
+        elif kind not in ("attempt", "status", "error", "notice", "deployment", "learning", "network", "recovery", "runtime_message", "dependency_loaded"):
             return
-        event = {key: event[key] for key in ("at", "type", "key", "reason", "action_key") if key in event}
+        event = {key: event[key] for key in ("at", "type", "key", "reason", "action_key", "fault", "component", "version", "file", "elapsed", "outcome", "attempt_number", "detail") if key in event}
         self.recent_activity.append(event)
         limit = max(1, self.root.winfo_screenheight() // max(1, self.small_font.metrics("linespace")))
         while len(self.recent_activity) > limit:
             self.recent_activity.popleft()
-        self.render_activity()
+        self.activity_dirty = True
 
     def render_activity(self):
         text = self.activity_text
+        view = text.yview()
+        follow = not text.get("1.0", "end-1c").strip() or view[-1] >= 1.0 - sys.float_info.epsilon
         text.configure(state="normal")
         text.delete("1.0", "end")
-        for event in self.recent_activity:
-            text.insert("end", event_text(event, self.language, compact=True))
-        text.see("end")
+        text.insert("1.0", "".join(event_text(event, self.language, compact=True) for event in self.recent_activity))
+        if follow:
+            text.see("end")
+        else:
+            text.yview_moveto(view[0])
         text.configure(state="disabled")
+        self.activity_dirty = False
 
     def show_fault(self):
         from tkinter import messagebox
@@ -16901,58 +17194,6 @@ class YuanApp:
         action = tr(self.recovery_value.get("action_key", "action_" + category), self.language)
         messagebox.showwarning(APP_NAME, reason + "\n" + action, parent=self.root)
 
-    def show_activity(self):
-        if not self.launcher:
-            return
-        if self.activity_window and self.activity_window.winfo_exists():
-            self.activity_window.lift()
-            return
-        from tkinter import scrolledtext
-        window = self.tk.Toplevel(self.root)
-        self.activity_window = window
-        window.title(tr("all_activity", self.language))
-        window.configure(bg=self.palette["bg"])
-        window.geometry(f"{max(1, self.root.winfo_width())}x{max(1, self.root.winfo_height())}")
-        bar = self.tk.Frame(window, bg=self.palette["panel"])
-        bar.pack(fill="x")
-        text = scrolledtext.ScrolledText(window, wrap="word", font=self.small_font, bg=self.palette["field"], fg=self.palette["text"],
-                                         insertbackground=self.palette["accent"], relief="flat")
-        text.pack(fill="both", expand=True)
-        position = {"before": None, "trail": [], "first": None, "live": True, "last": None}
-        store = self.launcher.activity
-        def render():
-            if not window.winfo_exists() or store.closed:
-                return
-            limit = max(1, window.winfo_height() // max(1, self.small_font.metrics("linespace")))
-            try:
-                rows = store.page(position["before"], limit)
-            except (sqlite3.Error, OSError) as exc:
-                rows = [(0, {"type": "error", "reason": concise_error(exc)})]
-            marker = (rows[-1][0] if rows else None, position["before"], self.language)
-            if marker != position["last"]:
-                position["first"] = rows[0][0] if rows else None
-                position["last"] = marker
-                text.configure(state="normal")
-                text.delete("1.0", "end")
-                text.insert("1.0", "\n".join(event_text(event, self.language, compact=True) for _, event in rows))
-                text.configure(state="disabled")
-                if position["live"]:
-                    text.see("end")
-            self.root.after(max(1, int(math.sqrt(tick()) * 1000)), render)
-        def earlier():
-            if position["first"] is not None:
-                position["trail"].append(position["before"])
-                position["before"] = position["first"]
-                position["live"] = False
-        def later():
-            position["before"] = position["trail"].pop() if position["trail"] else None
-            position["live"] = position["before"] is None
-        def live():
-            position.update(before=None, trail=[], live=True, last=None)
-        for key, command in (("older", earlier), ("newer", later), ("live", live)):
-            self.button(bar, command, text=tr(key, self.language), pady=self.unit//2).pack(side="left", padx=self.unit//2, pady=self.unit//2)
-        text.bind("<MouseWheel>", lambda event: position.update(live=False))
-        render()
 
     def layout_cards(self, columns):
         if columns == self.card_columns:
@@ -17104,10 +17345,6 @@ class YuanApp:
             self.status_key = "failure"
             self.refresh()
             return
-        if self.launcher and not self.launcher.thread.is_alive():
-            self.launcher.activity.close()
-        if self.activity_window and self.activity_window.winfo_exists():
-            self.activity_window.destroy()
         for window in (self.learning_window, self.review_window):
             if window and window.winfo_exists():
                 window.destroy()
@@ -17227,8 +17464,6 @@ class YuanApp:
         if self.launcher and self.launcher.thread.is_alive():
             self.launcher.stop()
         else:
-            if self.launcher:
-                self.launcher.activity.close()
             self.destroy()
             return
         self.refresh()
@@ -17466,8 +17701,6 @@ class YuanApp:
                     self.choose_button.configure(state="disabled")
                     return
                 if self.closing:
-                    if self.launcher:
-                        self.launcher.activity.close()
                     self.destroy()
                     return
                 if self.pending_workspace:
@@ -17733,9 +17966,10 @@ class YuanApp:
                 except self.tk.TclError:
                     return
         if self.closing and self.launcher and not self.launcher.thread.is_alive():
-            self.launcher.activity.close()
             self.destroy()
             return
+        if self.activity_dirty:
+            self.render_activity()
         self.refresh()
         self.root.after(max(1, int(math.sqrt(tick()) * 1000)), self.pump)
 
@@ -18258,7 +18492,6 @@ class BrowserApp:
                 return
             if self.launcher.process_retained:
                 raise YuanError("旧音频进程未安全结束 / Previous audio process did not stop safely")
-            self.launcher.activity.close()
             self.launcher = None
         workspace = self.pending_workspace
         if not workspace.is_dir():
@@ -18579,8 +18812,6 @@ window.addEventListener('beforeunload',e=>{if(state.session&&!leaving){e.prevent
             if self.launcher:
                 self.launcher.stop()
                 self.launcher.thread.join(timeout=self.launcher.supervisor.grace)
-                if not self.launcher.thread.is_alive():
-                    self.launcher.activity.close()
             self.server.shutdown()
             self.server.server_close()
             thread.join(timeout=2)
@@ -18640,8 +18871,6 @@ class TerminalApp(BrowserApp):
                 self.action({"action": "close", "confirmed": True})
                 if self.launcher is not None:
                     self.launcher.thread.join(timeout=self.launcher.supervisor.grace)
-                    if not self.launcher.thread.is_alive():
-                        self.launcher.activity.close()
 
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--probe-device-memory":
@@ -18666,9 +18895,9 @@ def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--probe-import":
         runtime_probe_import(sys.argv[2], sys.argv[3])
         return
-    if len(sys.argv) == 3 and sys.argv[1] == "--probe-resources":
-        import psutil
-        sys.stdout.write(json.dumps({**available_resources(psutil), "process_rss": int(psutil.Process().memory_info().rss)}, allow_nan=False) + "\n")
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--probe-resources":
+        details = json.loads(sys.argv[3]) if len(sys.argv) == 4 else {}
+        sys.stdout.write(json.dumps(runtime_resource_snapshot(sys.argv[2], details), allow_nan=False) + "\n")
         sys.stdout.flush()
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--probe":
