@@ -31,19 +31,20 @@ import urllib.error
 import urllib.parse
 from pathlib import Path
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 
 APP_NAME = "Yuan"
-STATE_NAME = f".{APP_NAME.lower()}"
+STATE_NAME = ".yuan-native"
 EMBEDDED_RELEASE = {}
 PYTHON_REQUIREMENT = ">=3.10,<3.14"
 PACKAGES = (
-    "numpy==2.2.6; python_version < '3.11'", "numpy==2.3.5; python_version >= '3.11'", "sounddevice==0.5.3", "soundfile==0.13.1",
-    "soxr==1.0.0", "psutil==7.2.2", "certifi==2026.5.20", "cryptography==46.0.4", "zstandard==0.23.0", "pyarrow==20.0.0"
+    "numpy>=2.0,<2.4", "sounddevice==0.5.3", "soundfile==0.13.1",
+    "soxr==1.0.0", "psutil>=7.0,<8", "certifi>=2025.11.12", "cryptography>=46,<48", "zstandard==0.23.0", "pyarrow==20.0.0"
 )
 TEXT = {
+    "automatic_release_retry": ("验收运行中断 · 保留冻结任务并自动恢复", "Acceptance interrupted · frozen task retained for automatic recovery"),
     "stage_import_pyarrow": ("导入原生语料读取组件", "Importing the native corpus reader"),
     "public_speech_import": ("已导入带人工转写的原生语料", "Imported native human-transcribed speech"),
     "data_sources_exhausted": ("可用来源暂未覆盖数据缺口 · 保留进度并自动复查", "Available sources do not cover the data gaps · progress retained for automatic recheck"),
@@ -121,7 +122,7 @@ TEXT = {
     "process_running": ("执行中", "Running"),
     "process_idle": ("未运行子进程", "No child process running"),
     "owned_source_found": ("已发现自有模型交付来源，尚待完整验收", "Owned model delivery source found; full acceptance still required"),
-    "owned_source_absent": ("尚未发现自有模型交付来源；环境就绪不等于可对话", "No owned model delivery source found; runtime readiness does not imply conversation readiness"),
+    "owned_source_absent": ("首次运行将自动创建本地模型，随后自主学习并验证对话能力", "First launch creates a local model, then learns and validates conversation ability automatically"),
     "owned_source_invalid": ("自有模型来源配置需修正；运行环境准备仍继续", "Owned model source configuration needs correction; runtime preparation continues"),
     "open_fault": ("查看处理方法", "View recovery action"),
     "operation_begin": ("开始", "Started"),
@@ -291,6 +292,7 @@ TEXT = {
     "ready": ("一切就绪 · 可以开始对话", "Everything is ready · start a conversation"),
     "connecting": ("正在连接麦克风与扬声器", "Connecting the microphone and speaker"),
     "listening": ("我在听", "I'm listening"),
+    "preparing_reply": ("持续收音 · 正在释放训练资源", "Listening continuously · releasing training resources"),
     "thinking": ("Yuan 正在直接生成语音回复", "Yuan is generating a direct audio reply"),
     "speaking": ("Yuan 正在说话", "Yuan is speaking"),
     "ending": ("正在结束本次对话", "Ending this conversation"),
@@ -379,7 +381,7 @@ TEXT = {
     "training_unvalidated": ("候选持续训练 · 等待独立验证与保护样本", "Candidate is training · waiting for independent validation and guard samples"),
     "candidate_recovered": ("已恢复未启用的候选训练状态", "Inactive candidate training state restored"),
     "checkpoint_failure": ("模型存档无效 · 未装载损坏权重", "Invalid model checkpoint · damaged weights were not loaded"),
-    "device_fallback": ("加速设备不可用 · 改用 CPU", "Accelerator unavailable · using CPU"),
+    "backend_next": ("自动匹配下一种加速后端", "Automatically matching the next accelerator backend"),
     "sample_skipped": ("音频样本暂不可学习 · 已保留来源记录", "Audio sample is not learnable · provenance retained"),
     "source_catalog": ("公开音频目录", "Public audio catalog"),
     "dialogue_pair": ("音频配对记录", "Audio pair record"),
@@ -625,12 +627,21 @@ class InvalidAudio(YuanError):
 class IneligibleSample(YuanError):
     pass
 
+class AcceptanceFailed(IneligibleSample):
+    pass
+
 class FlushResult(dict):
     def __bool__(self):
         return self.get("ok") is True
 
 def tick():
     return max(sys.getswitchinterval(), time.get_clock_info("monotonic").resolution)
+
+def timing_floor():
+    return max(sys.float_info.epsilon, time.get_clock_info("monotonic").resolution)
+
+def elapsed_seconds(started):
+    return max(timing_floor(), time.monotonic() - started)
 
 def check(cancel):
     if cancel is not None and cancel.is_set():
@@ -832,32 +843,41 @@ class StartupControl:
             return self._transfer_used + active
 
     @property
+    def transfer_remaining(self):
+        return max(0.0, self.transfer_seconds - self.transfer_used)
+
+    @property
     def deadline(self):
         return self._deadline + min(self.transfer_seconds, self.transfer_used)
+
+    def transfer_fault(self):
+        return YuanFault("累计下载预算已用尽，已保留可续传部分 / Cumulative download budget exhausted; resumable data retained",
+                         category="timeout", code="startup_transfer_deadline", stage="engine_startup",
+                         transfer_seconds=self.transfer_seconds, transfer_used_seconds=self.transfer_used)
 
     def is_set(self):
         if self.cancel.is_set():
             return True
         with self.lock:
-            if self._transfer_started is not None and self.transfer_used >= self.transfer_seconds:
-                raise YuanFault("累计下载预算已用尽，已保留可续传部分 / Cumulative download budget exhausted; resumable data retained",
-                                category="timeout", code="startup_transfer_deadline", stage="download")
+            used = self.transfer_used
+            if (self._transfer_started is not None or used > 0.0) and used >= self.transfer_seconds:
+                raise self.transfer_fault()
             if self.clock() >= self.deadline:
-                raise YuanFault("累计启动执行预算已用尽 / Cumulative startup execution budget exhausted", category="timeout", code="startup_campaign_deadline", stage="engine_startup")
+                raise YuanFault("运行准备暂未完成，将从检查点继续 / Runtime preparation will continue from its checkpoint", category="timeout", code="startup_campaign_deadline", stage="engine_startup")
         return False
 
     @contextmanager
     def transfer(self):
-        check(self)
-        if self.transfer_seconds <= 0:
-            yield
-            return
         with self.lock:
+            check(self)
+            if self.transfer_remaining <= 0.0:
+                raise self.transfer_fault()
             if self._transfer_depth == 0:
                 self._transfer_started = self.clock()
             self._transfer_depth += 1
         try:
             yield
+            check(self)
         finally:
             with self.lock:
                 self._transfer_depth -= 1
@@ -868,18 +888,22 @@ class StartupControl:
     def wait(self, seconds):
         check(self)
         with self.lock:
-            remaining = self._deadline - self.clock() + min(self.transfer_seconds, self.transfer_used)
+            remaining = max(0.0, self.deadline - self.clock())
             if self._transfer_started is not None:
-                remaining = min(remaining, self.transfer_seconds - self.transfer_used)
+                remaining = self.transfer_remaining
         self.cancel.wait(max(0.0, min(seconds, remaining)))
         return self.is_set()
 
+
 class TransferBudget:
     def __init__(self, initial, maximum, idle, margin=2.0, clock=None):
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+               for value in (initial, maximum, idle, margin)):
+            raise ValueError("下载时间预算无效 / Invalid transfer time budget")
         self.clock = clock or time.monotonic
         self.started = self.clock()
-        self.deadline = self.started + initial
-        self.hard_deadline = self.started + max(initial, maximum)
+        self.hard_deadline = self.started + maximum
+        self.deadline = min(self.hard_deadline, self.started + initial)
         self.idle, self.margin = idle, max(1.0, margin)
         self.previous = None
         self.previous_at = self.started
@@ -887,18 +911,21 @@ class TransferBudget:
 
     def advance(self, current, total):
         now = self.clock()
+        if now >= self.deadline:
+            return self.deadline
         if self.previous is not None and current > self.previous:
             elapsed = max(tick(), now - self.previous_at)
             measured = (current - self.previous) / elapsed
             weight = -math.expm1(-elapsed / max(tick(), self.idle))
             self.speed = measured if self.speed is None else self.speed + weight * (measured - self.speed)
             remaining = max(0, total - current) / self.speed if total is not None and self.speed > 0 else self.idle
-            self.deadline = max(self.deadline, min(self.hard_deadline, now + max(self.idle, remaining * self.margin)))
+            self.deadline = min(self.hard_deadline, max(self.deadline, now + max(self.idle, remaining * self.margin)))
         elif self.previous is not None and current < self.previous:
             self.speed = None
         if self.previous is None or current != self.previous:
             self.previous, self.previous_at = current, now
         return self.deadline
+
 
 class TransferRate:
     def __init__(self, interval, clock=None):
@@ -1517,9 +1544,26 @@ class WorkspaceLease:
     def __exit__(self, *args):
         self.close()
 
+def workspace_state(workspace):
+    return ensure_workspace_identity(safe_path(workspace, STATE_NAME + "-" + build_digest()))
+
+def ensure_workspace_identity(state, verified_assets=False):
+    state = Path(state).resolve()
+    identity = {"protocol": "yuan-workspace-v1", "build_sha256": build_digest(), "schema_version": 1}
+    path = safe_path(state, "workspace-identity.json")
+    if path.exists():
+        if checked_json(path) != identity:
+            raise YuanFault("数据空间属于其他版本，已拒绝复用 / Workspace belongs to another build; reuse refused", category="integrity", code="workspace_build_mismatch")
+    else:
+        if any((state / name).exists() for name in ("memory/memory.sqlite3", "runtime-current.json", "policy-effective.json")) or (state / "learning").exists() and not verified_assets:
+            raise YuanFault("数据空间缺少当前版本身份，已保留且不加载 / Existing workspace has no current-build identity; preserved without loading", category="integrity", code="workspace_identity_missing")
+        state.mkdir(parents=True, exist_ok=True)
+        atomic_json(path, identity)
+    return state
+
 def workspace_environment(workspace):
     workspace = Path(workspace).resolve()
-    state = safe_path(workspace, STATE_NAME)
+    state = ensure_workspace_identity(workspace_state(workspace))
     cache = safe_path(state, "cache")
     values = {
         "HOME": state / "home", "USERPROFILE": state / "home",
@@ -1534,6 +1578,9 @@ def workspace_environment(workspace):
     env = NetworkConfig(state).apply(os.environ.copy())
     for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "PYTHONSTARTUP"):
         env.pop(key, None)
+    for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+        if env.get(key) in ("", "-1"):
+            env.pop(key, None)
     for key, path in values.items():
         path = safe_path(state, path.relative_to(state).as_posix())
         path.mkdir(parents=True, exist_ok=True)
@@ -1592,7 +1639,50 @@ def spawn(command, env, **kwargs):
     options = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
     return subprocess.Popen(command, env=env, cwd=env["YUAN_WORKSPACE"], **options, **kwargs)
 
-def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_seconds=None, stall_seconds=None, timeout_seconds=None, stage=None, events=None):
+def process_activity(pid):
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        class Counters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in ("reads", "writes", "others", "read_bytes", "write_bytes", "other_bytes")]
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetProcessTimes.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME))
+        kernel.GetProcessIoCounters.argtypes = (wintypes.HANDLE, ctypes.POINTER(Counters))
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            created, ended, system, user = (wintypes.FILETIME() for _ in range(4))
+            counters = Counters()
+            if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(ended), ctypes.byref(system), ctypes.byref(user)):
+                return None
+            cpu = (((system.dwHighDateTime << 32) | system.dwLowDateTime) + ((user.dwHighDateTime << 32) | user.dwLowDateTime)) / 10000000
+            if not kernel.GetProcessIoCounters(handle, ctypes.byref(counters)):
+                return (cpu, 0, 0)
+            return (cpu, counters.read_bytes, counters.write_bytes)
+        finally:
+            kernel.CloseHandle(handle)
+    if sys.platform.startswith("linux"):
+        try:
+            root = Path("/proc") / str(pid)
+            fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+            cpu = (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+            values = {}
+            try:
+                for line in (root / "io").read_text().splitlines():
+                    key, value = line.split(":", 1)
+                    values[key] = int(value.strip())
+            except OSError:
+                pass
+            return (cpu, values.get("read_bytes", 0) + values.get("rchar", 0), values.get("write_bytes", 0) + values.get("wchar", 0))
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_seconds=None, stall_seconds=None, timeout_seconds=None, stage=None, events=None, adaptive=False):
     check(cancel)
     process = spawn(command, env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1)
     result = deque(maxlen=256)
@@ -1608,6 +1698,8 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
         raise ValueError("Invalid process deadline")
     deadline = started + budget
     previous_activity = None
+    previous_progress = None
+    progress_stages = set()
     monitor = None
     psutil = sys.modules.get("psutil")
     if psutil is not None:
@@ -1643,6 +1735,20 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
             if line is not None:
                 result.append(line)
                 last_output = time.monotonic()
+                if adaptive:
+                    raw = re.fullmatch(r"Progress ([0-9]+) of ([0-9]+)", line.strip())
+                    productive = False
+                    if raw:
+                        current = (int(raw[1]), int(raw[2]))
+                        productive = previous_progress is None or current[1] != previous_progress[1] or current[0] > previous_progress[0]
+                        previous_progress = current
+                    elif "Downloading " in line or "Using cached " in line:
+                        previous_progress = None
+                    elif re.search(r"Installing collected packages|Successfully installed", line) and line not in progress_stages:
+                        progress_stages.add(line)
+                        productive = True
+                    if productive:
+                        deadline = max(deadline, last_output + budget)
                 category = failure_category(YuanError(line))
                 if category != "unknown":
                     evidence.setdefault(category, line)
@@ -1684,15 +1790,24 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
                         if activity != previous_activity:
                             previous_activity = activity
                             last_activity = now
+                            if adaptive:
+                                deadline = max(deadline, now + budget)
                     except (OSError, psutil.Error):
                         monitor = None
+                if activity is None:
+                    activity = process_activity(process.pid)
+                    if activity is not None and activity != previous_activity:
+                        previous_activity = activity
+                        last_activity = now
+                        if adaptive:
+                            deadline = max(deadline, now + budget)
                 if heartbeat:
                     heartbeat({"pid": process.pid, "elapsed": now - started, "output_idle": now - last_output, "activity_idle": now - last_activity,
                                "process_running": process.poll() is None, "process_activity": activity, "monitor_available": activity is not None,
                                "remaining_seconds": max(0.0, deadline - now), "budget_seconds": budget})
-                if stall_seconds and now - last_output > stall_seconds and process.poll() is None:
+                if stall_seconds and now - max(last_output, last_activity) > stall_seconds and process.poll() is None:
                     raise YuanFault("组件没有可观察进展 / No observable component progress", category="timeout", code="component_stalled", stage=stage,
-                                    command=[str(value) for value in command], pid=process.pid, idle_seconds=now-last_output, output=redact(list(result)))
+                                    command=[str(value) for value in command], pid=process.pid, idle_seconds=now-max(last_output, last_activity), output=redact(list(result)))
         returncode = process.wait()
         if child_fault:
             raise YuanFault(child_fault.get("reason") or "运行预检失败 / Runtime probe failed", category=child_fault.get("category", "unknown"),
@@ -1729,7 +1844,7 @@ def startup_preflight(state, dependencies=None, emit=None):
     disk = shutil.disk_usage(state)
     result = {"storage_writable": True, "free_bytes": disk.free, "python": platform.python_version(), "system": platform.system(),
               "machine": platform.machine(), "display": bool(sys.platform in ("win32", "darwin") or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
-              "device_presence": None, "audio_permissions": "not_probed", "runtime_profile": "yuan-runtime-pinned-v5"}
+              "device_presence": None, "audio_permissions": "not_probed", "runtime_profile": "yuan-runtime-v6"}
     if disk.free <= 0:
         raise YuanError("所选目录没有可用空间 / Selected folder has no free space")
     if dependencies is not None:
@@ -1763,10 +1878,65 @@ def startup_preflight(state, dependencies=None, emit=None):
         emit("deployment_preflight", key="deployment_preflight", **result)
     return result
 
+class WheelCatalog:
+    @staticmethod
+    def tags(python, command):
+        program = "import json;from pip._vendor.packaging.tags import sys_tags;print(json.dumps([str(t) for t in sys_tags()]))"
+        values = json.loads(command([str(python), "-c", program]).strip())
+        if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+            raise YuanFault("解释器平台标签无效 / Invalid interpreter platform tags", category="compatibility", code="wheel_tags_invalid")
+        return {tag: index for index, tag in enumerate(values)}
+
+    @staticmethod
+    def select(text, base, tags, name, version):
+        from html.parser import HTMLParser
+        class Links(HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.rows = []
+            def handle_starttag(self, tag, attrs):
+                if tag.casefold() == "a":
+                    self.rows.append(dict(attrs))
+        parser = Links()
+        parser.feed(text)
+        candidates = []
+        for row in parser.rows:
+            if "data-yanked" in row:
+                continue
+            url = urllib.parse.urljoin(base, row.get("href") or "")
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme != "https" or parsed.hostname not in ("download.pytorch.org", "download-r2.pytorch.org") or parsed.username or parsed.password:
+                continue
+            filename = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+            parts = filename[:-4].split("-") if filename.endswith(".whl") else []
+            if len(parts) not in (5, 6) or parts[0].replace("_", "-").casefold() != name.casefold() or parts[1].split("+", 1)[0] != version:
+                continue
+            ranks = [tags[key] for py in parts[-3].split(".") for abi in parts[-2].split(".") for platform_tag in parts[-1].split(".") if (key := py + "-" + abi + "-" + platform_tag) in tags]
+            digest = urllib.parse.parse_qs(parsed.fragment).get("sha256", [None])[0]
+            if not ranks or not is_digest(digest):
+                continue
+            clean = urllib.parse.urlunsplit(parsed._replace(fragment=""))
+            candidates.append((min(ranks), filename, {"name": name, "version": parts[1], "url": clean, "filename": filename, "sha256": digest}))
+        if not candidates:
+            raise YuanFault("当前后端没有匹配的官方运行组件 / No matching official runtime wheel for this backend", category="compatibility", code="wheel_candidate_missing", backend=base, version=version)
+        return min(candidates, key=lambda value: value[:2])[2]
+
+    @staticmethod
+    def read(network, url, cancel):
+        chunks, length = [], 0
+        with network.request(url) as response:
+            for chunk in network.blocks(response):
+                check(cancel)
+                length += len(chunk)
+                if length > 64 * 1024 * 1024:
+                    raise InvalidDownload("组件目录超过安全大小 / Component catalog exceeds its safety bound")
+                chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
 class RuntimeInstaller:
     def __init__(self, workspace, cancel, emit):
         self.workspace, self.cancel, self.emit = Path(workspace), cancel, emit
-        self.state = safe_path(workspace, STATE_NAME)
+        self.state = workspace_state(workspace)
         self.env = workspace_environment(workspace)
         self.lock_path = safe_path(self.state, "runtime-lock.json")
         self.policy = AdaptivePolicy(self.state)
@@ -1832,7 +2002,7 @@ class RuntimeInstaller:
             self.emit("runtime_message", detail=line, stage=self.phase)
         self.emit("progress", **self.progress)
 
-    def command(self, command, report=False):
+    def command(self, command, report=False, transfer=False):
         is_probe = any(flag in command for flag in ("--probe", "--probe-import", "--verify-install"))
         def receive(event):
             self.supervisor.observe(event)
@@ -1858,14 +2028,14 @@ class RuntimeInstaller:
             budget = max(budget, sum(budgets.values()) + self.supervisor.grace)
         if isinstance(self.cancel, StartupControl):
             check(self.cancel)
-            budget = min(budget, max(tick(), self.cancel.deadline - time.monotonic()))
             env["YUAN_STARTUP_DEADLINE"] = str(self.cancel.deadline)
         self.supervisor.policy.save()
         began = time.monotonic()
         try:
-            result = run_command(command, env, self.cancel, self.report if report else None, heartbeat=heartbeat,
-                                 heartbeat_seconds=self.heartbeat_seconds, stall_seconds=None if is_probe else self.stall_seconds,
-                                 timeout_seconds=budget, stage=self.phase, events=receive if is_probe else None)
+            with self.cancel.transfer() if transfer and isinstance(self.cancel, StartupControl) else nullcontext():
+                result = run_command(command, env, self.cancel, self.report if report else None, heartbeat=heartbeat,
+                                     heartbeat_seconds=self.heartbeat_seconds, stall_seconds=None if is_probe else self.stall_seconds,
+                                     timeout_seconds=budget, stage=self.phase, events=receive if is_probe else None, adaptive=not is_probe)
             self.emit("runtime_message", stage=self.phase, command=[str(value) for value in command], returncode=0, elapsed=time.monotonic()-began)
             return result
         except YuanFault as exc:
@@ -1886,7 +2056,7 @@ class RuntimeInstaller:
                 raise YuanError("当前 Python 版本不满足要求 / Host Python does not meet requirements")
             return host_python()
         executable = self._uv()
-        self.command([str(executable), "--no-config", "python", "install", request], report=True)
+        self.command([str(executable), "--no-config", "python", "install", request], report=True, transfer=True)
         result = self.command([str(executable), "--no-config", "python", "find", "--managed-python", request]).strip().splitlines()
         if not result:
             raise YuanError("独立 Python 查找结果为空 / Managed Python lookup returned no result")
@@ -1898,71 +2068,110 @@ class RuntimeInstaller:
 
     def detect_hardware(self):
         hardware = {"system": platform.system(), "machine": platform.machine(), "cuda": None,
-                    "visibility": os.environ.get("CUDA_VISIBLE_DEVICES"), "driver": None}
-        if hardware["system"] not in ("Linux", "Windows") or hardware["visibility"] in ("", "-1"):
-            return hardware
+                    "visibility": os.environ.get("CUDA_VISIBLE_DEVICES"), "driver": None, "adapters": []}
+        timeout = self.policy.number("runtime", "hardware_probe_seconds", 10.0, 1.0, 60.0)
+        def execute(arguments):
+            result = subprocess.run(arguments, capture_output=True, timeout=timeout, env=self.env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            check(self.cancel)
+            return result.stdout.decode("utf-8-sig", "replace") if result.returncode == 0 else ""
+        if hardware["system"] == "Windows":
+            powershell = shutil.which("powershell.exe") or str(Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+            try:
+                text = execute([powershell, "-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding=[Text.UTF8Encoding]::new();Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID,DriverVersion,ConfigManagerErrorCode | ConvertTo-Json -Compress"])
+                rows = json.loads(text) if text else []
+                rows = [rows] if isinstance(rows, dict) else rows
+                for row in rows:
+                    name, identifier = str(row.get("Name", "")), str(row.get("PNPDeviceID", "")).upper()
+                    vendor = "nvidia" if "VEN_10DE" in identifier else "amd" if "VEN_1002" in identifier else "intel" if "VEN_8086" in identifier else None
+                    if vendor:
+                        hardware["adapters"].append({"name": name, "vendor": vendor, "driver": str(row.get("DriverVersion", "")), "status": row.get("ConfigManagerErrorCode")})
+            except (OSError, ValueError, subprocess.TimeoutExpired, TypeError):
+                pass
+        elif hardware["system"] == "Linux":
+            for directory in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+                if not re.fullmatch(r"card[0-9]+", directory.name):
+                    continue
+                try:
+                    vendor_id = (directory / "device/vendor").read_text().strip().lower()
+                    vendor = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}.get(vendor_id)
+                    if vendor:
+                        hardware["adapters"].append({"name": directory.name, "vendor": vendor})
+                except OSError:
+                    pass
+        elif hardware["system"] == "Darwin" and hardware["machine"].casefold() in ("arm64", "aarch64"):
+            hardware["adapters"].append({"name": "Apple Silicon", "vendor": "apple"})
         executable = shutil.which("nvidia-smi")
         if executable is None and hardware["system"] == "Windows":
-            candidate = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "NVIDIA Corporation/NVSMI/nvidia-smi.exe"
-            executable = str(candidate) if candidate.is_file() else None
-        if executable is None:
-            return hardware
-        try:
-            from xml.etree import ElementTree
-            timeout = self.policy.number("runtime", "hardware_probe_seconds", 10.0, 1.0, 60.0)
-            result = subprocess.run([executable, "-q", "-x"], capture_output=True, timeout=timeout, env=self.env,
-                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            check(self.cancel)
-            if result.returncode == 0:
-                tree = ElementTree.fromstring(result.stdout)
-                version = tree.findtext("cuda_version", "")
-                if re.fullmatch(r"\d+\.\d+", version) and tree.findall("gpu"):
-                    hardware.update(cuda=version, driver=tree.findtext("driver_version"),
-                                    devices=[item.findtext("product_name", "") for item in tree.findall("gpu")])
-        except (OSError, subprocess.TimeoutExpired, ValueError, ElementTree.ParseError):
-            pass
+            candidates = [Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/nvidia-smi.exe", Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "NVIDIA Corporation/NVSMI/nvidia-smi.exe"]
+            executable = next((str(path) for path in candidates if path.is_file()), None)
+        if executable:
+            try:
+                from xml.etree import ElementTree
+                text = execute([executable, "-q", "-x"])
+                if text:
+                    tree = ElementTree.fromstring(text)
+                    version = tree.findtext("cuda_version", "")
+                    if tree.findall("gpu"):
+                        hardware.update(driver=tree.findtext("driver_version"), devices=[item.findtext("product_name", "") for item in tree.findall("gpu")])
+                        if re.fullmatch(r"\d+\.\d+", version):
+                            hardware["cuda"] = version
+                        if not any(item["vendor"] == "nvidia" for item in hardware["adapters"]):
+                            hardware["adapters"] += [{"name": name, "vendor": "nvidia"} for name in hardware["devices"]]
+                if not hardware["cuda"]:
+                    match = re.search(r"CUDA Version:\s*([0-9]+\.[0-9]+)", execute([executable]))
+                    if match:
+                        hardware["cuda"] = match[1]
+                capabilities = execute([executable, "--query-gpu=compute_cap", "--format=csv,noheader,nounits"])
+                hardware["compute_capabilities"] = [value.strip() for value in capabilities.splitlines() if re.fullmatch(r"\s*[0-9]+\.[0-9]+\s*", value)]
+            except (OSError, ValueError, subprocess.TimeoutExpired, ElementTree.ParseError):
+                pass
+        atomic_json(self.state / "hardware.json", hardware, self.cancel)
+        self.emit("hardware", hardware=hardware)
         return hardware
 
+
     def backend_candidates(self):
-        if self.hardware["system"] not in ("Linux", "Windows"):
+        system = self.hardware["system"]
+        devices = self.hardware.get("adapters", [])
+        vendors = {str(item.get("vendor", "")).casefold() for item in devices}
+        nvidia = bool(self.hardware.get("cuda") or "nvidia" in vendors)
+        if system == "Darwin":
             return ["native"]
-        version = self.hardware.get("cuda")
-        if not version:
-            return ["cpu"]
-        fingerprint = payload_digest(self.hardware)
-        path = self.state / "runtime-backends.json"
-        saved = read_json(path)
-        interval = self.policy.number("runtime", "backend_recheck_seconds", 86400.0, 1.0, 30 * 86400.0)
-        if saved.get("hardware") == fingerprint and saved.get("created", 0) + interval > time.time():
-            channels = saved.get("channels", [])
-        else:
+        if nvidia:
+            version = self.hardware.get("cuda")
+            maximum = tuple(map(int, version.split("."))) if version else None
+            capabilities = [float(value) for value in self.hardware.get("compute_capabilities", []) if re.fullmatch(r"[0-9]+\.[0-9]+", str(value))]
             channels = []
-            try:
-                response = self.network.request("https://download.pytorch.org/whl/")
-                chunks, count = [], 0
-                with response:
-                    for chunk in self.network.blocks(response):
-                        check(self.cancel)
-                        count += len(chunk)
-                        if count > 1024 * 1024:
-                            raise InvalidDownload("计算后端目录过大 / Compute backend catalog is too large")
-                        chunks.append(chunk)
-                text = b"".join(chunks).decode("utf-8")
-                links = re.findall(r"""href\s*=\s*["']([^"']+)["']""", text, re.IGNORECASE)
-                names = [urllib.parse.urlsplit(urllib.parse.urljoin("https://download.pytorch.org/whl/", link)).path.rstrip("/").rsplit("/", 1)[-1] for link in links]
-                channels = sorted({name for name in names if re.fullmatch(r"cu\d{2,4}", name)}, key=lambda value: int(value[2:]), reverse=True)
-                atomic_json(path, {"hardware": fingerprint, "channels": channels, "created": time.time()}, self.cancel)
-            except Cancelled:
-                raise
-            except (OSError, ValueError, YuanError) as exc:
-                self.emit("notice", key="device_fallback", reason=concise_error(exc), backend="cpu")
-        maximum = tuple(map(int, version.split(".")))
-        compatible = [item for item in channels if isinstance(item, str) and re.fullmatch(r"cu\d{2,4}", item)
-                      and (int(item[2:-1]), int(item[-1])) <= maximum]
-        return compatible + ["cpu"]
+            for capability in sorted(set(capabilities), reverse=True) or [None]:
+                compatible = (["cu128", "cu130"] if capability is not None and capability >= 10 else
+                              ["cu126"] if capability is not None and capability < 7.5 else ["cu126", "cu128", "cu130"])
+                channels.extend(channel for channel in compatible if channel not in channels)
+            if maximum is not None:
+                channels = [channel for channel in channels if (int(channel[2:-1]), int(channel[-1])) <= maximum]
+            if system == "Windows":
+                channels.append("directml")
+            if channels:
+                return channels
+            raise YuanFault("显卡驱动与计算组件正在重新匹配 / Rematching the graphics driver and compute components", category="compatibility", code="accelerator_driver_match", hardware=self.hardware)
+        if system == "Windows" and devices:
+            return (["xpu"] if "intel" in vendors else []) + ["directml"]
+        if system == "Linux":
+            if "amd" in vendors and Path("/dev/kfd").exists():
+                return ["rocm7.1"]
+            if "intel" in vendors:
+                return ["xpu"]
+            if devices:
+                raise YuanFault("正在匹配图形计算驱动 / Matching the graphics compute driver", category="compatibility", code="accelerator_driver_match", hardware=self.hardware)
+        return ["cpu"]
+
+
+    def required_packages(self):
+        if self.compute_backend == "directml":
+            return tuple("numpy>=1.26,<2" if item.startswith("numpy") else item for item in PACKAGES) + ("torch-directml==0.2.5.dev240914",)
+        return PACKAGES
 
     def runtime_signature(self):
-        return payload_digest(["yuan-runtime-pinned-v5", PACKAGES, self.hardware, self.compute_backend, PYTHON_REQUIREMENT, "torch==2.10.0"])
+        return payload_digest(["yuan-runtime-v6", self.required_packages(), self.hardware, self.compute_backend, PYTHON_REQUIREMENT, "torch==2.10.0", "metadata-first-resume-v6"])
 
     def _platform_key(self, python):
         script = "import json,platform,sys,sysconfig;print(json.dumps([platform.system(),platform.machine(),sys.version_info[:2],sys.implementation.name,sysconfig.get_config_var('SOABI')],separators=(',',':')))"
@@ -1993,7 +2202,7 @@ class RuntimeInstaller:
             packages.append({"name": item["name"], "version": item["version"]})
         packages.sort(key=lambda item: item["name"])
         names = [item["name"] for item in packages]
-        required = {re.split(r"[<>=!~\[]", item)[0].lower() for item in ("torch==2.10.0", *PACKAGES)}
+        required = {re.split(r"[<>=!~\[]", item)[0].lower() for item in ("torch", *self.required_packages())}
         if len(names) != len(set(names)) or not required.issubset(names) or packages != entry.get("packages"):
             raise YuanError("运行组件版本清单不完整或重复 / Runtime package manifest is incomplete or duplicated")
         return entry
@@ -2014,11 +2223,21 @@ class RuntimeInstaller:
             url = download.get("url", "")
             if item.get("is_yanked"):
                 raise YuanError("拒绝已撤回的运行组件 / Refusing a withdrawn runtime artifact")
-            artifacts.append({"name": re.sub(r"[-_.]+", "-", str(metadata.get("name", ""))).lower(), "version": str(metadata.get("version", "")),
-                              "url": url, "filename": urllib.parse.unquote(Path(urllib.parse.urlparse(url).path).name), "sha256": digest})
+            name = re.sub(r"[-_.]+", "-", str(metadata.get("name", ""))).lower()
+            version = str(metadata.get("version", ""))
+            if urllib.parse.urlsplit(url).scheme == "file":
+                clean = urllib.parse.urlunsplit(urllib.parse.urlsplit(url)._replace(fragment=""))
+                artifact = getattr(self, "local_artifacts", {}).get(clean)
+                if not artifact or artifact["name"] != name or artifact["version"] != version or artifact["sha256"] != digest:
+                    raise YuanFault("本地组件与已核验来源不一致 / Local component differs from its verified source", category="integrity", code="local_artifact_mismatch")
+                artifacts.append(dict(artifact))
+            else:
+                artifacts.append({"name": name, "version": version, "url": url,
+                                  "filename": urllib.parse.unquote(Path(urllib.parse.urlparse(url).path).name), "sha256": digest})
         artifacts.sort(key=lambda item: item["name"])
         entry = {"platform": platform_value, "packages": [{"name": item["name"], "version": item["version"]} for item in artifacts], "artifacts": artifacts}
         return self._validate_entry(entry, platform_value)
+
 
     def _installation_identity(self, python, entry):
         runtime = Path(python).parent.parent
@@ -2063,15 +2282,6 @@ class RuntimeInstaller:
         except YuanFault as exc:
             atomic_json(failure_path, {"identity": identity, "fault": fault_event(exc), "at": time.time()}, self.cancel)
             raise
-        backend = self.compute_backend or "cpu"
-        if backend.startswith("cu"):
-            script = "import torch;assert torch.cuda.is_available();x=torch.arange(16,device='cuda',dtype=torch.float32).reshape(4,4);y=x@x.T;torch.cuda.synchronize();assert torch.isfinite(y).all();r=torch.nn.GRU(4,4,batch_first=True).cuda();z,_=r(x.reshape(1,4,4));z.sum().backward();torch.cuda.synchronize();assert torch.isfinite(z).all()"
-            try:
-                self.command([str(python), "-c", script], report=True)
-            except Cancelled:
-                raise
-            except Exception as exc:
-                raise YuanFault("GPU 实际计算验证失败 / GPU compute validation failed", category="compatibility", code="compute_backend_failed", stage=self.phase, backend=backend) from exc
         failure_path.unlink(missing_ok=True)
         self.verified_entry = entry
 
@@ -2141,15 +2351,25 @@ class RuntimeInstaller:
         publish(force=True)
         def complete(path, cached=False):
             check(cancel)
-            size = path.stat().st_size
+            info = path.stat()
+            size = info.st_size
+            with self.network.host_lock:
+                if not hasattr(self, "artifact_checks"):
+                    self.artifact_checks = {}
+                self.artifact_checks[str(path)] = (artifact["sha256"], size, info.st_mtime_ns, info.st_ctime_ns)
             progress.update(current=size, total=size, cached=cached, verified=True, transfer_state="download_complete", last_progress_at=time.time())
             publish(force=True)
             self.emit("download_complete", key="download_complete", component="runtime_download", **context, cached=cached)
             self.policy.save()
             return path
         check(cancel)
-        if target.is_file() and not target.is_symlink() and (artifact.get("size") is None or target.stat().st_size == artifact["size"]) and digest_file(target, cancel) == artifact["sha256"]:
-            return complete(target, True)
+        if target.is_file() and not target.is_symlink():
+            info = target.stat()
+            stamp = (artifact["sha256"], info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            with self.network.host_lock:
+                verified = getattr(self, "artifact_checks", {}).get(str(target)) == stamp
+            if (artifact.get("size") is None or info.st_size == artifact["size"]) and (verified or digest_file(target, cancel) == artifact["sha256"]):
+                return complete(target, True)
         for attempt in range(self.download_attempts):
             check(cancel)
             previous = [None, -math.inf]
@@ -2234,46 +2454,62 @@ class RuntimeInstaller:
         backend = self.compute_backend or ("cpu" if platform.system() in ("Linux", "Windows") else "native")
         if backend == "native":
             return "torch==2.10.0"
-        if backend != "cpu" and not re.fullmatch(r"cu\d{2,4}", backend):
-            raise YuanError("计算后端无效 / Invalid compute backend")
-        index = "https://download.pytorch.org/whl/" + backend
-        path, original = runtime / "torch-resolve.json", self.env
-        self.env = {key: value for key, value in original.items() if key not in ("PIP_EXTRA_INDEX_URL", "UV_EXTRA_INDEX_URL", "PIP_FIND_LINKS")}
-        self.env["PIP_INDEX_URL"] = index
-        try:
-            self.pip_command(python, ["install", "--only-binary=:all:", "--dry-run", "--ignore-installed", "--no-deps", "--report", str(path),
-                                     "--index-url", index, "--timeout", str(self.network.timeout_ceiling),
-                                     "--retries", str(self.download_attempts), "torch==2.10.0"], report=True)
-            selected = next((item for item in checked_json(path).get("install", []) if item.get("metadata", {}).get("name", "").lower() == "torch"), None)
-            url = selected.get("download_info", {}).get("url", "") if selected else ""
-            parsed = urllib.parse.urlsplit(url)
-            checksum = selected.get("download_info", {}).get("archive_info", {}).get("hashes", {}).get("sha256") if selected else None
-            if (parsed.scheme != "https" or parsed.hostname not in ("download.pytorch.org", "download-r2.pytorch.org")
-                    or parsed.username or parsed.password or not parsed.path.startswith("/whl/" + backend + "/")
-                    or not parsed.path.endswith(".whl") or not is_digest(checksum)):
-                raise YuanError("计算组件来源或摘要无效 / Invalid compute component source or checksum")
-            clean = urllib.parse.urlunsplit(parsed._replace(fragment=""))
-            return "torch @ " + clean + "#sha256=" + checksum
-        finally:
-            self.env = original
+        channel = "cpu" if backend == "directml" else backend
+        version = "2.4.1" if backend == "directml" else "2.10.0"
+        if channel not in ("cpu", "xpu") and not re.fullmatch(r"(?:cu\d{2,4}|rocm\d+\.\d+(?:\.\d+)?)", channel):
+            raise YuanFault("计算后端标识无效 / Invalid compute backend identifier", category="compatibility", code="backend_identifier")
+        index = "https://download.pytorch.org/whl/" + channel + "/torch/"
+        tags = WheelCatalog.tags(python, self.command)
+        path = self.state / ("torch-catalog-" + payload_digest([channel, version, list(tags)]) + ".json")
+        saved = read_json(path)
+        artifact = saved.get("artifact")
+        if not isinstance(artifact, dict) or not is_digest(artifact.get("sha256")):
+            artifact = WheelCatalog.select(WheelCatalog.read(self.network, index, self.cancel), index, tags, "torch", version)
+            try:
+                with self.network.request(artifact["url"], method="HEAD") as response:
+                    size = response.headers.get("Content-Length", "")
+                    if re.fullmatch(r"[0-9]+", size) and int(size) > 0:
+                        artifact["size"] = int(size)
+            except Cancelled:
+                raise
+            except (OSError, ValueError, YuanError):
+                pass
+            atomic_json(path, {"artifact": artifact}, self.cancel)
+        parsed = urllib.parse.urlsplit(artifact.get("url", ""))
+        if parsed.hostname not in ("download.pytorch.org", "download-r2.pytorch.org") or not parsed.path.startswith("/whl/" + channel + "/") or artifact.get("name") != "torch" or str(artifact.get("version", "")).split("+", 1)[0] != version:
             path.unlink(missing_ok=True)
+            raise YuanFault("组件缓存与所选后端不一致 / Component cache differs from the selected backend", category="integrity", code="wheel_catalog_identity")
+        self.stage("download")
+        local = self._download_all([artifact])[0]
+        self.local_artifacts = getattr(self, "local_artifacts", {})
+        self.local_artifacts[local.resolve().as_uri()] = artifact
+        self.stage("runtime_resolve")
+        return "torch @ " + local.resolve().as_uri() + "#sha256=" + artifact["sha256"]
+
 
     def _ensure_candidate(self, request):
+        failures = []
         for backend in self.backend_candidates():
             check(self.cancel)
             self.compute_backend = backend
+            self.env["YUAN_COMPUTE_BACKEND"] = backend
             self.emit("runtime_profile", compute_backend=backend, hardware=self.hardware)
             try:
                 return self._ensure_backend(request)
             except Cancelled:
                 raise
             except Exception as exc:
-                if backend in ("cpu", "native") or failure_category(exc) in ("integrity", "permission", "storage", "resource"):
+                if failure_category(exc) != "compatibility":
                     raise
-                self.emit("notice", key="device_fallback", backend=backend, reason=concise_error(exc))
-        raise YuanError("没有可用的计算后端 / No usable compute backend")
+                failures.append({"backend": backend, "reason": concise_error(exc)})
+                self.emit("notice", key="backend_next", backend=backend, reason=concise_error(exc))
+        raise YuanFault("正在匹配显卡与运行组件 / Matching graphics hardware and runtime components", category="compatibility", code="compute_candidates_exhausted", stage=self.phase, candidates=failures)
+
 
     def _ensure_backend(self, request):
+        version = sys.version_info[:2] if request == "host" else tuple(int(value) for value in re.findall(r"[0-9]+", request.split("-", 2)[1])[:2])
+        if self.compute_backend == "directml" and version >= (3, 13):
+            raise YuanFault("为 DirectML 自动匹配兼容解释器 / Automatically matching a compatible interpreter for DirectML", category="compatibility", code="directml_python_match", stage=self.phase)
         signature = self.runtime_signature()
         self.stage("runtime")
         lock = checked_json(self.lock_path) if self.lock_path.exists() else {"python_requirement": PYTHON_REQUIREMENT, "platforms": {}}
@@ -2307,9 +2543,9 @@ class RuntimeInstaller:
         help_text = self.pip_command(python, ["help", "install"])
         version_text = self.pip_command(python, ["--version"])
         match = re.match(r"pip ([0-9]+)(?:\.([0-9]+))?", version_text)
-        pip_major = int(match[1]) if match else 0
-        if pip_major < 23 or "--dry-run" not in help_text or "--report" not in help_text:
-            self.command([str(python), "-m", "pip", "install", "--only-binary=:all:", "--no-deps", "--upgrade", "pip>=23"], report=True)
+        pip_version = (int(match[1]), int(match[2] or 0)) if match else (0, 0)
+        if pip_version < (26, 2) or "--dry-run" not in help_text or "--report" not in help_text:
+            self.command([str(python), "-m", "pip", "install", "--only-binary=:all:", "--no-deps", "--upgrade", "pip>=26.2"], report=True, transfer=True)
             help_text = self.pip_command(python, ["help", "install"])
         progress_args = ["--progress-bar", "raw" if re.search(r"\braw\b", help_text) else "off"]
         platform_key, platform_value = self._platform_key(python)
@@ -2319,7 +2555,7 @@ class RuntimeInstaller:
             torch_requirement = self.torch_requirement(python, runtime)
             report_path = runtime / "resolve.json"
             self.command([str(python), "-m", "pip", "install", "--only-binary=:all:", "--dry-run", "--ignore-installed", "--report", str(report_path), *progress_args,
-                          "--timeout", str(self.network.timeout_ceiling), "--retries", str(self.download_attempts), torch_requirement, *PACKAGES], report=True)
+                          "--timeout", str(self.network.timeout_ceiling), "--retries", str(self.download_attempts), torch_requirement, *self.required_packages()], report=True, transfer=True)
             entry = self._entry_from_report(checked_json(report_path), platform_value)
             lock["platforms"][platform_key] = entry
             atomic_json(self.lock_path, lock, self.cancel)
@@ -2477,10 +2713,13 @@ class RuntimeInstaller:
         return executable
 
     def interpreter_candidates(self):
-        if sys.version_info[:2] >= (3, 10) and sys.implementation.name == "cpython":
+        vendors = {item.get("vendor") for item in self.hardware.get("adapters", [])}
+        legacy = self.hardware.get("system") == "Windows" and bool(vendors) and "nvidia" not in vendors
+        requirement = ">=3.10,<3.13" if legacy else PYTHON_REQUIREMENT
+        if compatible_python(requirement, sys.version_info) and sys.implementation.name == "cpython":
             yield "host"
         executable = self._uv()
-        raw = self.command([str(executable), "--no-config", "python", "list", "--managed-python", "--output-format", "json", PYTHON_REQUIREMENT])
+        raw = self.command([str(executable), "--no-config", "python", "list", "--managed-python", "--output-format", "json", requirement])
         rows = json.loads(raw)
         if not isinstance(rows, list):
             raise YuanError("Python 候选清单格式无效 / Invalid Python candidate catalog")
@@ -2492,7 +2731,7 @@ class RuntimeInstaller:
             if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
                 continue
             values = tuple(int(value) for value in version.split("."))
-            if values[:2] < (3, 10):
+            if not compatible_python(requirement, values):
                 continue
             key = row.get("key")
             if not isinstance(key, str) or not re.fullmatch(r"cpython-[a-zA-Z0-9_.+-]+", key):
@@ -2521,9 +2760,10 @@ class RuntimeInstaller:
         verified = current.get("verified_at", 0)
         if backend == "cpu" and self.hardware.get("cuda") and (not isinstance(verified, (int, float)) or not math.isfinite(verified) or verified + interval <= time.time()):
             return None
-        if backend not in ("native", "cpu") and (not isinstance(backend, str) or not re.fullmatch(r"cu\d{2,4}", backend)):
+        if backend not in ("native", "cpu", "xpu", "directml") and (not isinstance(backend, str) or not re.fullmatch(r"(?:cu\d{2,4}|rocm\d+\.\d+(?:\.\d+)?)", backend)):
             return None
         self.compute_backend = backend
+        self.env["YUAN_COMPUTE_BACKEND"] = backend
         signature = self.runtime_signature()
         lock = checked_json(self.lock_path)
         try:
@@ -2552,7 +2792,7 @@ class RuntimeInstaller:
         for request in self.interpreter_candidates():
             check(self.cancel)
             key = payload_digest([request, sys.executable if request == "host" else None, sys.version if request == "host" else None,
-                                  PACKAGES, "torch==2.10.0", self.hardware, "yuan-runtime-pinned-v5", self.network_config.index_urls])
+                                  PACKAGES, "torch==2.10.0", self.hardware, "yuan-runtime-pinned-v6", self.network_config.index_urls])
             record = records.get(key, {})
             if record.get("failed_at", 0) + interval > time.time():
                 attempted.append({"interpreter": request, "cached_failure": True, "reason": record.get("reason")})
@@ -2673,6 +2913,8 @@ class Network:
                     result.close()
         try:
             check(self.cancel)
+            if time.monotonic() >= deadline:
+                raise YuanFault("网络连接期限已到 / Network connection deadline reached", category="network", code="network_connect_deadline", url=url, connect_seconds=connect_budget)
             threading.Thread(target=connect, daemon=True, name="YuanNetworkConnect").start()
         except BaseException:
             self.connection_gate.release()
@@ -2683,6 +2925,8 @@ class Network:
                 if time.monotonic() >= deadline:
                     raise YuanFault("网络连接期限已到 / Network connection deadline reached", category="network", code="network_connect_deadline", url=url, connect_seconds=connect_budget)
             check(self.cancel)
+            if time.monotonic() >= deadline:
+                raise YuanFault("网络连接期限已到 / Network connection deadline reached", category="network", code="network_connect_deadline", url=url, connect_seconds=connect_budget)
         except BaseException:
             abandoned.set()
             if result_box and not isinstance(result_box[0], BaseException):
@@ -2767,7 +3011,27 @@ class Network:
                 except OSError:
                     pass
 
-    def json(self, url):
+    @contextmanager
+    def transfer(self):
+        pending, seen = [self.cancel], set()
+        with ExitStack() as stack:
+            while pending:
+                cancel = pending.pop()
+                if cancel is None or id(cancel) in seen:
+                    continue
+                seen.add(id(cancel))
+                if isinstance(cancel, StartupControl):
+                    stack.enter_context(cancel.transfer())
+                elif isinstance(cancel, AnyCancel):
+                    pending.extend(reversed(cancel.events))
+            check(self.cancel)
+            yield
+
+    def json(self, url, with_headers=False):
+        with self.transfer():
+            return self._json(url, with_headers=with_headers)
+
+    def _json(self, url, with_headers=False):
         key = self.origin_key(url)
         initial = min(self.transfer_seconds, self.connection_timeout(url) + self.read_idle_seconds)
         observed = self.policy.measured("network_manifest", key, initial / self.transfer_margin) if self.policy else initial / self.transfer_margin
@@ -2779,6 +3043,7 @@ class Network:
         deadline = began + budget
         payload = bytearray()
         with self.request(url, deadline=deadline) as response:
+            headers = dict(response.headers.items()) if with_headers else {}
             for block in self.blocks(response, deadline=deadline):
                 if len(payload) + len(block) > 16 * 1024 * 1024:
                     raise YuanError("网络清单超过安全容量 / Network manifest exceeds safe capacity")
@@ -2790,10 +3055,14 @@ class Network:
         if time.monotonic() >= deadline:
             raise YuanFault("清单处理总期限已到 / Manifest processing deadline reached", category="network", code="network_manifest_deadline", url=url)
         if self.policy:
-            self.policy.observe("network_manifest", key, max(tick(), time.monotonic() - began))
-        return result
+            self.policy.observe("network_manifest", key, elapsed_seconds(began))
+        return (result, headers) if with_headers else result
 
     def download(self, url, target, expected_size=None, expected_hash=None, progress=None, max_bytes=None, algorithm=None, events=None, storage=None):
+        with self.transfer():
+            return self._download(url, target, expected_size, expected_hash, progress, max_bytes, algorithm, events, storage)
+
+    def _download(self, url, target, expected_size=None, expected_hash=None, progress=None, max_bytes=None, algorithm=None, events=None, storage=None):
         budget = TransferBudget(self.transfer_seconds, self.transfer_max_seconds, self.read_idle_seconds, self.transfer_margin)
         deadline = budget.deadline
         target = Path(target)
@@ -3024,10 +3293,7 @@ class StorageBudget:
         if before["ready"]:
             return before
         removed += self.reclaim_recovery(cancel, required)
-        key = store.setting("serving_memory_key", "")
-        with store.transaction():
-            store.db.execute("DELETE FROM memories WHERE model_key<>?", (key,))
-            store.db.execute("DELETE FROM memory_progress WHERE model_key<>?", (key,))
+        store.prune_memory_versions(cancel)
         eligible = ("g.retention='training_cache' AND g.split='train' AND s.generated=0 AND s.audio_status IN ('ready','evicted') "
                     "AND (s.visits>0 OR (s.learnable=0 AND COALESCE(json_extract(s.metadata,'$.transcript_verified'),0)=0 AND EXISTS(SELECT 1 FROM samples learned WHERE learned.audio=s.audio AND learned.generated=0 AND learned.visits>0)) "
                     "OR EXISTS(SELECT 1 FROM turn_pairs p WHERE (p.user_sample=s.id OR p.assistant_sample=s.id) AND p.visits>0)) "
@@ -3076,21 +3342,33 @@ class AudioStore:
 
     @staticmethod
     def memory_reason(metadata, eligible=True, generated=False):
-        for key in ("capture_gap", "playback_overlap", "interrupted", "discontinuous", "input_incomplete", "final"):
+        for key in ("capture_gap", "interrupted", "discontinuous", "input_incomplete", "final"):
             if metadata.get(key):
                 return key
-        if not generated and not eligible:
-            return "capture_quality"
-        return ""
+        return AudioStore.context_reason(metadata, eligible, generated)
 
 
     def __init__(self, state, recover=True):
+        state = ensure_workspace_identity(state)
         self.root = safe_path(state, "memory")
         self.root.mkdir(parents=True, exist_ok=True)
         self.audio = safe_path(self.root, "audio")
         self.audio.mkdir(exist_ok=True)
         self.db = sqlite3.connect(str(database_path(self.root, "memory.sqlite3")), timeout=math.sqrt(os.cpu_count() or 1))
         self.db.row_factory = sqlite3.Row
+        try:
+            tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            expected = (1, build_digest())
+            if tables:
+                row = self.db.execute("SELECT schema_version,build_sha256 FROM workspace_identity WHERE singleton=1").fetchone() if "workspace_identity" in tables else None
+                if row is None or tuple(row) != expected:
+                    raise YuanFault("数据库版本身份不匹配，已拒绝读取旧数据 / Database build identity mismatch; old data will not be read", category="integrity", code="database_build_mismatch")
+            self.db.execute("CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,build_sha256 TEXT NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO workspace_identity VALUES(1,?,?)", expected)
+            self.db.commit()
+        except BaseException:
+            self.db.close()
+            raise
         self.db.create_function("yuan_sample_supervision", 1, lambda value: payload_digest(self.sample_supervision(json.loads(value))), deterministic=True)
         self.db.create_function("yuan_pair_supervision", 1, lambda value: payload_digest(self.pair_supervision(json.loads(value))), deterministic=True)
         self.db.create_function("yuan_evidence", 1, lambda value: payload_digest(self.evidence_metadata(json.loads(value))), deterministic=True)
@@ -3119,6 +3397,7 @@ class AudioStore:
         CREATE INDEX IF NOT EXISTS pair_learning ON turn_pairs(verified,visits,created);
         CREATE TABLE IF NOT EXISTS memories(sample_id TEXT NOT NULL REFERENCES samples(id) ON DELETE CASCADE, model_key TEXT NOT NULL, start INTEGER NOT NULL CHECK(start>=0), end INTEGER NOT NULL CHECK(end>start), vector BLOB NOT NULL, dims INTEGER NOT NULL, created REAL NOT NULL, PRIMARY KEY(sample_id,model_key,start,end));
         CREATE TABLE IF NOT EXISTS memory_progress(sample_id TEXT NOT NULL REFERENCES samples(id) ON DELETE CASCADE, model_key TEXT NOT NULL, next_start INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,retry_at REAL NOT NULL DEFAULT 0, PRIMARY KEY(sample_id,model_key));
+        CREATE TABLE IF NOT EXISTS memory_calibrations(model_key TEXT PRIMARY KEY,attempt TEXT NOT NULL,certificate TEXT NOT NULL,updated REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS memory_model ON memories(model_key,created);
         CREATE TABLE IF NOT EXISTS memory_buckets(model_key TEXT NOT NULL, band INTEGER NOT NULL, bucket INTEGER NOT NULL, sample_id TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, PRIMARY KEY(model_key,band,bucket,sample_id,start,end), FOREIGN KEY(sample_id,model_key,start,end) REFERENCES memories(sample_id,model_key,start,end) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS memory_bucket_sample ON memory_buckets(sample_id,model_key);
@@ -3341,8 +3620,10 @@ class AudioStore:
                     elif prior_metadata != metadata:
                         self.db.execute("UPDATE samples SET metadata=? WHERE id=?", (encoded_metadata, sample_id))
                     return sample_id
+                owner = self.db.execute("SELECT id FROM samples WHERE digest=? AND learnable=1", (checksum,)).fetchone()
+                learnable = bool(dialogue_eligible and not generated and task == "acoustic" and owner is None)
                 self.db.execute("INSERT INTO samples(id,group_id,role,task,audio,seconds,rate,count,created,digest,file_sha256,generated,learnable,dialogue_eligible,memory_eligible,memory_exclusion,exclusion,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (sample_id, group_id, role, task, prepared["audio"], prepared["count"] / prepared["rate"], prepared["rate"], prepared["count"], created, checksum, prepared["file_sha256"], int(generated), 0, int(dialogue_eligible), int(not memory_reason), memory_reason, exclusion, encoded_metadata))
+                                (sample_id, group_id, role, task, prepared["audio"], prepared["count"] / prepared["rate"], prepared["rate"], prepared["count"], created, checksum, prepared["file_sha256"], int(generated), int(learnable), int(dialogue_eligible), int(not memory_reason), memory_reason, exclusion, encoded_metadata))
                 self.refresh_audio_owner(checksum)
             return sample_id
         except BaseException:
@@ -3733,6 +4014,22 @@ class AudioStore:
             projections = cache[1]
         signs = np.einsum("bkd,d->bk", projections, vector) >= 0
         return tuple(sum(int(value) << offset for offset, value in enumerate(row)) for row in signs)
+
+    def prune_memory_versions(self, cancel=None):
+        check(cancel)
+        with self.transaction():
+            keys = [self.setting(name) for name in ("serving_memory_key", "building_memory_key", "previous_memory_key")]
+            keys = sorted({key for key in keys if isinstance(key, str) and key})
+            if not keys:
+                return False
+            placeholders = ",".join("?" for key in keys)
+            for table in ("memories", "memory_progress", "memory_index_stats", "memory_calibrations"):
+                check(cancel)
+                self.db.execute("DELETE FROM " + table + " WHERE model_key NOT IN (" + placeholders + ")", keys)
+        return True
+
+    def memory_index_pending(self, model_key):
+        return self.db.execute("SELECT 1 FROM samples s JOIN groups g ON g.id=s.group_id JOIN sessions x ON x.id=s.group_id LEFT JOIN memory_progress m ON m.sample_id=s.id AND m.model_key=? WHERE g.origin='local' AND x.ended IS NOT NULL AND s.audio_status='ready' AND s.memory_eligible=1 AND s.count>1 AND COALESCE(m.next_start,0)<s.count LIMIT 1", (model_key,)).fetchone() is not None
 
     def indexed_memory_count(self, model_key):
         row = self.db.execute("SELECT items FROM memory_index_stats WHERE model_key=?", (model_key,)).fetchone()
@@ -4236,6 +4533,8 @@ class OwnedReleaseInstaller:
             raise YuanError("自有模型帧长度无效 / Invalid owned model frame length")
         normalizer = types.SimpleNamespace(np=np, rate=configuration["rate"], layers=configuration["layers"])
         normalizer.normalize = lambda audio, rate: NativeAudio.normalize(normalizer, audio, rate)
+        self._manifest(root, cancel)
+        ensure_workspace_identity(root, verified_assets=True)
         store = AudioStore(root, recover=False)
         try:
             importer = DatasetImporter(root, store, normalizer, self.emit, namespace="owned")
@@ -4675,7 +4974,8 @@ def load_runtime_modules(state, emit, cancel=None):
         budgets = {}
     emit("runtime_profile", python=platform.python_version(), executable=sys.executable, system=platform.system(), machine=platform.machine(),
          cwd=str(Path.cwd()), environment=supervisor.fingerprint, mode="probe" if "--probe" in sys.argv else "engine")
-    modules = {name: import_runtime_module(name, state, emit, cancel, supervisor, budgets) for name in RUNTIME_MODULES}
+    names = RUNTIME_MODULES if "--probe" in sys.argv else tuple(name for name in RUNTIME_MODULES if name != "pyarrow")
+    modules = {name: import_runtime_module(name, state, emit, cancel, supervisor, budgets) for name in names}
     supervisor.policy.save()
     emit("runtime_profile", components={name: str(getattr(module, "__version__", "")) for name, module in modules.items()})
     return modules
@@ -5143,7 +5443,7 @@ class AcceptancePolicy:
         count = store.db.execute("SELECT count(*) FROM samples s JOIN groups g ON g.id=s.group_id WHERE g.split='train' AND s.learnable=1 AND s.audio_status='ready'").fetchone()[0]
         if not count:
             gaps.append({"kind": "raw_audio", "language": None, "split": "train", "have": 0, "need": 1})
-        gaps.extend(MemoryCalibration(model, store).selection(self)["missing"])
+        gaps.extend(MemoryCalibration(model, store).selection(self, splits=("train", "validation", "guard"))["missing"])
         return gaps
 
     def acquisition_plan(self, report):
@@ -5178,7 +5478,7 @@ class AcceptancePolicy:
             if gap["kind"] == "retrieval_supervision":
                 tasks[(gap["language"], gap["split"], gap["kind"], gap["relevant"])] = {
                     "language": gap["language"], "split": gap["split"], "scenario": None, "relevant": gap["relevant"],
-                    "missing_sources": gap["need"] - gap["have"], "evidence_scope": "retrieval_calibration",
+                    "missing_sources": gap["need"] - gap["have"], "evidence_scope": "retrieval_training" if gap["split"] == "train" else "retrieval_calibration",
                     "automatic_source": "annotated_catalog", "requires": "independent_human_retrieval_annotations",
                     "gap_kind": gap["kind"], "discovery_required": True, "coverage_guaranteed": False,
                     "completion": "validated_independent_coverage"}
@@ -5225,6 +5525,15 @@ def network_digest(network, cancel=None):
             digest.update(view[start:start + size])
     return digest.hexdigest()
 
+def tensors_finite(torch, values):
+    flags = {}
+    for value in values:
+        if not isinstance(value, torch.Tensor):
+            return False
+        key = str(value.device)
+        flags.setdefault(key, []).append(torch.isfinite(value.detach()).all())
+    return all(bool(torch.stack(group).all().item()) for group in flags.values())
+
 def gradient_checkpoint(value, cancel):
     if isinstance(value, (tuple, list)):
         for item in value:
@@ -5237,14 +5546,15 @@ def gradient_checkpoint(value, cancel):
     return value
 
 class CooperativeCompute:
-    def __init__(self, model, component):
+    def __init__(self, model, component, device=None):
         self.model, self.component = model, component
+        self.device = model.device if device is None else device
         self.section = "cooperative_" + component
 
     def target(self):
         frame = self.model.hop / self.model.rate
         baseline = math.sqrt(frame * max(frame, self.model.chunk_seconds))
-        return self.model.policy.number("execution", "interactive_yield_seconds", baseline, frame, max(baseline, self.model.chunk_seconds))
+        return max(frame, getattr(self.model, "compute_quantum_seconds", baseline))
 
     def frames(self, maximum):
         maximum = max(1, int(maximum))
@@ -5257,14 +5567,13 @@ class CooperativeCompute:
     def run(self, operation, frames, cancel):
         check(cancel)
         began = time.monotonic()
-        try:
-            result = operation()
-        finally:
-            elapsed = max(tick(), time.monotonic() - began)
-            self.model.policy.observe(self.section, "seconds_per_frame", elapsed / max(1, frames))
-            self.model.policy.observe(self.section, "atomic_seconds", elapsed)
-            self.model.policy.observe(self.section, "over_budget", float(elapsed > self.target()))
+        result = operation()
+        compute_sync(self.model.torch, self.device)
+        elapsed = elapsed_seconds(began)
         check(cancel)
+        self.model.policy.observe(self.section, "seconds_per_frame", elapsed / max(1, frames))
+        self.model.policy.observe(self.section, "atomic_seconds", elapsed)
+        self.model.policy.observe(self.section, "over_budget", float(elapsed > self.target()))
         return gradient_checkpoint(result, cancel)
 
 class CancellableOutput:
@@ -5305,11 +5614,46 @@ def save_checkpoint(torch, payload, path, cancel, block_bytes):
         check(cancel)
         raise
 
+def relocate_network(torch, network, optimizer, device):
+    if network is None:
+        return
+    before = list(network.parameters())
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+    network.to(device)
+    if optimizer is None:
+        return
+    replacements = dict(zip(before, network.parameters()))
+    def move(value, target):
+        if isinstance(value, torch.Tensor):
+            return value.to(target)
+        if isinstance(value, dict):
+            return {key: move(item, target) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return type(value)(move(item, target) for item in value)
+        return value
+    for group in optimizer.param_groups:
+        group["params"] = [replacements.get(parameter, parameter) for parameter in group["params"]]
+        for parameter in group["params"]:
+            original = next((old for old, new in replacements.items() if new is parameter), parameter)
+            values = optimizer.state.pop(original, {})
+            for key, value in tuple(values.items()):
+                target = device if key != "step" or group.get("capturable") or group.get("fused") else torch.device("cpu")
+                values[key] = move(value, target)
+            if values:
+                optimizer.state[parameter] = values
+
+def unsupported_operation(exc):
+    message = str(exc).casefold()
+    return isinstance(exc, NotImplementedError) or isinstance(exc, RuntimeError) and "out of memory" not in message and any(
+        phrase in message for phrase in ("not implemented", "not supported", "unsupported operator", "could not run", "does not support"))
+
 class SpeechVerifier:
     protocol = "yuan-self-trained-speech-verifier-v4-task-normalization"
 
     def __init__(self, model, store, emit):
         self.model, self.store, self.emit = model, store, emit
+        self.configure_device(model.device)
         self.root = safe_path(model.state, "learning/verifier")
         self.root.mkdir(parents=True, exist_ok=True)
         self.store.db.execute("CREATE TABLE IF NOT EXISTS speech_training(sample TEXT PRIMARY KEY REFERENCES samples(id) ON DELETE CASCADE, visits INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0)")
@@ -5323,6 +5667,34 @@ class SpeechVerifier:
         self.certificate = {}
         self.dirty = False
         self.interval = max(1, math.isqrt(model.width * model.layers))
+
+    def configure_device(self, device):
+        self.device = self.model.torch.device(device)
+        certificate = read_json(Path(self.model.state) / "compute-verified.json")
+        rows = certificate.get("devices", []) if certificate.get("build_sha256") == build_digest() else []
+        identity = compute_device_identity(self.model.torch, self.device)
+        verified = next((row for row in rows if row.get("device") == str(self.device) and row.get("identity_sha256") == identity), {})
+        self.feature_device = self.model.torch.device(verified.get("verifier_feature_device", str(self.device)))
+        self.ctc_device = self.model.torch.device(verified.get("verifier_ctc_device", str(self.device)))
+
+    def relocate(self, device):
+        relocate_network(self.model.torch, self.network, self.optimizer, device)
+        relocate_network(self.model.torch, self.accepted, None, device)
+        self.configure_device(device)
+
+    def ctc_loss(self, output, targets):
+        torch = self.model.torch
+        def calculate(device):
+            return torch.nn.functional.ctc_loss(output.to(device), targets.to(device),
+                       torch.tensor([output.shape[0]], dtype=torch.long), torch.tensor([targets.numel()], dtype=torch.long), blank=0, zero_infinity=False)
+        try:
+            return calculate(self.ctc_device)
+        except (RuntimeError, NotImplementedError) as exc:
+            if self.ctc_device.type == "cpu" or not unsupported_operation(exc):
+                raise
+            self.ctc_device = torch.device("cpu")
+            self.emit("compute_partition", component="verifier_ctc", device="cpu", network_device=str(self.device), reason=concise_error(exc))
+            return calculate(self.ctc_device)
 
     @staticmethod
     def normalize_text(value):
@@ -5363,8 +5735,8 @@ class SpeechVerifier:
             def __init__(self):
                 super().__init__()
                 self.input = torch.nn.Sequential(torch.nn.Linear(size // 2 + 1, width), torch.nn.LayerNorm(width), torch.nn.GELU())
-                self.forward_encoder = torch.nn.GRU(width, width, batch_first=True)
-                self.backward_encoder = torch.nn.GRU(width, width, batch_first=True)
+                self.forward_encoder = portable_recurrent(torch, width, width, batch_first=True)
+                self.backward_encoder = portable_recurrent(torch, width, width, batch_first=True)
                 self.output = torch.nn.Linear(width * 2, 257)
             def forward(self, features, cancel=None, budget=None):
                 check(cancel)
@@ -5396,7 +5768,7 @@ class SpeechVerifier:
                     value = budget.run(lambda: self.output(block).log_softmax(-1), block.shape[1], cancel) if budget is not None else self.output(block).log_softmax(-1)
                     outputs.append(gradient_checkpoint(value, cancel))
                 return torch.cat(outputs, dim=1)
-        return Recognizer().float().cpu()
+        return Recognizer().to(device=self.device, dtype=torch.float32)
 
     def features(self, values, cancel=None):
         check(cancel)
@@ -5408,23 +5780,30 @@ class SpeechVerifier:
         working = max(len(values), len(values) // self.model.hop * self.model.width * 32) * np.dtype(np.float32).itemsize
         if len(values) > self.model.capacity() or working > available_resources(psutil)["memory"] // max(2, self.model.layers + 1):
             raise IneligibleSample("语义验证音频超过资源预算 / Semantic verification audio exceeds the resource budget")
-        audio = torch.from_numpy(values.copy())
+        audio = torch.from_numpy(values.copy()).to(self.feature_device)
         size, hop = self.model.hop * 4, self.model.hop
         if len(audio) < size:
             audio = torch.nn.functional.pad(audio, (0, size - len(audio)))
         frames = audio.unfold(0, size, hop)
-        window = torch.hann_window(size)
-        budget = CooperativeCompute(self.model, "verifier_features")
+        window = torch.hann_window(size, device=self.feature_device)
+        budget = CooperativeCompute(self.model, "verifier_features", device=self.feature_device)
         step = budget.frames(len(frames))
         pieces = []
         for start in range(0, len(frames), step):
             block = frames[start:start + step]
-            pieces.append(budget.run(lambda: torch.log1p(torch.abs(torch.fft.rfft(block * window))), len(block), cancel))
+            try:
+                pieces.append(budget.run(lambda: torch.log1p(torch.abs(torch.fft.rfft(block * window))), len(block), cancel))
+            except (RuntimeError, NotImplementedError) as exc:
+                if self.feature_device.type == "cpu" or not unsupported_operation(exc):
+                    raise
+                self.feature_device = torch.device("cpu")
+                self.emit("compute_partition", component="verifier_spectrum", device="cpu", network_device=str(self.device), reason=concise_error(exc))
+                return self.features(values, cancel)
         spectrum = torch.cat(pieces)
         check(cancel)
         mean = spectrum.mean()
         scale = spectrum.std(unbiased=False).clamp_min(torch.finfo(torch.float32).eps)
-        return ((spectrum - mean) / scale).unsqueeze(0)
+        return ((spectrum - mean) / scale).unsqueeze(0).to(self.device)
 
     def transcribe(self, values, network=None, cancel=None):
         torch = self.model.torch
@@ -5467,7 +5846,7 @@ class SpeechVerifier:
             check(cancel)
             self.network = self.build()
             parameters = sum(value.numel() for value in self.network.parameters())
-            self.optimizer = self.model.torch.optim.AdamW(self.network.parameters(), lr=1 / math.sqrt(parameters), weight_decay=1 / parameters)
+            self.optimizer = self.model.torch.optim.AdamW(self.network.parameters(), lr=1 / math.sqrt(parameters), weight_decay=1 / parameters, foreach=False)
             manifest = self.manifest
             if manifest.get("identity") != self.identity() or manifest.get("training_revision") != self.training_revision:
                 return
@@ -5482,6 +5861,7 @@ class SpeechVerifier:
                     raise YuanError("验证模型权重无效 / Invalid verifier weights")
                 self.network.load_state_dict(state["network"], strict=True)
                 self.optimizer.load_state_dict(state["optimizer"])
+                relocate_network(self.model.torch, self.network, self.optimizer, self.device)
                 for values in self.optimizer.state.values():
                     for value in values.values():
                         if isinstance(value, self.model.torch.Tensor) and not self.model.torch.isfinite(value).all():
@@ -5631,6 +6011,7 @@ class SpeechVerifier:
         name = "verifier-" + uuid.uuid4().hex + ".pt"
         path, temporary = self.root / name, self.root / (name + ".partial")
         size = sum(value.numel() * value.element_size() for value in self.network.parameters())
+        committed = False
         try:
             with StorageBudget(self.model.state).reserve(max(1, size * 4), "checkpoint"):
                 save_checkpoint(self.model.torch, {"network": self.network.state_dict(), "optimizer": self.optimizer.state_dict(), "steps": self.steps}, temporary, cancel, self.model.width * self.model.hop * 4)
@@ -5641,6 +6022,7 @@ class SpeechVerifier:
                 manifest = {"identity": self.identity(), "file": name, "sha256": digest_file(path, cancel), "training_revision": self.training_revision,
                             "certificate": self.certificate, "steps": self.steps, "self_trained": True, "external_model": False}
                 atomic_json(self.root / "current.json", manifest, cancel)
+                committed = True
                 self.manifest = manifest
                 self.dirty = False
                 for old in self.root.glob("verifier-*.pt"):
@@ -5648,6 +6030,8 @@ class SpeechVerifier:
                         old.unlink(missing_ok=True)
         finally:
             temporary.unlink(missing_ok=True)
+            if not committed:
+                path.unlink(missing_ok=True)
 
     def step(self, cancel):
         if self.ready(cancel):
@@ -5672,15 +6056,15 @@ class SpeechVerifier:
             budget = CooperativeCompute(self.model, "verifier_training")
             began = time.monotonic()
             output = self.network(features, cancel=cancel, budget=budget).transpose(0, 1)
-            loss = budget.run(lambda: torch.nn.functional.ctc_loss(output, targets, torch.tensor([output.shape[0]]), torch.tensor([len(targets)]), blank=0, zero_infinity=False), output.shape[0], cancel)
+            loss = budget.run(lambda: self.ctc_loss(output, targets), output.shape[0], cancel)
             if not torch.isfinite(loss):
                 raise YuanError("语义验证模型训练损失无效 / Invalid verifier training loss")
             gradient_checkpoint(loss, cancel).backward()
             check(cancel)
-            self.model.policy.observe("cooperative_verifier_training", "seconds_per_frame", max(tick(), time.monotonic() - began) / features.shape[1])
+            self.model.policy.observe("cooperative_verifier_training", "seconds_per_frame", elapsed_seconds(began) / features.shape[1])
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), math.sqrt(sum(value.numel() for value in self.network.parameters())), error_if_nonfinite=True)
             self.optimizer.step()
-            if any(not torch.isfinite(value).all() for value in self.network.parameters()):
+            if not tensors_finite(torch, self.network.parameters()):
                 self.network = self.optimizer = self.accepted = None
                 self.manifest, self.certificate = {}, {}
                 raise YuanError("语义验证模型更新无效 / Invalid verifier update")
@@ -5856,7 +6240,10 @@ class ModelResources:
         config = cls.configuration(config)
         estimate = cls.estimate(config)
         limits = available_resources(psutil)
-        fraction = policy.ratio("model", "initial_training_memory_fraction", 1 / max(16, limits["cpus"]))
+        fraction = policy.ratio("model", "initial_training_memory_fraction", 1 / math.sqrt(len(estimate["copies"])))
+        if fraction <= 0.0:
+            raise YuanFault("模型内存预算必须大于零 / Model memory budget must be positive",
+                            category="configuration", code="model_memory_budget_invalid", stage="stage_configuration")
         budget = int(limits["memory"] * fraction)
         if estimate["required_bytes"] > budget:
             raise YuanFault("当前资源不足，模型结构与权重保持不变 / Current resources are insufficient; architecture and weights are preserved",
@@ -5864,6 +6251,193 @@ class ModelResources:
                             available_bytes=limits["memory"], required_bytes=math.ceil(estimate["required_bytes"] / fraction),
                             model_budget_bytes=budget, model_required_bytes=estimate["required_bytes"])
         return config, estimate
+
+def portable_recurrent(torch, *args, **kwargs):
+    class Recurrent(torch.nn.GRU):
+        def forward(self, inputs, hx=None):
+            if inputs.device.type != "privateuseone":
+                return super().forward(inputs, hx)
+            return self.portable(inputs, hx)
+
+        def portable(self, inputs, hx=None):
+            if inputs.ndim != 3 or self.bidirectional or self.dropout:
+                raise YuanError("循环计算结构不匹配 / Recurrent compute structure mismatch")
+            values = inputs if self.batch_first else inputs.transpose(0, 1)
+            if hx is None:
+                hx = values.new_zeros(self.num_layers, values.shape[0], self.hidden_size)
+            states = []
+            for layer in range(self.num_layers):
+                weight_i = getattr(self, "weight_ih_l" + str(layer))
+                weight_h = getattr(self, "weight_hh_l" + str(layer))
+                bias_i = getattr(self, "bias_ih_l" + str(layer)) if self.bias else None
+                bias_h = getattr(self, "bias_hh_l" + str(layer)) if self.bias else None
+                projected = torch.nn.functional.linear(values, weight_i, bias_i)
+                current = hx[layer]
+                outputs = []
+                for position in range(values.shape[1]):
+                    incoming = projected[:, position]
+                    recurrent = torch.nn.functional.linear(current, weight_h, bias_h)
+                    ir, iz, inn = incoming.chunk(3, -1)
+                    hr, hz, hn = recurrent.chunk(3, -1)
+                    reset = torch.sigmoid(ir + hr)
+                    update = torch.sigmoid(iz + hz)
+                    candidate = torch.tanh(inn + reset * hn)
+                    current = candidate + update * (current - candidate)
+                    outputs.append(current)
+                values = torch.stack(outputs, 1)
+                states.append(current)
+            return (values if self.batch_first else values.transpose(0, 1)), torch.stack(states)
+    return Recurrent(*args, **kwargs)
+
+
+def compute_device_identity(torch, device, name=None):
+    device = torch.device(device)
+    module = getattr(torch, device.type, None)
+    if name is None:
+        if module is not None and hasattr(module, "get_device_name"):
+            name = module.get_device_name(device)
+        elif device.type == "privateuseone":
+            import torch_directml
+            name = torch_directml.device_name(device.index or 0)
+        else:
+            name = "Apple Metal" if device.type == "mps" else "CPU" if device.type == "cpu" else str(device)
+    identity = {"device": str(device), "name": str(name), "system": platform.system(), "machine": platform.machine(),
+                "visibility": {key: os.environ.get(key) for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "ZE_AFFINITY_MASK", "ONEAPI_DEVICE_SELECTOR")}}
+    if module is not None and hasattr(module, "get_device_properties"):
+        properties = module.get_device_properties(device)
+        for key in ("name", "major", "minor", "total_memory", "uuid", "pci_bus_id", "luid"):
+            value = getattr(properties, key, None)
+            if value is not None:
+                identity[key] = value if isinstance(value, (str, int, float, bool)) else str(value)
+    return payload_digest(identity)
+
+def compute_devices(torch, state, emit):
+    expected = os.environ.get("YUAN_COMPUTE_BACKEND") or read_json(Path(state) / "runtime-current.json").get("compute_backend", "")
+    devices = []
+    if expected == "directml":
+        try:
+            import torch_directml
+            for index in range(torch_directml.device_count()):
+                devices.append((torch_directml.device(index), torch_directml.device_name(index)))
+        except (ImportError, OSError, RuntimeError) as exc:
+            raise YuanFault("DirectML 环境需要修复，保留显卡模式 / DirectML runtime needs repair; accelerator mode retained", category="compatibility", code="compute_backend_failed", backend=expected) from exc
+    else:
+        if torch.cuda.is_available():
+            for index in range(torch.cuda.device_count()):
+                devices.append((torch.device("cuda", index), torch.cuda.get_device_name(index)))
+        if not devices and hasattr(torch, "xpu") and torch.xpu.is_available():
+            for index in range(torch.xpu.device_count()):
+                devices.append((torch.device("xpu", index), torch.xpu.get_device_name(index)))
+        if not devices and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            devices.append((torch.device("mps"), "Apple Metal"))
+    if not devices:
+        hardware = read_json(Path(state) / "hardware.json")
+        if expected not in ("", "cpu", "native") or hardware.get("adapters"):
+            raise YuanFault("正在修复显卡运行链路，未切换为 CPU / Repairing the accelerator pipeline without switching to CPU", category="compatibility", code="compute_backend_failed", backend=expected, hardware=hardware)
+        devices = [(torch.device("cpu"), "CPU")]
+    emit("accelerators", devices=[{"device": str(device), "name": name} for device, name in devices], backend=expected)
+    return devices
+
+
+def compute_sync(torch, device):
+    module = getattr(torch, device.type, None)
+    if module is not None and hasattr(module, "synchronize"):
+        if device.type in ("cuda", "xpu"):
+            module.synchronize(device)
+        elif device.type == "mps":
+            module.synchronize()
+
+def probe_device_memory(state, device, config, required, cancel, policy, emit):
+    import psutil
+    state = Path(state).resolve()
+    check(cancel)
+    host = available_resources(psutil)["memory"]
+    fraction = policy.ratio("learning", "memory_probe_host_fraction", 1 / math.sqrt(len(ModelResources.estimate(config)["copies"])))
+    limit = int(host * fraction)
+    if type(required) is not int or required < 1 or required > limit:
+        raise YuanFault("探测需求超过安全主机预算 / Probe requirement exceeds the safe host budget", category="resource", code="memory_probe_budget", required_bytes=required, host_budget_bytes=limit)
+    root = safe_path(state, "tmp")
+    root.mkdir(parents=True, exist_ok=True)
+    baseline = max(math.sqrt(config["rate"] / config["hop"]), policy.measured("learning_control", "memory_probe_seconds", 0.0) * 2)
+    budget = policy.number("learning", "memory_probe_seconds", baseline, 1.0, max(baseline, math.sqrt(host / max(1, required)) * baseline))
+    began = time.monotonic()
+    process = None
+    with tempfile.TemporaryDirectory(prefix="memory-probe-", dir=root) as directory:
+        directory = Path(directory)
+        request = directory / "request.json"
+        result_path = directory / "result.json"
+        atomic_json(request, {"device": str(device), "configuration": config, "allocation_bytes": required,
+                              "result": str(result_path.relative_to(Path(state)))}, cancel)
+        try:
+            with (directory / "output.log").open("wb") as log:
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+                options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+                process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--probe-device-memory", str(state), str(request)],
+                                           cwd=str(Path(state).parent), env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, **options)
+                while process.poll() is None:
+                    check(cancel)
+                    if time.monotonic() - began >= budget:
+                        raise YuanFault("设备预算探测超时，保留后端并稍后缩小重试 / Device budget probe timed out; backend retained for a smaller retry", category="resource", code="memory_probe_timeout")
+                    if cancel is None:
+                        time.sleep(math.sqrt(tick()))
+                    else:
+                        cancel.wait(math.sqrt(tick()))
+                check(cancel)
+            result = read_json(result_path)
+            if (process.returncode != 0 or result.get("verified") is not True or result.get("device") != str(device)
+                    or result.get("configuration") != config or type(result.get("allocation_bytes")) is not int
+                    or result["allocation_bytes"] < required):
+                reason = result.get("reason", "设备分配或真实训练探测未通过 / Device allocation or actual training probe did not pass")
+                raise YuanFault(str(reason), category="resource", code="memory_probe_failed")
+            elapsed = elapsed_seconds(began)
+            policy.observe("learning_control", "memory_probe_seconds", elapsed)
+            emit("learning_memory", device=str(device), memory_evidence="allocation_probe", probe_seconds=elapsed,
+                 tested_allocation_bytes=result["allocation_bytes"], measured_free_memory=False)
+            return result
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=max(1.0, math.sqrt(tick())))
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def memory_probe_entry(state, request):
+    state = Path(state).resolve()
+    request = safe_path(state, Path(request).resolve().relative_to(state).as_posix())
+    value = checked_json(request)
+    config = ModelResources.configuration(value["configuration"])
+    result_path = safe_path(state, value["result"])
+    required = value["allocation_bytes"]
+    result = {"device": value["device"], "configuration": config, "allocation_bytes": required, "verified": False}
+    try:
+        import numpy as np
+        import psutil
+        import torch
+        if type(required) is not int or not 0 < required <= available_resources(psutil)["memory"]:
+            raise ValueError("探测容量无效 / Invalid probe capacity")
+        if value["device"].split(":", 1)[0] == "privateuseone":
+            import torch_directml
+            device = torch_directml.device(int(value["device"].partition(":")[2] or 0))
+        else:
+            device = torch.device(value["device"])
+        torch.set_num_threads(1)
+        reserve = torch.empty((math.ceil(required / 4),), device=device, dtype=torch.float32)
+        reserve.fill_(0)
+        if float(reserve[-1].detach().cpu().item()) != 0:
+            raise YuanError("分配探测产生无效数值 / Allocation probe produced invalid values")
+        policy = AdaptivePolicy(state)
+        components = probe_training_components(torch, np, state, policy, device, config, None, lambda *args, **kwargs: None)
+        compute_sync(torch, device)
+        result.update(verified=components.get("training_components_verified") is True,
+                      allocation_bytes=reserve.numel() * reserve.element_size(), memory_evidence="allocation_probe")
+        del reserve
+    except Exception as exc:
+        result["reason"] = concise_error(exc)
+    atomic_json(result_path, result)
+
 
 class NativeAudio:
     def __init__(self, state, cancel, emit, owned_root=None, dependencies=None):
@@ -5895,6 +6469,7 @@ class NativeAudio:
         self.dtype = torch.float32
         with operation(emit, "stage_configuration"):
             self.rate, self.hop, self.width, self.layers, self.chunk_seconds, self.capacity_seconds = self._configuration(psutil)
+            self.configure_execution()
         with operation(emit, "stage_threads"):
             threads = execution_threads(psutil, self.policy)
             if os.environ.get("YUAN_TRAINER") == "1":
@@ -5905,11 +6480,7 @@ class NativeAudio:
             try:
                 self.network = self._build().to(self.device, dtype=self.dtype)
             except (RuntimeError, MemoryError) as exc:
-                if self.device.type == "cpu":
-                    raise
-                self.emit("notice", key="device_fallback", reason=concise_error(exc))
-                self.device = torch.device("cpu")
-                self.network = self._build().to(self.device, dtype=self.dtype)
+                raise YuanFault("模型尚未完成设备分配，保留当前加速后端 / Model device allocation is incomplete; selected backend retained", category="resource" if "memory" in str(exc).casefold() else "compatibility", code="model_device_allocation", device=str(self.device)) from exc
         self.performance_section = self.performance_identity()
         with operation(emit, "stage_restore"):
             self.restore()
@@ -5944,29 +6515,72 @@ class NativeAudio:
         return "cold_start"
 
     def _device(self):
-        torch = self.torch
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
+        devices = compute_devices(self.torch, self.state, self.emit)
+        def score(item):
+            device, name = item
+            try:
+                if device.type in ("cuda", "xpu"):
+                    module = getattr(self.torch, device.type)
+                    free, total = module.mem_get_info(device)
+                    return int(free)
+            except (AttributeError, OSError, RuntimeError):
+                pass
+            return 0
+        certificate = read_json(self.state / "compute-verified.json")
+        expected_backend = os.environ.get("YUAN_COMPUTE_BACKEND", "")
+        if certificate.get("backend") == expected_backend and certificate.get("devices"):
+            verified = {item["device"]: item.get("identity_sha256") for item in certificate["devices"]} if certificate.get("build_sha256") == build_digest() else {}
+            devices = [item for item in devices if verified.get(str(item[0])) == compute_device_identity(self.torch, item[0], item[1])]
+            if not devices:
+                raise YuanFault("设备拓扑已变化，将重新验证 / Device topology changed; verification will restart", category="compatibility", code="compute_backend_failed")
+        devices.sort(key=score, reverse=True)
+        selected = devices[0][0]
+        self.accelerators = [{"device": str(device), "name": name} for device, name in devices]
+        if selected.type == "cuda":
+            self.torch.cuda.set_device(selected)
+            self.torch.backends.cudnn.benchmark = True
+            self.torch.backends.cuda.matmul.allow_tf32 = True
+            self.torch.backends.cudnn.allow_tf32 = True
+        if selected.type == "xpu":
+            self.torch.xpu.set_device(selected)
+        return selected
+
 
     def performance_identity(self):
         import psutil
         return "performance:" + payload_digest([platform.system(), platform.machine(), platform.processor(), available_resources(psutil)["cpus"],
                                                    str(self.device), str(self.torch.__version__), self.identity(), str(self.dtype)])
 
+    def training_placement(self, device, learner=None):
+        target = self.torch.device(device)
+        previous = self.device
+        compute_sync(self.torch, previous)
+        relocate_network(self.torch, self.network, None, target)
+        relocate_network(self.torch, self.serving_network, None, target)
+        if learner is not None:
+            relocate_network(self.torch, learner.candidate, learner.optimizer, target)
+        verifier = getattr(self, "verifier", None)
+        if verifier is not None:
+            verifier.relocate(target)
+        self.device = target
+        self.performance_section = self.performance_identity()
+        if previous != target:
+            self.device_memory_probe = {}
+            self.memory_probe_retry_at = 0.0
+        if previous != target:
+            module = getattr(self.torch, previous.type, None)
+            if module is not None and hasattr(module, "empty_cache"):
+                module.empty_cache()
+        self.emit("compute_placement", device=str(target), serving_device=str(target), verifier_device=str(verifier.device) if verifier else None,
+                  candidate_device=str(target) if learner is not None and learner.candidate is not None else None,
+                  training_paused=target.type == "cpu" and previous.type != "cpu")
+
     def switch_device(self, device, cancel, learner=None):
         check(cancel)
         target = self.torch.device(device)
-        networks = [self.network, self.serving_network]
         if learner is not None:
             learner.checkpoint(cancel, force=True)
-            learner._discard_candidate()
-        for network in networks:
-            if network is not None:
-                network.to(target, dtype=self.dtype)
-        self.device = target
+        self.training_placement(target, learner)
         self.performance_section = self.performance_identity()
         self.capacity_scale = 1.0
         self.training_retry_at = 0.0
@@ -6017,8 +6631,15 @@ class NativeAudio:
                 layers = self.policy.integer("model", "layers", max(1, math.isqrt(cpus) // 2), 1, 4)
                 saved = {"rate": rate, "hop": hop, "width": 32, "layers": layers}
                 saved, self.configuration_budget = ModelResources.validate(saved, psutil, self.policy)
-                ceiling = min(256, 32 * max(1, math.isqrt(cpus)))
-                while saved["width"] * 2 <= ceiling:
+                headroom = self.memory_headroom()
+                accelerator = self.device.type in ("cuda", "xpu", "mps") and headroom["measured"]
+                fraction = self.policy.ratio("model", "initial_accelerator_memory_fraction", 1 / math.sqrt(len(self.configuration_budget["copies"])))
+                device_budget = int(headroom["device_available"] * fraction)
+                ceiling = max(32, math.isqrt(max(1, device_budget // ((40 * layers + 48) * 4 * sum(self.configuration_budget["copies"].values()))))) if accelerator else 32 * max(1, math.isqrt(cpus))
+                selection_budget = self.policy.number("model", "architecture_selection_seconds", max(1.0, math.sqrt(cpus)), 1.0, max(1.0, math.sqrt(cpus) * 4))
+                selection_began = time.monotonic()
+                previous_probe = None
+                while saved["width"] * 2 <= ceiling and time.monotonic() - selection_began < selection_budget:
                     proposal = {**saved, "width": saved["width"] * 2}
                     try:
                         proposal, estimate = ModelResources.validate(proposal, psutil, self.policy)
@@ -6026,6 +6647,22 @@ class NativeAudio:
                         if exc.category != "resource":
                             raise
                         break
+                    if accelerator:
+                        if estimate["required_bytes"] > device_budget:
+                            break
+                        try:
+                            probe = probe_training_components(self.torch, self.np, self.state, self.policy, self.device, proposal, self.cancel, self.emit)
+                        except (RuntimeError, MemoryError) as exc:
+                            if isinstance(exc, MemoryError) or "out of memory" in str(exc).casefold():
+                                self.emit("deployment", key="native_model_created", selection="resource_boundary", device=str(self.device), reason=concise_error(exc), conversation_verified=False)
+                                break
+                            raise
+                        frame_cost = probe["audio_seconds_per_frame"]
+                        latency_limit = self.policy.number("model", "initial_frame_compute_seconds", math.sqrt(seconds), seconds, max(seconds, selection_budget))
+                        self.policy.observe("architecture:" + str(proposal["width"]), "seconds_per_frame", frame_cost)
+                        if frame_cost > latency_limit or previous_probe is not None and frame_cost > previous_probe * math.sqrt(2):
+                            break
+                        previous_probe = frame_cost
                     saved, self.configuration_budget = proposal, estimate
                 saved["width"] = self.policy.integer("model", "width", saved["width"], 32, saved["width"])
                 saved, self.configuration_budget = ModelResources.validate(saved, psutil, self.policy)
@@ -6050,7 +6687,7 @@ class NativeAudio:
             def __init__(self):
                 super().__init__()
                 self.prompt = torch.nn.Embedding(256, width)
-                self.prompt_recurrent = torch.nn.GRU(width, width, batch_first=True)
+                self.prompt_recurrent = portable_recurrent(torch, width, width, batch_first=True)
                 self.prompt_mix = torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.Tanh())
                 self.roles = torch.nn.Embedding(4, width)
                 self.tasks = torch.nn.Embedding(2, width)
@@ -6058,11 +6695,11 @@ class NativeAudio:
                 self.codec_encoder = torch.nn.Sequential(torch.nn.Linear(hop, latent), torch.nn.LayerNorm(latent) if latent > 1 else torch.nn.Identity(), torch.nn.Tanh())
                 self.codec_decoder = torch.nn.Sequential(torch.nn.Linear(latent, width), torch.nn.GELU(), torch.nn.Linear(width, hop), torch.nn.Tanh())
                 self.frame_encoder = torch.nn.Sequential(torch.nn.Linear(latent, width), torch.nn.LayerNorm(width), torch.nn.GELU(), torch.nn.Linear(width, width), torch.nn.Tanh())
-                self.audio_encoder = torch.nn.GRU(width, width, num_layers=layers, batch_first=True)
+                self.audio_encoder = portable_recurrent(torch, width, width, num_layers=layers, batch_first=True)
                 self.memory_projection = torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.Tanh())
-                self.dialogue_core = torch.nn.GRU(width, width, num_layers=layers, batch_first=True)
+                self.dialogue_core = portable_recurrent(torch, width, width, num_layers=layers, batch_first=True)
                 self.decoder_input = torch.nn.Sequential(torch.nn.Linear(latent, width), torch.nn.Tanh())
-                self.audio_decoder = torch.nn.GRU(width, width, num_layers=layers, batch_first=True)
+                self.audio_decoder = portable_recurrent(torch, width, width, num_layers=layers, batch_first=True)
                 self.decoder_condition = torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.Tanh())
                 self.output = torch.nn.Linear(width, latent)
                 self.ending = torch.nn.Linear(width, 1)
@@ -6126,29 +6763,84 @@ class NativeAudio:
         return max(self.hop * 2, min(configured, int(memory_bound)))
 
     def window(self):
-        return max(self.hop * 2, min(self.capacity() // 4, int(self.rate * self.chunk_seconds / 2)))
+        configured = getattr(self, "training_window_samples", int(self.rate * self.chunk_seconds / 2))
+        bounded = min(self.capacity() // 4, configured)
+        return max(self.hop * 2, int(bounded) // self.hop * self.hop)
+
+    def memory_window(self):
+        capacity = self.capacity()
+        seconds = self.policy.number("memory", "segment_seconds", capacity / self.rate / 4,
+                                     self.hop * 2 / self.rate, max(self.hop * 2 / self.rate, capacity / self.rate))
+        return max(self.hop * 2, min(capacity, int(seconds * self.rate)) // self.hop * self.hop)
+
+    def configure_execution(self):
+        frame = self.hop / self.rate
+        baseline = math.sqrt(frame * max(frame, self.chunk_seconds))
+        self.compute_quantum_seconds = self.policy.number("execution", "interactive_yield_seconds", baseline, frame,
+                                                         max(baseline, self.chunk_seconds))
+        seconds = self.policy.number("learning", "training_window_seconds", self.chunk_seconds / 2,
+                                     frame * 2, max(frame * 2, self.capacity_seconds / 4))
+        self.training_window_samples = max(self.hop * 2, int(seconds * self.rate) // self.hop * self.hop)
+        seconds = self.policy.number("inference", "stream_block_seconds", max(frame, math.sqrt(frame)),
+                                     frame, max(frame, self.capacity_seconds))
+        self.decode_block_frames = max(1, int(round(seconds / frame)))
 
     def memory_headroom(self):
         import psutil
         host = available_resources(psutil)["memory"]
-        available = host
-        measured = True
+        available = host if self.device.type == "cpu" else 0
+        measured = self.device.type == "cpu"
+        evidence = "host_measurement" if measured else "unknown"
         reason = None
         try:
-            if self.device.type == "cuda":
-                free, total = self.torch.cuda.mem_get_info(self.device)
-                cached = max(0, self.torch.cuda.memory_reserved(self.device) - self.torch.cuda.memory_allocated(self.device))
+            if self.device.type in ("cuda", "xpu"):
+                module = getattr(self.torch, self.device.type)
+                free, total = module.mem_get_info(self.device)
+                cached = max(0, module.memory_reserved(self.device) - module.memory_allocated(self.device))
                 available = max(0, min(int(total), int(free + cached)))
+                measured, evidence = True, "device_measurement"
             elif self.device.type == "mps":
                 mps = self.torch.mps
                 maximum = int(mps.recommended_max_memory())
                 current = int(mps.current_allocated_memory())
                 available = min(host, max(0, maximum - current))
-        except (AttributeError, RuntimeError, OSError) as exc:
-            available = 0
-            measured = False
+                measured, evidence = True, "device_measurement"
+            elif self.device.type != "cpu":
+                reason = "设备内存查询尚无直接测量，训练预算将独立探测 / Device memory has no direct measurement; training budget will be probed independently"
+        except (AttributeError, RuntimeError, OSError, NotImplementedError) as exc:
+            available, measured, evidence = 0, False, "unknown"
             reason = concise_error(exc)
-        return {"device": str(self.device), "host_available": host, "device_available": available, "measured": measured, "reason": reason}
+        return {"device": str(self.device), "host_available": host, "device_available": available,
+                "measured": measured, "memory_evidence": evidence, "reason": reason}
+
+    def probe_training_budget(self, required, resident, cancel):
+        config = {key: getattr(self, key) for key in ("rate", "hop", "width", "layers")}
+        identity = payload_digest([str(self.device), config, self.performance_section])
+        now = time.monotonic()
+        cache = getattr(self, "device_memory_probe", {})
+        baseline = max(self.capacity_seconds, self.policy.measured(self.performance_section, "training_seconds_per_frame", 0.0) * self.window() / self.hop)
+        lifetime = self.policy.number("learning", "memory_probe_valid_seconds", baseline, self.chunk_seconds, max(baseline, self.capacity_seconds * self.layers))
+        if (cache.get("identity") == identity and cache.get("verified") is True and now < cache.get("expires", 0)
+                and cache.get("allocation_bytes", 0) + cache.get("resident_bytes", 0) >= required + resident):
+            return cache
+        if now < getattr(self, "memory_probe_retry_at", 0.0):
+            return {"verified": False, "reason": "resource_probe_cooldown"}
+        try:
+            result = probe_device_memory(self.state, self.device, config, required, cancel, self.policy, self.emit)
+        except Cancelled:
+            raise
+        except (OSError, RuntimeError, ValueError, YuanError, MemoryError) as exc:
+            delay = self.policy.number("learning", "memory_probe_retry_seconds", max(self.chunk_seconds, math.sqrt(self.capacity_seconds)),
+                                       self.hop / self.rate, max(self.chunk_seconds, self.capacity_seconds))
+            self.memory_probe_retry_at = time.monotonic() + delay
+            self.training_window_samples = max(self.hop * 2, int(self.window() / math.sqrt(2)) // self.hop * self.hop)
+            self.device_memory_probe = {"verified": False, "reason": concise_error(exc), "retry_seconds": delay}
+            self.emit("learning_memory", device=str(self.device), memory_evidence="unknown", **self.device_memory_probe)
+            return self.device_memory_probe
+        result.update(identity=identity, resident_bytes=resident, expires=time.monotonic() + lifetime)
+        self.device_memory_probe = result
+        self.memory_probe_retry_at = 0.0
+        return result
 
     def training_budget(self, learner=None):
         headroom = self.memory_headroom()
@@ -6167,22 +6859,32 @@ class NativeAudio:
                         resident += value.numel() * value.element_size()
         copies = {"candidate": 1, "gradient": 1, "moments": 2, "promotion": 1, "restore": 1}
         fixed = max(0, self.model_bytes * sum(copies.values()) - resident)
-        frames = max(self.width, math.ceil(self.window() / self.hop))
+        retrieval = learner.retrieval_plan(self.cancel) if learner is not None and hasattr(learner, "retrieval_plan") else {"samples": 0}
+        frames = max(self.width, math.ceil((self.window() + retrieval["samples"]) / self.hop))
         estimate = self.width * self.layers * self.np.dtype(self.np.float32).itemsize * 72
         per_frame = self.policy.measured(getattr(self, "performance_section", "performance"), "training_bytes_per_frame", estimate)
         variable = math.ceil(frames * max(estimate, per_frame))
         required = fixed + variable
-        host_required = self.model_bytes * 2 + self.window() * self.np.dtype(self.np.float32).itemsize * 4
+        host_required = self.model_bytes * 2 + (self.window() + retrieval["samples"]) * self.np.dtype(self.np.float32).itemsize * 4
         cooling = time.monotonic() < self.training_retry_at
+        probe = {}
+        if not headroom["measured"] and headroom["host_available"] >= host_required and not cooling:
+            probe = self.probe_training_budget(required, resident, self.cancel)
+        verified = headroom["measured"] and headroom["device_available"] >= required
+        verified = verified or probe.get("verified") is True
         return {**headroom, "fixed_bytes": fixed, "activation_bytes": variable, "required_bytes": required, "host_required_bytes": host_required,
                 "minimum_bytes": fixed + self.width * max(estimate, per_frame), "cooldown": cooling,
-                "ready": bool(headroom["measured"] and headroom["device_available"] >= required and headroom["host_available"] >= host_required and not cooling)}
+                "memory_evidence": "allocation_probe" if probe.get("verified") else headroom["memory_evidence"], "allocation_probe": probe,
+                "ready": bool(verified and headroom["host_available"] >= host_required and not cooling)}
 
     def recover_training_memory(self, learner):
         import gc
         previous = self.window()
         unchanged = self.training_oom_window == previous
         self.training_oom_window = previous
+        self.device_memory_probe = {}
+        self.memory_probe_retry_at = 0.0
+        self.training_window_samples = max(self.hop * 2, int(previous / math.sqrt(2)) // self.hop * self.hop)
         learner.candidate = learner.optimizer = None
         learner.dirty = False
         gc.collect()
@@ -6300,38 +7002,42 @@ class NativeAudio:
                 hidden, pending, encoder = self._encode_audio(network, audio, hidden, role, cancel, condition=condition)
         return hidden
 
-    @supervised('memory_encoding', 'runtime')
-    def memory_vector(self, waveform, role="user", cancel=None):
+    def memory_embedding(self, network, waveform, role="user", cancel=None):
         np, torch = self.np, self.torch
         if not len(waveform):
             raise InvalidAudio("音频记忆输入为空 / Audio memory input is empty")
         block_samples = max(1, self.width) * self.hop
         pending = np.empty(0, dtype=np.float32)
-        total = None
-        count = 0
+        total, count = None, 0
+        for values in self.audio_blocks(waveform, cancel):
+            check(cancel)
+            values = np.concatenate((pending, values)) if len(pending) else values
+            complete = len(values) // block_samples * block_samples
+            for start in range(0, complete, block_samples):
+                check(cancel)
+                frames, _ = self._frames(values[start:start + block_samples])
+                vector = gradient_checkpoint(network.memory(frames, self.role_index(role)), cancel)
+                total = vector if total is None else total + vector
+                count += 1
+            pending = values[complete:].copy()
+        if len(pending):
+            check(cancel)
+            frames, _ = self._frames(pending)
+            vector = gradient_checkpoint(network.memory(frames, self.role_index(role)), cancel)
+            total = vector if total is None else total + vector
+            count += 1
+        if total is None:
+            raise InvalidAudio("音频记忆输入为空 / Audio memory input is empty")
+        check(cancel)
+        return torch.nn.functional.normalize(total / count, dim=-1)
+
+    @supervised('memory_encoding', 'runtime')
+    def memory_vector(self, waveform, role="user", cancel=None):
+        np, torch = self.np, self.torch
         network = self.serving_network if self.playback_ready and self.serving_network is not None else self.network
         network.eval()
         with self.interruptible(cancel), torch.inference_mode():
-            for values in self.audio_blocks(waveform, cancel):
-                check(cancel)
-                values = np.concatenate((pending, values)) if len(pending) else values
-                complete = len(values) // block_samples * block_samples
-                for start in range(0, complete, block_samples):
-                    check(cancel)
-                    frames, _ = self._frames(values[start:start + block_samples])
-                    vector = network.memory(frames, self.role_index(role))
-                    total = vector if total is None else total + vector
-                    count += 1
-                pending = values[complete:].copy()
-            if len(pending):
-                check(cancel)
-                frames, _ = self._frames(pending)
-                vector = network.memory(frames, self.role_index(role))
-                total = vector if total is None else total + vector
-                count += 1
-            if total is None:
-                raise InvalidAudio("音频记忆输入为空 / Audio memory input is empty")
-            vector = torch.nn.functional.normalize(total / count, dim=-1)
+            vector = self.memory_embedding(network, waveform, role, cancel)
             values = vector.reshape(-1).detach().float().cpu().numpy().copy()
         if not values.size or not np.isfinite(values).all():
             raise YuanError("音频记忆向量无效 / Invalid audio memory vector")
@@ -6380,6 +7086,9 @@ class NativeAudio:
 
     def _acoustic_loss(self, prediction, target):
         torch = self.torch
+        destination = prediction.device
+        if destination.type in ("privateuseone", "mps"):
+            prediction, target = prediction.to("cpu"), target.to("cpu")
         waveform = torch.nn.functional.smooth_l1_loss(prediction, target)
         motion = torch.nn.functional.smooth_l1_loss(prediction[:, 1:] - prediction[:, :-1], target[:, 1:] - target[:, :-1]) if target.shape[1] > 1 else waveform * 0
         spectra = []
@@ -6394,7 +7103,7 @@ class NativeAudio:
             spectra.append(torch.nn.functional.smooth_l1_loss(left, right))
             size *= 2
         spectrum = sum(spectra) / len(spectra) if spectra else waveform * 0
-        return waveform + motion + spectrum
+        return (waveform + motion + spectrum).to(destination)
 
     def loss(self, network, prompt, source, target, ended=False, context=(), rollout=False, task="acoustic", prefix=None, end_label_valid=False, contrasts=(), rollout_frames=None, rollout_weight=1.0):
         torch = self.torch
@@ -6612,6 +7321,8 @@ class NativeAudio:
                             raise YuanError("备用检查点依赖的数据已经修订 / Fallback checkpoint depends on revised data")
                     finally:
                         validation_store.close()
+                if manifest.get("training_provenance", {}).get("build_sha256") != build_digest():
+                    raise YuanError("不加载其他版本产生的模型 / Models from other code versions are not loaded")
                 network = self._load_network(manifest, self.cancel)
             except Cancelled:
                 raise
@@ -6648,7 +7359,9 @@ class NativeAudio:
         baseline = self.active_digest
         previous = getattr(self, "training_manifest", None)
         phase = self.training_phase()
-        acoustic_ready = self.acoustic_ready or task in ("acoustic", "dialogue") and phase != "representation" and metrics.get("training_validated") is True
+        stage = metrics.get("phase_readiness", {})
+        phase_ready = metrics.get("phase_ready") is True and stage.get("ready") is True and stage.get("phase") == phase
+        acoustic_ready = self.acoustic_ready or task == "acoustic" and phase == "acoustic" and phase_ready
         dialogue_trained = self.dialogue_trained or task == "dialogue" and metrics.get("regression", {}).get("passed") is True
         with StorageBudget(self.state).reserve(max(1, sum(value.numel() * value.element_size() for value in network.parameters()) * 2), "checkpoint"):
             try:
@@ -6670,13 +7383,14 @@ class NativeAudio:
                             "accepted": accepted, "metrics": metrics, "acoustic_ready": acoustic_ready,
                             "dialogue_trained": dialogue_trained, "created": time.time()}
                 curriculum = copy.deepcopy((previous or {}).get("curriculum", {"phase": "representation", "validated": {}}))
-                if (metrics.get("training_validated") is True
+                if (metrics.get("training_validated") is True and phase_ready
                         and ((phase in ("representation", "acoustic") and task == "acoustic")
                              or (phase in ("conditional_dialogue", "multi_turn") and task == "dialogue"))
                         and (phase != "multi_turn" or metrics.get("regression", {}).get("passed") is True)):
                     next_phase = {"representation": "acoustic", "acoustic": "conditional_dialogue", "conditional_dialogue": "multi_turn", "multi_turn": "multi_turn"}[phase]
-                    curriculum["validated"][phase] = {"model_sha256": checksum, "data_evidence_sha256": metrics.get("data_evidence_sha256"),
-                                                        "validation": metrics.get("validation_comparison"), "guard": metrics.get("guard_comparison")}
+                    curriculum["validated"][phase] = {"model_sha256": checksum, "model_file": name, "data_evidence_sha256": metrics.get("data_evidence_sha256"),
+                                                        "validation": metrics.get("validation_comparison"), "guard": metrics.get("guard_comparison"),
+                                                        "proficiency": copy.deepcopy(stage)}
                     curriculum["phase"] = next_phase
                 manifest["curriculum"] = curriculum
                 prior = previous or getattr(self, "serving_manifest", {})
@@ -6792,6 +7506,9 @@ class NativeAudio:
             manifest = read_json(directory / name)
             if manifest.get("file"):
                 protected.add(manifest["file"])
+            for evidence in manifest.get("curriculum", {}).get("validated", {}).values():
+                if isinstance(evidence, dict) and isinstance(evidence.get("model_file"), str):
+                    protected.add(evidence["model_file"])
         for name in ("release.json", "pending-review.json", "previous-release.json"):
             pointer = read_json(directory / name)
             try:
@@ -6822,7 +7539,7 @@ class NativeAudio:
                 return
             try:
                 protected = set()
-                for name in ("release.json", "pending-review.json", "previous-release.json"):
+                for name in ("release.json", "pending-review.json", "previous-release.json", "evaluation-resume.json"):
                     pointer_path = directory / name
                     if not pointer_path.exists():
                         continue
@@ -7179,6 +7896,16 @@ class NativeAudio:
             return False
         selected = acceptance.select(store, self, fresh=True)
         if not selected:
+            if existing_final is not None:
+                previous = json.loads(existing_final["receipt"])
+                rows = [store.db.execute("SELECT * FROM turn_pairs WHERE id=?", (identifier,)).fetchone() for identifier in previous["pair_ids"]]
+                try:
+                    current = store.evaluation_snapshot(rows) if all(row is not None for row in rows) else None
+                    stale = current is None or current["sha256"] != previous["evaluation_snapshot_sha256"]
+                except YuanError:
+                    stale = True
+                if stale:
+                    FinalAcceptance.finish(store, previous, "stale")
             return False
         store.assert_independent([row["group_id"] for row in selected])
         snapshot = store.evaluation_snapshot(selected)
@@ -7192,14 +7919,34 @@ class NativeAudio:
         import soundfile as sf
         receipt = FinalAcceptance.claim(self, store, acceptance, selected, snapshot)
         frozen_network = self.network
-        evaluation_id = uuid.uuid4().hex
+        evaluation_id = receipt["sha256"][:len(uuid.uuid4().hex)]
         root = safe_path(directory, "evaluations/" + evaluation_id)
         root.mkdir(parents=True, exist_ok=True)
+        resume_path = directory / "evaluation-resume.json"
+        atomic_json(resume_path, {"final_acceptance_sha256": receipt["sha256"], "model_sha256": self.active_digest,
+                                 "evaluation_file": (root / "evaluation.json").relative_to(directory).as_posix()}, cancel)
+        receipt_path = root / "receipt.json"
+        if receipt_path.exists() and checked_json(receipt_path) != receipt:
+            FinalAcceptance.finish(store, receipt, "stale")
+            raise IneligibleSample("验收恢复记录与冻结身份不一致 / Acceptance recovery record differs from the frozen identity")
+        atomic_json(receipt_path, receipt, cancel)
         cases = []
         committed = False
         try:
             for row in selected:
                 check(cancel)
+                record_path = safe_path(root, row["id"] + "-case.json")
+                if record_path.exists():
+                    record = checked_json(record_path)
+                    case = record["case"]
+                    if record.get("final_acceptance_sha256") != receipt["sha256"] or case.get("pair") != row["id"]:
+                        raise IneligibleSample("验收案例恢复身份不一致 / Acceptance case recovery identity differs")
+                    self._review_case(store, case, cancel)
+                    for kind in ("input", "output"):
+                        if digest_file(safe_path(directory, case[kind + "_file"]), cancel) != case[kind + "_sha256"]:
+                            raise InvalidAudio("验收缓存音频已改变 / Cached acceptance audio changed")
+                    cases.append(case)
+                    continue
                 evidence = json.loads(row["evidence"])
                 user, target = store.sample(row["user_sample"]), store.sample(row["assistant_sample"])
                 if user["rate"] != self.rate:
@@ -7213,7 +7960,7 @@ class NativeAudio:
                 generation = {}
                 output = self.respond_audio(evidence["prompt"], history, waveform, cancel, network=frozen_network, evaluation=generation)
                 case_id = row["id"]
-                input_path, output_path = root / (case_id + "-input.flac"), root / (case_id + "-output.flac")
+                input_path, output_path = (safe_path(root, case_id + "-" + kind + ".flac") for kind in ("input", "output"))
                 for path, values in ((input_path, waveform), (output_path, output)):
                     with sf.SoundFile(str(path), mode="w", samplerate=self.rate, channels=1, format="FLAC", subtype="PCM_24") as output_file:
                         for block in self.audio_blocks(values, cancel):
@@ -7225,6 +7972,7 @@ class NativeAudio:
                               "input_samples": user["count"], "input_start": 0, "input_end": user["count"],
                               "input_file": input_path.relative_to(directory).as_posix(), "input_sha256": digest_file(input_path, cancel),
                               "output_file": output_path.relative_to(directory).as_posix(), "output_sha256": digest_file(output_path, cancel)})
+                atomic_json(record_path, {"final_acceptance_sha256": receipt["sha256"], "case": cases[-1]}, cancel)
             dataset = [{key: case[key] for key in ("id", "pair", "language", "prompt", "recording_id", "user_digest", "target_digest", "annotation_digest", "input_samples", "input_start", "input_end", "scenarios", "history")} for case in cases]
             evaluation = {"protocol": "yuan-native-listening-v4", "evaluator_sha256": behavior_digest(), "build_sha256": build_digest(), "identity": self.identity(),
                           "model": self.training_manifest, "dataset_sha256": payload_digest(dataset), "cases": cases, "created": time.time(),
@@ -7249,9 +7997,21 @@ class NativeAudio:
             committed = True
             self.emit("notice", key="release_wait", evaluation=evaluation_id, cases=len(cases), model=self.active_digest)
             return True
+        except (YuanError, ValueError, TypeError, KeyError) as exc:
+            if not isinstance(exc, YuanFault) or exc.category not in ("resource", "timeout"):
+                FinalAcceptance.finish(store, receipt, "stale")
+            raise
         finally:
-            if not committed:
+            current = store.db.execute("SELECT status FROM final_acceptance_runs WHERE id=?", (receipt["sha256"],)).fetchone()
+            resumable = current is not None and current["status"] in ("reserved", "evaluating")
+            if not committed and not resumable:
                 shutil.rmtree(root, ignore_errors=True)
+            if committed or not resumable:
+                try:
+                    if read_json(resume_path).get("final_acceptance_sha256") == receipt["sha256"]:
+                        resume_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.emit("notice", key="checkpoint_failure", component="evaluation_resume", reason=concise_error(exc))
 
     def promote(self, candidate, metrics, cancel, task, store):
         active = copy.deepcopy(candidate).eval().requires_grad_(False)
@@ -7359,8 +8119,7 @@ class NativeAudio:
             raise YuanError("模型输入为静音 / Model input is silent")
         network = network if network is not None else self.serving_network if self.playback_ready and self.serving_network is not None else self.network
         count = max(self.hop, min(int(max_samples) if max_samples is not None else self.reply_samples(incoming, history), self.capacity()))
-        block_seconds = self.policy.number("inference", "stream_block_seconds", max(self.hop / self.rate, math.sqrt(self.hop / self.rate)), self.hop / self.rate, max(self.hop / self.rate, self.chunk_seconds))
-        block_frames = max(1, min(math.ceil(count / self.hop), int(round(block_seconds * self.rate / self.hop))))
+        block_frames = max(1, min(math.ceil(count / self.hop), getattr(self, "decode_block_frames", max(1, round(math.sqrt(self.rate / self.hop))))))
         self.emit("phase", key="prefill", current=len(incoming), total=self.capacity(), unit="samples", reply_samples=count, reply_seconds=count / self.rate, streaming=True)
         network.eval()
         if hidden is None:
@@ -7382,7 +8141,7 @@ class NativeAudio:
                 with self.interruptible(cancel), torch.inference_mode():
                     seconds_per_frame = self.policy.measured(getattr(self, "performance_section", "performance"), "stream_seconds_per_frame", self.hop / self.rate)
                     target = CooperativeCompute(self, "streaming").target()
-                    frames = max(1, min(block_frames, total_frames - frames_done, int(target / max(tick(), seconds_per_frame))))
+                    frames = max(1, min(block_frames, total_frames - frames_done, int(target / max(timing_floor(), seconds_per_frame))))
                     if not emitted:
                         frames = 1
                     for _ in range(frames):
@@ -7400,8 +8159,9 @@ class NativeAudio:
                     natural = bool(len(stops))
                     frames_done += keep
                     values = host[:keep, :self.hop].reshape(-1)[:count - emitted].copy()
-                self.policy.observe(getattr(self, "performance_section", "performance"), "stream_seconds_per_frame", max(tick(), time.monotonic() - began) / frames)
-                compute_seconds += max(tick(), time.monotonic() - began)
+                elapsed = elapsed_seconds(began)
+                self.policy.observe(getattr(self, "performance_section", "performance"), "stream_seconds_per_frame", elapsed / frames)
+                compute_seconds += elapsed
                 energy += float(np.dot(values.astype(np.float64), values.astype(np.float64)))
                 energy_samples += len(values)
                 emitted += len(values)
@@ -7431,22 +8191,28 @@ class NativeAudio:
 
     def adapt_execution(self):
         section = getattr(self, "performance_section", "performance")
-        observed = self.policy.measured(section, "training_seconds_per_frame", 0.0)
-        realtime = self.policy.measured(section, "generation_realtime_factor", 0.0)
+        previous = self.window()
         base, capacity = self._execution_limits(__import__("psutil"), self.rate, self.hop)
-        response = self.policy.number("execution", "yield_seconds", base, self.hop / self.rate, max(base, capacity))
-        interactive = CooperativeCompute(self, "learning").target()
-        yielded = self.policy.measured("learning", "yield_seconds", 0.0)
-        response = min(response, interactive)
-        if yielded > interactive:
-            response *= interactive / yielded
-        training = response * self.hop / (self.rate * observed) if observed > 0 else base
-        inference = response / max(1.0, realtime)
-        requested = min(base, training, inference)
-        current = max(self.hop * 2 / self.rate, self.chunk_seconds)
-        self.chunk_seconds = max(self.hop * 2 / self.rate, min(capacity, math.sqrt(current * max(self.hop / self.rate, requested))))
-        self.capacity_seconds = max(self.chunk_seconds, capacity)
-        self.policy.observe(section, "execution_chunk_seconds", self.chunk_seconds)
+        self.chunk_seconds, self.capacity_seconds = base, capacity
+        self.configure_execution()
+        requested = self.window()
+        estimate = self.width * self.layers * self.np.dtype(self.np.float32).itemsize * 72
+        per_frame = max(estimate, self.policy.measured(section, "training_bytes_per_frame", estimate))
+        headroom = self.memory_headroom()
+        if headroom["measured"]:
+            fixed = getattr(self, "model_bytes", 0) * 6
+            budget = max(0, min(headroom["host_available"], headroom["device_available"]) - fixed)
+            requested = min(requested, max(self.hop * 2, int(budget / per_frame) * self.hop))
+        if time.monotonic() < self.training_retry_at or self.training_oom_window is not None:
+            requested = min(previous, requested)
+        if requested < previous:
+            samples = requested
+        else:
+            samples = min(requested, math.ceil(math.sqrt(previous * requested) / self.hop) * self.hop)
+        self.training_window_samples = max(self.hop * 2, int(samples) // self.hop * self.hop)
+        self.policy.observe(section, "training_window_samples", self.window())
+        self.policy.observe(section, "compute_quantum_seconds", self.compute_quantum_seconds)
+        self.policy.observe(section, "decode_block_frames", self.decode_block_frames)
 
     def calibrate(self, cancel, force=False):
         import psutil
@@ -7476,7 +8242,7 @@ class NativeAudio:
                         hidden = self._encode(self.network, "Yuan", values, cancel=cancel, task="dialogue")
                         output = self._decode(self.network, hidden, count, cancel, stop=False)
                         output.float().cpu().numpy()
-                    elapsed = max(tick(), time.monotonic() - began)
+                    elapsed = elapsed_seconds(began)
                     if trial:
                         self.emit("calibration", threads=threads, seconds=elapsed, samples=count, device=str(self.device))
                         if best is None or elapsed < best[0]:
@@ -7552,6 +8318,14 @@ class NativeAudio:
 
     @supervised('automatic_release', 'learning')
     def automatic_review(self, store, cancel):
+        if self.active_digest is not None and self.active_digest == self.serving_digest and self.playback_ready:
+            proof = getattr(self, "capability_evidence", {})
+            if (proof.get("model_sha256") == self.serving_digest and proof.get("sha256") == payload_digest({key: value for key, value in proof.items() if key != "sha256"})):
+                current = store.db.execute("SELECT receipt,status FROM final_acceptance_runs WHERE id=?", (proof.get("final_acceptance_sha256"),)).fetchone()
+                if current is not None and current["status"] in ("reserved", "evaluating"):
+                    receipt = json.loads(current["receipt"])
+                    if receipt["identity"]["candidate_sha256"] == self.serving_digest:
+                        FinalAcceptance.finish(store, receipt, "accepted")
         if self.active_digest is not None and self.active_digest == self.serving_digest and self.service_ready():
             self.automatic_release_state = "serving_current"
             return False
@@ -7564,17 +8338,29 @@ class NativeAudio:
         if verifier is None or not verifier.ready(cancel):
             self.automatic_release_state = "waiting_independent_verifier"
             return False
-        review_path = safe_path(directory, pointer["review_file"])
-        review = checked_json(review_path)
-        evaluation_path = safe_path(directory, review["evaluation_file"])
-        checksum = digest_file(evaluation_path, cancel)
         revisions = store.revisions()
-        signature = (self.active_digest, self.serving_digest, checksum, revisions["training_revision"], revisions["evaluation_revision"], payload_digest(verifier.certificate))
-        if signature == getattr(self, "automatic_attempt", None):
+        identity = FinalAcceptance.identity(self, store, AcceptancePolicy(self))
+        retry_key = "automatic_acceptance_retry_" + identity["sha256"]
+        retry = store.setting(retry_key, {})
+        if not isinstance(retry, dict):
+            retry = {}
+        retry = getattr(self, "automatic_retry", {}).get(retry_key, retry)
+        if time.time() < retry.get("retry_at", 0):
+            self.automatic_release_state = "runtime_retry"
             return False
         self.automatic_release_state = "evaluating_tasks"
-        final_receipt = None
+        final_receipt = signature = current_final = None
         try:
+            current_final = FinalAcceptance.current(self, store, AcceptancePolicy(self))
+            if current_final is None or current_final["status"] not in ("reserved", "evaluating"):
+                return False
+            review_path = safe_path(directory, pointer["review_file"])
+            review = checked_json(review_path)
+            evaluation_path = safe_path(directory, review["evaluation_file"])
+            checksum = digest_file(evaluation_path, cancel)
+            signature = (self.active_digest, self.serving_digest, checksum, revisions["training_revision"], revisions["evaluation_revision"], payload_digest(verifier.certificate))
+            if signature == getattr(self, "automatic_attempt", None):
+                return False
             evaluation = checked_json(evaluation_path)
             final_receipt = FinalAcceptance.validate(evaluation)
             if final_receipt["identity"] != FinalAcceptance.identity(self, store, AcceptancePolicy(self)):
@@ -7588,7 +8374,7 @@ class NativeAudio:
             if (checksum != review.get("evaluation_sha256") or evaluation.get("model", {}).get("sha256") != self.active_digest
                     or metrics.get("training_validated") is not True or metrics.get("regression", {}).get("passed") is not True
                     or not store.validation_current(metrics) or not store.validation_current(evaluation)):
-                raise YuanError("候选缺少当前数据版本的独立训练验证 / Candidate lacks independent training validation for the current data revision")
+                raise IneligibleSample("候选缺少当前数据版本的独立训练验证 / Candidate lacks independent training validation for the current data revision")
             cases = evaluation.get("cases", [])
             acceptance = AcceptancePolicy(self)
             acceptance.check_coverage(cases)
@@ -7613,11 +8399,11 @@ class NativeAudio:
                 independent[split] = {"passed": passed, "before": before, "after": after, "margin": margin, "sources": len(comparison[0]),
                                       "data_sha256": payload_digest([dict(row) for row in selected]), "comparison": dict(assessor.comparison_result)}
                 if not passed:
-                    raise IneligibleSample("候选相对服务模型发生回归 / Candidate regressed relative to the serving model")
+                    raise AcceptanceFailed("候选相对服务模型发生回归 / Candidate regressed relative to the serving model")
                 if split == "validation":
                     improved = improved or before - after > margin
             if not improved and self.service_ready():
-                raise IneligibleSample("候选缺少开发集改进证据 / Candidate lacks development-set improvement evidence")
+                raise AcceptanceFailed("候选缺少开发集改进证据 / Candidate lacks development-set improvement evidence")
             measured = []
             for case in cases:
                 check(cancel)
@@ -7626,7 +8412,7 @@ class NativeAudio:
             scope_expanded = not self.service_ready() and CapabilityEvidence.automatic_scope(measured) == CapabilityEvidence.dialogue_scope
             improved = improved or scope_expanded
             if not improved:
-                raise IneligibleSample("候选保持现有能力但尚无独立改进证据 / Candidate preserves current ability but has no independent improvement evidence")
+                raise AcceptanceFailed("候选保持现有能力但尚无独立改进证据 / Candidate preserves current ability but has no independent improvement evidence")
             verifier_snapshot = verifier.snapshot(evaluation_path.parent, cancel)
             audit = {"protocol": "yuan-independent-task-release-v1", "evaluator_sha256": behavior_digest(), "candidate_sha256": self.active_digest,
                      "serving_sha256": self.serving_digest, "evaluation_sha256": checksum, "independent": independent, "improvement": bool(improved),
@@ -7638,7 +8424,7 @@ class NativeAudio:
             check(cancel)
             if (store.setting("training_revision") != revisions["training_revision"] or not store.snapshot_valid(data_snapshot)
                     or not store.validation_current(metrics) or not store.validation_current(evaluation) or not verifier.ready(cancel)):
-                raise YuanError("任务验收使用的监督数据发生变化 / Supervision used by task acceptance changed")
+                raise IneligibleSample("任务验收使用的监督数据发生变化 / Supervision used by task acceptance changed")
             checks = [CapabilityEvidence.task_checks(result, audit["scope"]) for result in measured]
             capabilities = CapabilityEvidence.build(evaluation, checks, audit["scope"])
             review.update(reviewer="Yuan / independently calibrated task verification", reviewed_at=time.time(), checks=checks, capabilities=capabilities)
@@ -7652,11 +8438,27 @@ class NativeAudio:
             self.automatic_release_state = "yielded"
             raise
         except (OSError, ValueError, TypeError, KeyError, RuntimeError, sqlite3.Error) as exc:
-            self.automatic_attempt = signature
-            if final_receipt is not None:
-                FinalAcceptance.finish(store, final_receipt, "rejected")
-            self.automatic_release_state = "semantic_evidence_missing" if isinstance(exc, IneligibleSample) else "candidate_isolated"
-            self.emit("notice", key="automatic_release_wait", reason=concise_error(exc), serving_preserved=bool(self.playback_ready))
+            retryable = isinstance(exc, (OSError, sqlite3.Error)) or isinstance(exc, RuntimeError) and not isinstance(exc, YuanError)
+            retryable = retryable or isinstance(exc, YuanFault) and exc.category in ("resource", "timeout")
+            if retryable:
+                attempts = int(retry.get("attempts", 0)) + 1
+                retry = {"attempts": attempts, "retry_at": time.time() + store.retry_delay(attempts), "reason": concise_error(exc)}
+                self.automatic_retry = {retry_key: retry}
+                try:
+                    store.set_setting(retry_key, retry)
+                except (OSError, sqlite3.Error):
+                    pass
+                self.automatic_release_state = "runtime_retry"
+                self.emit("notice", key="automatic_release_retry", reason=concise_error(exc), retry_at=retry["retry_at"],
+                          frozen_task_retained=final_receipt is not None, serving_preserved=bool(self.playback_ready))
+            else:
+                self.automatic_attempt = signature
+                if final_receipt is None and current_final is not None:
+                    final_receipt = json.loads(current_final["receipt"])
+                if final_receipt is not None:
+                    FinalAcceptance.finish(store, final_receipt, "rejected" if isinstance(exc, AcceptanceFailed) else "stale")
+                self.automatic_release_state = "semantic_evidence_missing" if isinstance(exc, IneligibleSample) else "candidate_isolated"
+                self.emit("notice", key="automatic_release_wait", reason=concise_error(exc), serving_preserved=bool(self.playback_ready))
             return False
 
     def _task_audio(self, path, checksum, cancel):
@@ -7685,7 +8487,7 @@ class NativeAudio:
         output = self._task_audio(safe_path(directory, case["output_file"]), case["output_sha256"], cancel)
         result = verifier.assess(output, evidence["language"], answers, case.get("generation", {}), cancel, normalization=SpeechVerifier.answer_policy(evidence))
         if not result["passed"]:
-            raise IneligibleSample("候选未通过任务答案、音频质量或正常结束检查 / Candidate failed task answers, audio quality or natural ending checks")
+            raise AcceptanceFailed("候选未通过任务答案、音频质量或正常结束检查 / Candidate failed task answers, audio quality or natural ending checks")
         assessor = AudioLearner(self, store, self.emit)
         features, target = assessor._generation_features(pair, cancel)
         measured, files = {}, []
@@ -7702,20 +8504,32 @@ class NativeAudio:
                 raise IneligibleSample("任务缺少独立的对照答案标注 / Task lacks independently annotated contrast answers")
             alternative = assessor._contrast_features(pair, features, dimension, control, cancel)
             if controls is None:
-                generation = {}
-                values = self.respond_audio(alternative["prompt"], alternative["context"], alternative["source"], cancel, network=self.network, evaluation=generation)
-                path = safe_path(directory, case["output_file"]).with_name(case["id"] + "-contrast-" + dimension + ".flac")
-                sf.write(str(path), values, self.rate, format="FLAC", subtype="PCM_24")
-                with path.open("rb") as stream:
-                    os.fsync(stream.fileno())
-                artifact = {"file": path.relative_to(directory).as_posix(), "sha256": digest_file(path, cancel), "generation": generation}
+                path = safe_path(safe_path(directory, case["output_file"]).parent, case["id"] + "-contrast-" + dimension + ".flac")
+                record_path = path.with_suffix(".json")
+                identity = payload_digest({"model": self.active_digest, "case": case, "dimension": dimension,
+                                           "verifier": FinalAcceptance.verifier_key(verifier)})
+                if record_path.exists():
+                    record = checked_json(record_path)
+                    if record.get("identity") != identity:
+                        raise IneligibleSample("验收对照恢复身份不一致 / Acceptance contrast recovery identity differs")
+                    artifact = record["artifact"]
+                    if artifact.get("file") != path.relative_to(directory).as_posix():
+                        raise IneligibleSample("验收对照恢复路径不一致 / Acceptance contrast recovery path differs")
+                else:
+                    generation = {}
+                    values = self.respond_audio(alternative["prompt"], alternative["context"], alternative["source"], cancel, network=self.network, evaluation=generation)
+                    sf.write(str(path), values, self.rate, format="FLAC", subtype="PCM_24")
+                    with path.open("rb") as stream:
+                        os.fsync(stream.fileno())
+                    artifact = {"file": path.relative_to(directory).as_posix(), "sha256": digest_file(path, cancel), "generation": generation}
+                    atomic_json(record_path, {"identity": identity, "artifact": artifact}, cancel)
             else:
                 artifact = controls[dimension]
                 path = safe_path(directory, artifact["file"])
             values = self._task_audio(path, artifact["sha256"], cancel)
             assessment = verifier.assess(values, evidence["language"], alternatives, artifact.get("generation", {}), cancel, normalization=SpeechVerifier.answer_policy(evidence, dimension))
             if not assessment["passed"]:
-                raise IneligibleSample("提示词、输入或历史对照任务未通过 / Prompt, input or history contrast task did not pass")
+                raise AcceptanceFailed("提示词、输入或历史对照任务未通过 / Prompt, input or history contrast task did not pass")
             measured[dimension] = {**artifact, "assessment": assessment}
             files.append(path)
         return {"id": case["id"], "assessment": result, "controls": measured,
@@ -7803,7 +8617,7 @@ class AudioLearner:
         initial = 1 / math.sqrt(parameters)
         value = self.model.policy.measured("learning", "accepted_learning_rate", initial)
         rate = self.model.policy.number("learning", "learning_rate", value, initial / math.sqrt(parameters), min(1.0, initial * math.sqrt(self.model.width)))
-        return self.model.torch.optim.AdamW(network.parameters(), lr=rate, weight_decay=1 / parameters)
+        return self.model.torch.optim.AdamW(network.parameters(), lr=rate, weight_decay=1 / parameters, foreach=False if self.model.device.type == "privateuseone" else None)
 
     @supervised('candidate_prepare', 'learning')
     def _prepare(self, cancel):
@@ -7901,12 +8715,13 @@ class AudioLearner:
                         self.dirty = False
                         self.checkpoint_base = self.model.active_digest
                         self.last_checkpoint_step = self.steps
-                        measured = max(tick(), time.monotonic() - began)
+                        measured = elapsed_seconds(began)
                         self.checkpoint_seconds = measured if self.checkpoint_seconds is None else math.sqrt(self.checkpoint_seconds * measured)
                         if self.training_seconds:
-                            suggested = max(1, int(math.ceil(self.checkpoint_seconds / max(tick(), self.training_seconds))))
+                            suggested = max(1, int(math.ceil(self.checkpoint_seconds / max(timing_floor(), self.training_seconds))))
                             self.checkpoint_interval = max(self.validation_interval, int(round(math.sqrt(self.checkpoint_interval * max(self.validation_interval, suggested)))))
-                        self.emit("checkpoint_saved", steps=self.steps, base=self.checkpoint_base)
+                        self.model.policy.observe("learning_control", "checkpoint_seconds", measured)
+                        self.emit("checkpoint_saved", steps=self.steps, base=self.checkpoint_base, checkpoint_digest=read_json(directory / "candidate.json").get("sha256"))
                     finally:
                         temporary.unlink(missing_ok=True)
                         if not committed:
@@ -8428,6 +9243,107 @@ class AudioLearner:
                 "missing": missing, "passed": bool(checks) and not missing and all(row["passed"] for row in checks.values()),
                 "evidence_sha256": payload_digest(evidence_rows), "semantic_acceptance": False, "teacher_forcing": False}
 
+    def retrieval_plan(self, cancel):
+        acceptance = AcceptancePolicy(self.model)
+        data = MemoryCalibration(self.model, self.store).selection(acceptance, cancel, splits=("train",))
+        available = [(language, labels) for language, labels in data["selected"]["train"].items() if labels[True] and labels[False]]
+        if not available:
+            return {"examples": (), "samples": 0}
+        language, labels = available[self.steps % len(available)]
+        common = sorted(set(labels[True]) & set(labels[False]))
+        if common:
+            source = common[(self.steps // len(available)) % len(common)]
+            examples = (labels[True][source], labels[False][source])
+        else:
+            examples = tuple(list(labels[relevant].values())[(self.steps // len(available)) % len(labels[relevant])] for relevant in (True, False))
+        samples = sum(math.ceil(count * self.model.rate / row["rate"])
+                      for pair, query, candidate, example in examples
+                      for row, count in ((query, query["count"]), (candidate, example["end"] - example["start"])))
+        return {"examples": examples, "samples": samples, "language": language}
+
+    def retrieval_loss(self, cancel):
+        plan = self.retrieval_plan(cancel)
+        if not plan["examples"]:
+            return None
+        torch = self.model.torch
+        scores = []
+        for pair, query, candidate, example in plan["examples"]:
+            vectors = []
+            for row, offset, count in ((query, 0, query["count"]), (candidate, example["start"], example["end"] - example["start"])):
+                check(cancel)
+                if row["split"] != "train" or row["generated"]:
+                    raise YuanError("检索训练拒绝非训练数据 / Retrieval training rejects non-training data")
+                values = self.store.read_audio(row, offset, count, cancel=cancel, verify=True)
+                if row["rate"] != self.model.rate:
+                    values = self.model.normalize(values, row["rate"])
+                role = "assistant" if row["role"] == "assistant" else "user"
+                vectors.append(self.model.memory_embedding(self.candidate, values, role, cancel))
+            scores.append((vectors[0] * vectors[1]).sum(dim=-1).mean())
+        temperature = self.model.policy.number("memory", "contrast_temperature", 1 / math.sqrt(self.model.width),
+                                               math.sqrt(torch.finfo(self.model.dtype).eps), 1.0)
+        loss = torch.nn.functional.softplus((scores[1] - scores[0]) / temperature) * temperature
+        return loss, {"retrieval": float(loss.detach().item()), "retrieval_positive": float(scores[0].detach().item()),
+                      "retrieval_negative": float(scores[1].detach().item()), "retrieval_language": plan["language"],
+                      "retrieval_samples": plan["samples"], "retrieval_split": "train"}
+
+    def phase_readiness(self, rows, task, metrics, cancel):
+        phase = self.model.training_phase()
+        result = {"phase": phase, "ready": False, "semantic_acceptance": False, "checks": {}}
+        if phase in ("conditional_dialogue", "multi_turn"):
+            regression = metrics.get("regression", {})
+            result.update(ready=task == "dialogue" and metrics.get("training_validated") is True and regression.get("passed") is True,
+                          scope="independent_generated_conditioning_contrasts", checks=copy.deepcopy(regression.get("checks", {})))
+            return result
+        if task != "acoustic" or metrics.get("training_validated") is not True:
+            return result
+        torch = self.model.torch
+        self.candidate.eval()
+        for split, records in rows.items():
+            totals = {}
+            for row in records:
+                for start in self._evaluation_starts(row, task):
+                    check(cancel)
+                    usable = self._usable(row, task, cancel, held_out=True, window_start=start)
+                    if usable is None:
+                        return result
+                    features = usable[0]
+                    count = min(len(features["target"]), self.model.window())
+                    with self.model.interruptible(cancel), torch.no_grad():
+                        frames, _ = self.model._frames(features["target"][:count])
+                        target = frames.reshape(1, -1)[:, :count]
+                        reconstructed = self.candidate.reconstruct(frames).reshape(1, -1)[:, :count]
+                        prior = torch.cat((torch.zeros_like(frames[:, :1]), frames[:, :-1]), dim=1).reshape(1, -1)[:, :count]
+                        references = (torch.zeros_like(target), target.mean(dim=-1, keepdim=True).expand_as(target), prior)
+                        reference = min(float(self.model._acoustic_loss(value, target).item()) for value in references)
+                        actual = float(self.model._acoustic_loss(reconstructed, target).item())
+                        measurements = {"representation": (reference, actual)}
+                        if phase == "acoustic":
+                            hidden = self.model._encode(self.candidate, features["prompt"], features["source"], features.get("context", ()), cancel, task="acoustic")
+                            predicted = self.model._decode(self.candidate, hidden, count, cancel, stop=False)
+                            seed, _ = self.model._frames(features["source"][-self.model.hop:])
+                            repeated = seed[:, -1:].expand(1, math.ceil(count / self.model.hop), self.model.hop).reshape(1, -1)[:, :count]
+                            reference = min(float(self.model._acoustic_loss(value, target).item()) for value in (torch.zeros_like(target), repeated))
+                            measurements["acoustic_rollout"] = (reference, float(self.model._acoustic_loss(predicted, target).item()))
+                    group = row["source_key"] if "source_key" in row.keys() else row["group_id"]
+                    for dimension, (reference, actual) in measurements.items():
+                        if not math.isfinite(reference) or not math.isfinite(actual):
+                            raise YuanError("阶段能力测量无效 / Invalid curriculum proficiency measurement")
+                        values = totals.setdefault(dimension, {}).setdefault(group, [0.0, 0.0, 0])
+                        values[0] += reference * count
+                        values[1] += actual * count
+                        values[2] += count
+            for dimension, groups in totals.items():
+                reference = {group: values[0] / values[2] for group, values in groups.items()}
+                actual = {group: values[1] / values[2] for group, values in groups.items()}
+                passed, baseline, updated, margin = self._comparison(reference, actual, True)
+                result["checks"][split + ":" + dimension] = {"passed": bool(passed), "reference": baseline, "candidate": updated,
+                                                             "margin": margin, "sources": len(groups), "comparison": dict(self.comparison_result)}
+        dimensions = ("representation",) if phase == "representation" else ("representation", "acoustic_rollout")
+        required = {split + ":" + dimension for split in ("validation", "guard") for dimension in dimensions}
+        result["ready"] = required.issubset(result["checks"]) and all(result["checks"][key]["passed"] for key in required)
+        result["scope"] = "independent_audio_proficiency_against_signal_controls"
+        return result
+
     def _select(self):
         pair = self.store.next_pair("train", self.model.hop, self.model.hop)
         sample = self.store.next_sample("train", self.model.hop * 2)
@@ -8522,12 +9438,15 @@ class AudioLearner:
         metrics["evaluation_dimensions"] = copy.deepcopy(self.generation_dimensions) if task == "dialogue" else {"acoustic_reconstruction": "training_diagnostic"}
         metrics["curriculum_phase"] = self.model.training_phase()
         metrics["training_validated"] = bool(passed)
+        metrics["candidate_accepted"] = bool(passed)
+        metrics["phase_readiness"] = self.phase_readiness(rows, task, metrics, cancel)
+        metrics["phase_ready"] = bool(passed and metrics["phase_readiness"]["ready"])
         metrics["conversation_verified"] = False
         metrics["serving_conversation_verified"] = self.model.dialogue_ready
-        measured = max(tick(), time.monotonic() - began)
+        measured = elapsed_seconds(began)
         self.validation_seconds = measured if self.validation_seconds is None else math.sqrt(self.validation_seconds * measured)
         if self.training_seconds:
-            suggested = max(1, int(math.ceil(self.validation_seconds / max(tick(), self.training_seconds))))
+            suggested = max(1, int(math.ceil(self.validation_seconds / max(timing_floor(), self.training_seconds))))
             self.validation_interval = max(1, int(round(math.sqrt(self.validation_interval * suggested))))
         check(cancel)
         if self._refresh_data(snapshot):
@@ -8564,7 +9483,8 @@ class AudioLearner:
         self.candidate.train().requires_grad_(True)
         began = time.monotonic()
         allocated = None
-        measured_frames = max(self.model.width, math.ceil(self.model.window() / self.model.hop))
+        retrieval_samples = self.retrieval_plan(cancel)["samples"]
+        measured_frames = max(self.model.width, math.ceil((self.model.window() + retrieval_samples) / self.model.hop))
         if self.model.device.type == "cuda":
             try:
                 torch.cuda.reset_peak_memory_stats(self.model.device)
@@ -8583,6 +9503,13 @@ class AudioLearner:
                 weight = self.model.policy.ratio(section, "loss_weight", math.sqrt(horizon / frames))
                 self.rollout_training = {"frames": horizon, "weight": weight}
                 loss = self.model.loss(self.candidate, **features, rollout=True, rollout_frames=horizon, rollout_weight=weight)
+                retrieval = self.retrieval_loss(cancel)
+                if retrieval is not None:
+                    retrieval_loss, retrieval_metrics = retrieval
+                    retrieval_weight = self.model.policy.ratio("memory", "retrieval_loss_weight", 1 / math.sqrt(self.model.layers + 2))
+                    scale = loss.detach().abs().clamp_min(math.sqrt(torch.finfo(self.model.dtype).eps))
+                    loss = loss + retrieval_weight * scale * retrieval_loss
+                    self.model.loss_components.update(retrieval_metrics, retrieval_weight=retrieval_weight)
                 if not torch.isfinite(loss):
                     self.candidate = self.optimizer = None
                     self.dirty = False
@@ -8593,7 +9520,7 @@ class AudioLearner:
                 parameters = sum(value.numel() for value in self.candidate.parameters())
                 torch.nn.utils.clip_grad_norm_(self.candidate.parameters(), math.sqrt(parameters), error_if_nonfinite=True)
                 self.optimizer.step()
-                if any(not torch.isfinite(value).all() for value in self.candidate.parameters()):
+                if not tensors_finite(torch, self.candidate.parameters()):
                     self.candidate = self.optimizer = None
                     self.dirty = False
                     self.emit("notice", key="candidate_reset")
@@ -8609,7 +9536,7 @@ class AudioLearner:
                 self.emit("learning_memory", device=str(self.model.device), peak_increment_bytes=peak, frames=measured_frames)
             self.model.training_retry_at = 0.0
             self.model.training_oom_window = None
-            measured = max(tick(), time.monotonic() - began)
+            measured = elapsed_seconds(began)
             self.training_seconds = measured if self.training_seconds is None else math.sqrt(self.training_seconds * measured)
             actual_frames = max(1, math.ceil(len(features["target"]) / self.model.hop))
             self.model.policy.observe(self.model.performance_section, "training_seconds_per_frame", measured / actual_frames)
@@ -9144,7 +10071,7 @@ class WorkspaceAudio:
                 self.store.set_setting(key, record)
                 if record.get("complete"):
                     self.pending = None
-                self.model.policy.observe("history", "import_seconds", max(tick(), time.monotonic() - began))
+                self.model.policy.observe("history", "import_seconds", elapsed_seconds(began))
                 if worked:
                     return True
             except Cancelled:
@@ -9560,7 +10487,7 @@ class PublicAudio:
                 except Exception as exc:
                     permanent = isinstance(exc, (ValueError, KeyError, TypeError, InvalidDownload)) or isinstance(exc, urllib.error.HTTPError) and exc.code in (400, 401, 403, 404, 410)
                     self._source_failure(missing, exc, permanent)
-            measured = max(tick(), time.monotonic() - began)
+            measured = elapsed_seconds(began)
             self.duration = math.sqrt(max(tick(), self.duration) * measured)
             if self._next_source() is not None:
                 self.next_network = time.monotonic()
@@ -10475,6 +11402,7 @@ class AudioDevices:
         self.driver = DeviceExecutor(emit)
         self.mono_buffer = None
         self.callback_errors = {"input": 0, "output": 0}
+        self.callback_diagnostics = {"input": None, "output": None}
         self.callback_notices = {"input": 0, "output": 0}
         self.callback_failed = {"input": False, "output": False}
         self.output_failed_since = None
@@ -10671,7 +11599,8 @@ class AudioDevices:
         try:
             self.input_callback(indata, frames, timing, status)
             self.callback_failed["input"] = False
-        except Exception:
+        except Exception as exc:
+            self.callback_diagnostics["input"] = (type(exc).__name__, exc.args, int(frames), time.monotonic())
             self.callback_errors["input"] += 1
             self.callback_failed["input"] = True
             self.input_gap_pending = True
@@ -10683,7 +11612,8 @@ class AudioDevices:
             self.output_callback(outdata, frames, timing, status)
             self.callback_failed["output"] = False
             self.output_failed_since = None
-        except Exception:
+        except Exception as exc:
+            self.callback_diagnostics["output"] = (type(exc).__name__, exc.args, int(frames), time.monotonic())
             outdata.fill(0)
             self.callback_errors["output"] += 1
             self.callback_failed["output"] = True
@@ -10707,8 +11637,11 @@ class AudioDevices:
             count = self.callback_errors[direction]
             if count != self.callback_notices[direction]:
                 self.callback_notices[direction] = count
+                diagnostic = self.callback_diagnostics[direction]
+                details = {"exception": diagnostic[0], "reason": redact(str(diagnostic[1])), "frames": diagnostic[2],
+                           "elapsed_seconds": max(0.0, time.monotonic() - diagnostic[3])} if diagnostic is not None else {}
                 self.emit("notice", key="capture_gap" if direction == "input" else "playback_gap",
-                          component=direction + "_callback", failures=count, recovered=not self.callback_failed[direction])
+                          component=direction + "_callback", failures=count, recovered=not self.callback_failed[direction], **details)
         if self.callback_failed["input"]:
             self.emit("audio", continuous=False, speech_active=False, level=0.0)
             raise YuanError("输入回调失败，正在恢复收音 / Input callback failed; capture recovery required")
@@ -11532,6 +12465,8 @@ class SourceRegistry:
                     "gap_kind": task.get("gap_kind"), "relevant": task.get("relevant"),
                     "required_fields": list(task.get("required_fields", [])), "gained": result["gained"],
                     "adapters": list(task.get("adapters", [])), "scope": "validated_import_not_capability_acceptance",
+                    "before": result.get("before", {}), "after": result.get("after", {}),
+                    "observed_data_revision": self.store.setting("data_revision"), "build_sha256": build_digest(),
                     "manifest_sha256": result.get("source_manifest_sha256")}
         self.store.db.execute("INSERT INTO validated_sources VALUES(?,?,?,?,?) ON CONFLICT(repository,task_id) DO UPDATE SET revision=excluded.revision,contract=excluded.contract,updated=excluded.updated",
                               (repository, AnnotatedAcquisition.task_identity(task), revision, json.dumps(contract, sort_keys=True), time.time()))
@@ -11547,7 +12482,7 @@ class SourceRegistry:
         kind = task.get("automatic_source")
         if kind == "annotated_catalog":
             return [{"repository": row["repository"], "revision": row["revision"], "scope": "previously_validated_import",
-                     "verification": "revalidate_task_independence_and_pinned_revision", "status": "path_verified", "semantic_acceptance": False,
+                     "verification": "revalidate_task_independence_and_pinned_revision", "status": "import_verified", "semantic_acceptance": False,
                      "manifest_sha256": json.loads(row["contract"]).get("manifest_sha256")} for row in self.matching(task)]
         candidates = []
         for row in self.store.db.execute("SELECT * FROM bootstrap_sources ORDER BY repository"):
@@ -11558,7 +12493,10 @@ class SourceRegistry:
                 continue
             if kind == "public_dialogue" and contract["repository"] != PublicDialogue.repository:
                 continue
-            candidates.append({**contract, "status": row["status"], "reason": row["reason"], "semantic_acceptance": False})
+            proof = next((item for item in self.matching(task) if item["repository"] == row["repository"] and item["revision"] == contract.get("revision")), None)
+            candidates.append({**contract, "status": "import_verified" if proof is not None else row["status"],
+                               "import_evidence": json.loads(proof["contract"]) if proof is not None else None,
+                               "reason": row["reason"], "semantic_acceptance": False})
         return candidates
 
     def plan(self, model, report, tasks):
@@ -11566,7 +12504,8 @@ class SourceRegistry:
         for task in tasks:
             candidates = self.candidates(task)
             enriched.append({**task, "source_candidates": candidates,
-                             "source_contract_ready": any(item.get("status") == "path_verified" for item in candidates),
+                             "source_contract_ready": any(item.get("status") == "import_verified" for item in candidates),
+                             "source_path_accessible": any(item.get("status") in ("path_verified", "import_verified") for item in candidates),
                              "stage": "training_data" if task.get("split") == "train" else "final_acceptance_data" if task.get("split") == "release" else "development_data"})
         training = [task for task in enriched if task["stage"] == "training_data"]
         development = [task for task in enriched if task["stage"] == "development_data"]
@@ -11576,10 +12515,18 @@ class SourceRegistry:
                   "training_path_ready": all(task["source_contract_ready"] for task in training),
                   "development_path_ready": all(task["source_contract_ready"] for task in development),
                   "final_acceptance_path_ready": all(task["source_contract_ready"] for task in final),
-                  "complete_path_ready": all(task["source_contract_ready"] for task in enriched),
+                  "complete_path_ready": not enriched,
+                  "import_adapters_validated": all(task["source_contract_ready"] for task in enriched),
+                  "owned_release_loaded": bool(getattr(model, "owned_root", None) is not None and model.service_ready()),
+                  "embedded_release_present": bool(EMBEDDED_RELEASE),
                   "candidate_validated": bool(getattr(model, "dialogue_trained", False)),
                   "conversation_verified": bool(model.service_ready())}
-        state = {"protocol": "yuan-autonomous-bootstrap-v2-pinned-contracts", "stages": stages, "tasks": enriched,
+        phase = ("accepted" if stages["conversation_verified"] else "acquiring_training_evidence" if training else
+                 "acquiring_independent_evidence" if development or final else "training_and_evaluating")
+        state = {"protocol": "yuan-autonomous-bootstrap-v3-import-evidence", "stages": stages, "tasks": enriched,
+                 "phase": phase, "build_sha256": build_digest(), "requires_user_dataset_preparation": False,
+                 "model_creation_is_capability_acceptance": False, "missing_task_count": len(enriched),
+                 "unvalidated_import_count": sum(not task["source_contract_ready"] for task in enriched),
                  "blocked_contracts": [task for task in enriched if not task["source_contract_ready"]],
                  "recovery_actions": {"network_wait": "retry_transport_or_rotate_source", "schema_wait": "select_supported_adapter",
                                       "annotation_wait": "discover_human_annotated_sources", "independence_wait": "select_new_independent_recordings",
@@ -11589,6 +12536,51 @@ class SourceRegistry:
         if self.store.setting("bootstrap_state", {}) != state:
             self.store.set_setting("bootstrap_state", state)
         return enriched
+
+    def source_coverage(self, model, repository, task):
+        kind = task.get("gap_kind")
+        if kind == "retrieval_supervision":
+            data = MemoryCalibration(model, self.store).selection(AcceptancePolicy(model), splits=(task["split"],))
+            cell = next((item for item in data["coverage"] if item["language"] == task.get("language")
+                         and item["relevant"] is task.get("relevant")), {})
+            return {"sources": cell.get("have", 0), "reference_sources": 0, "dialogue_sources": 0}
+        if kind in ("raw_audio", "transcript_supervision"):
+            clauses = ["g.split=?", "s.generated=0", "s.audio_status='ready'", "json_extract(s.metadata,'$.corpus')=?", "s.count>=?"]
+            args = [task.get("split", "train"), repository, model.hop]
+            if kind == "transcript_supervision":
+                clauses.extend(["s.dialogue_eligible=1", "json_extract(s.metadata,'$.transcript_verified')=1", "length(json_extract(s.metadata,'$.transcript'))>0", "s.count<=?"])
+                args.append(EvaluationEligibility.budgets(model)["verifier"])
+            else:
+                clauses.append("s.learnable=1")
+            if task.get("language") is not None:
+                clauses.append("json_extract(s.metadata,'$.language')=?")
+                args.append(task["language"])
+            count = self.store.db.execute("SELECT count(DISTINCT g.source_key) FROM samples s JOIN groups g ON g.id=s.group_id WHERE " + " AND ".join(clauses), args).fetchone()[0]
+            return {"sources": count, "reference_sources": 0, "dialogue_sources": 0}
+        report = AcceptancePolicy(model).coverage(self.store, model, splits=(task["split"],), fresh=True)
+        cell = next((item for item in report["cells"] if item["language"] == task.get("language") and item["scenario"] == task.get("scenario")), {})
+        return {"sources": cell.get("have", 0), "reference_sources": cell.get("reference_sources", 0), "dialogue_sources": cell.get("dialogue_reference_sources", 0)}
+
+    def run_source(self, model, job, tasks, cancel):
+        repository = getattr(job, "repository", None)
+        relevant = [task for task in tasks if any(item.get("repository") == repository for item in task.get("source_candidates", []))] if repository else []
+        before = {AnnotatedAcquisition.task_identity(task): self.source_coverage(model, repository, task) for task in relevant}
+        worked = job.step(cancel)
+        revision = getattr(job, "catalog", {}).get("revision", "")
+        if not worked or not re.fullmatch(r"[a-f0-9]{40}", str(revision)):
+            return worked
+        proof = payload_digest(job.catalog)
+        for task in relevant:
+            check(cancel)
+            previous = before[AnnotatedAcquisition.task_identity(task)]
+            after = self.source_coverage(model, repository, task)
+            gained = AnnotatedAcquisition.target_gain(task, previous, after)
+            result = {"before": previous, "after": after, "gained": gained, "progressed": any(gained.values()), "source_manifest_sha256": proof}
+            self.remember(repository, revision, task, result)
+            if result["progressed"]:
+                model.emit("bootstrap_source", repository=repository, status="import_verified", revision=revision,
+                           task_id=AnnotatedAcquisition.task_identity(task), gained=gained, capability_verified=False)
+        return worked
 
     @staticmethod
     def order(jobs, tasks, turn):
@@ -11659,11 +12651,11 @@ class AnnotatedAcquisition:
     @staticmethod
     def task_identity(task):
         return payload_digest([task.get("language"), task.get("split"), task.get("scenario"),
-                               "retrieval" if task.get("gap_kind") == "retrieval_supervision" else "dialogue", task.get("relevant")])
+                               task.get("gap_kind"), task.get("relevant"), sorted(task.get("required_fields", []))])
 
     def target_coverage(self, task):
         if task.get("gap_kind") == "retrieval_supervision":
-            data = MemoryCalibration(self.model, self.store).selection(AcceptancePolicy(self.model))
+            data = MemoryCalibration(self.model, self.store).selection(AcceptancePolicy(self.model), splits=(task["split"],))
             cell = next((item for item in data["coverage"] if item["split"] == task["split"] and item["language"] == task["language"]
                          and item["relevant"] is task.get("relevant")), {})
             return {"sources": cell.get("have", 0), "reference_sources": 0, "dialogue_sources": 0}
@@ -11723,15 +12715,34 @@ class AnnotatedAcquisition:
             return True
         return False
 
+    @staticmethod
+    def catalog_url(url):
+        parts = urllib.parse.urlsplit(url)
+        if (parts.scheme != "https" or parts.hostname != "huggingface.co" or parts.username is not None or parts.password is not None
+                or parts.port not in (None, 443) or parts.path.rstrip("/") != "/api/datasets" or parts.fragment):
+            raise InvalidDownload("标注目录分页地址无效 / Invalid annotation catalog pagination URL")
+        return url
+
+    @classmethod
+    def catalog_next(cls, headers, current):
+        value = next((value for key, value in headers.items() if key.lower() == "link"), "")
+        for part in urllib.request.parse_http_list(str(value)):
+            match = re.search(r'<([^>]+)>', part)
+            relation = re.search(r';\s*rel\s*=\s*(?:"([^"]+)"|([^;\s]+))', part, re.I)
+            if match and relation and "next" in (relation.group(1) or relation.group(2)).split():
+                return cls.catalog_url(urllib.parse.urljoin(current, match.group(1)))
+        return None
+
     def discover(self, cancel, task=None):
         self.network.cancel = cancel
         task = task or {}
         identifier = self.task_identity(task)
         interval = self.model.policy.number("network", "annotation_catalog_seconds", 3600.0, 1.0, 86400.0)
-        entries = self.catalog.get("tasks", {})
+        catalog = self.catalog if isinstance(self.catalog, dict) else {}
+        entries = catalog.get("tasks", {})
+        entries = entries if isinstance(entries, dict) else {}
         entry = entries.get(identifier, {})
-        if entry.get("created", 0) + interval > time.time() and isinstance(self.catalog.get("repositories"), list):
-            return self.catalog["repositories"]
+        entry = entry if isinstance(entry, dict) else {}
         limit = self.model.policy.integer("network", "annotation_catalog_entries", max(1, available_resources(__import__("psutil"))["cpus"] * 4), 1, 256)
         language = {"中文": "Chinese", "English": "English"}.get(task.get("language"), "")
         queries = [{"search": " ".join(value for value in (language, "annotated audio dialogue") if value)},
@@ -11739,22 +12750,48 @@ class AnnotatedAcquisition:
                    {"search": "speech dialogue"}, {"filter": "yuan-paired-audio-v1"}, {"search": "yuan-paired-audio"}]
         if task.get("gap_kind") == "retrieval_supervision":
             queries = [{"search": language + " speech retrieval relevance"}, {"search": "annotated spoken memory"}, *queries]
+        query_states = entry.get("queries", {})
+        query_states = query_states if isinstance(query_states, dict) else {}
+        repositories = [name for name in catalog.get("repositories", []) if isinstance(name, str)
+                        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", name)]
         cursor_key = "annotation_query_cursor_" + identifier
         cursor = int(self.store.setting(cursor_key, 0)) % len(queries)
-        self.store.set_setting(cursor_key, cursor + 1)
-        url = "https://huggingface.co/api/datasets?" + urllib.parse.urlencode({**queries[cursor], "limit": limit})
-        rows = self.network.json(url)
+        selected = None
+        for offset in range(len(queries)):
+            index = (cursor + offset) % len(queries)
+            query = queries[index]
+            state = query_states.get(payload_digest(query), {})
+            state = state if isinstance(state, dict) else {}
+            if state.get("complete") is not True or state.get("updated", 0) + interval <= time.time():
+                selected = (index, query, state)
+                break
+        if selected is None:
+            return repositories
+        index, query, state = selected
+        initial = "https://huggingface.co/api/datasets?" + urllib.parse.urlencode({**query, "limit": limit})
+        continuing = state.get("complete") is not True and isinstance(state.get("next_url"), str)
+        url = self.catalog_url(state["next_url"] if continuing else initial)
+        rows, headers = self.network.json(url, with_headers=True)
         if not isinstance(rows, list):
             raise InvalidDownload("自动标注目录格式无效 / Invalid automatic annotation catalog")
-        repositories = list(self.catalog.get("repositories", []))
         for row in rows:
             check(cancel)
             name = row.get("id", "") if isinstance(row, dict) else ""
-            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", name) and not row.get("gated") and not row.get("disabled"):
+            if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", name) and not row.get("gated") and not row.get("disabled"):
                 repositories.append(name)
-        entries[identifier] = {"created": time.time(), "query": queries[cursor]}
+        next_url = self.catalog_next(headers, url)
+        seen = list(state.get("pages", [])) if continuing else []
+        signature = payload_digest(url)
+        if signature not in seen:
+            seen.append(signature)
+        if next_url and payload_digest(next_url) in seen:
+            raise InvalidDownload("标注目录分页出现循环 / Annotation catalog pagination contains a cycle")
+        query_states[payload_digest(query)] = {"query": query, "updated": time.time(), "next_url": next_url,
+                                             "complete": next_url is None, "pages": seen}
+        entries[identifier] = {"created": time.time(), "queries": query_states}
         self.catalog = {"repositories": sorted(set(repositories)), "tasks": entries}
         atomic_json(self.root / "catalog.json", self.catalog, cancel)
+        self.store.set_setting(cursor_key, index + 1)
         return self.catalog["repositories"]
 
     @staticmethod
@@ -12390,7 +13427,13 @@ class PublicAudioWorker:
                         for job in jobs:
                             check(cancel)
                             name = getattr(job, "repository", type(job).__name__)
-                            worked = scheduler.step(name, lambda job=job: job.step(cancel), cancel) or worked
+                            worked = scheduler.step(name, lambda job=job: acquisition.registry.run_source(self.model, job, plan, cancel), cancel) or worked
+                        report = acceptance.coverage(store, self.model, fresh=True)
+                        plan = acquisition.registry.plan(self.model, report, acceptance.acquisition_plan(report))
+                        signature = payload_digest(plan)
+                        if signature != plan_signature:
+                            self.emit("data_plan", key="data_plan", tasks=plan, unsupported=[task for task in plan if task["automatic_source"] is None])
+                            plan_signature = signature
                     else:
                         self.emit("network", key="learning_storage_pause", budget=budget)
                     failures = 0
@@ -12415,7 +13458,7 @@ class PublicAudioWorker:
                     store = sources = importer = owned_importer = history = dialogues = acquisition = scheduler = None
                 finally:
                     self.idle.set()
-                measured = max(tick(), time.monotonic() - began)
+                measured = elapsed_seconds(began)
                 delay = min(ceiling, base * min(failures, math.sqrt(ceiling / base)) ** 2) if failures else max(math.sqrt(self.model.chunk_seconds * measured), self.model.chunk_seconds if not worked else math.sqrt(tick()))
                 cancel.wait(delay)
         finally:
@@ -12743,14 +13786,20 @@ class MemoryCalibration:
     def model_key(cls, model):
         return payload_digest([cls.protocol, model.serving_digest or model.active_digest or model.identity(), behavior_digest(), model.rate, model.hop, model.width])
 
-    def selection(self, acceptance, cancel=None):
+    def selection(self, acceptance, cancel=None, splits=("validation", "guard")):
+        splits = tuple(splits)
+        if not splits or len(set(splits)) != len(splits) or any(split not in ("train", "validation", "guard") for split in splits):
+            raise YuanError("检索监督数据划分无效 / Invalid retrieval supervision split")
         revisions = self.store.revisions()
-        version = (revisions["evaluation_revision"], revisions["training_revision"], self.model.window(), self.model.rate, acceptance.digest)
-        cached = getattr(self.store, "retrieval_selection_cache", None)
+        window = self.model.memory_window()
+        version = (revisions["evaluation_revision"], revisions["training_revision"], window, self.model.rate, acceptance.digest)
+        caches = getattr(self.store, "retrieval_selection_cache", {})
+        cached = caches.get(splits) if isinstance(caches, dict) else None
         if cached is not None and cached[0] == version:
             return cached[1]
-        selected = {split: {language: {True: {}, False: {}} for language in acceptance.languages} for split in ("validation", "guard")}
-        rows = self.store.db.execute("SELECT p.*,g.split,g.source_key FROM turn_pairs p JOIN groups g ON g.id=p.group_id WHERE g.split IN ('validation','guard') AND p.verified=1 AND p.eligible=1 AND json_extract(p.evidence,'$.retrieval.verified')=1 ORDER BY g.source_key,p.id")
+        selected = {split: {language: {True: {}, False: {}} for language in acceptance.languages} for split in splits}
+        placeholders = ",".join("?" for split in splits)
+        rows = self.store.db.execute("SELECT p.*,g.split,g.source_key FROM turn_pairs p JOIN groups g ON g.id=p.group_id WHERE g.split IN (" + placeholders + ") AND p.verified=1 AND p.eligible=1 AND json_extract(p.evidence,'$.retrieval.verified')=1 ORDER BY g.source_key,p.id", splits)
         for pair in rows:
             check(cancel)
             evidence = json.loads(pair["evidence"])
@@ -12759,8 +13808,8 @@ class MemoryCalibration:
             if language not in acceptance.languages or not isinstance(annotation, dict) or annotation.get("method") != "human_retrieval_relevance_v1":
                 continue
             query = self.store.sample(pair["user_sample"])
-            if (query is None or query["audio_status"] != "ready" or query["generated"] or not query["dialogue_eligible"]
-                    or query["count"] < 1 or query["count"] / query["rate"] > self.model.window() / self.model.rate):
+            if (query is None or query["split"] != pair["split"] or query["audio_status"] != "ready" or query["generated"] or not query["dialogue_eligible"]
+                    or query["count"] < 1 or query["rate"] <= 0 or query["count"] / query["rate"] > window / self.model.rate):
                 continue
             examples = annotation.get("examples")
             if not isinstance(examples, list):
@@ -12781,18 +13830,42 @@ class MemoryCalibration:
                         or not candidate["dialogue_eligible"] or candidate["id"] in (query["id"], pair["assistant_sample"])
                         or candidate["group_id"] == query["group_id"] and candidate["created"] >= query["created"]
                         or type(start) is not int or type(end) is not int or not 0 <= start < end <= candidate["count"]
-                        or (end - start) / candidate["rate"] > self.model.window() / self.model.rate):
+                        or candidate["rate"] <= 0 or (end - start) / candidate["rate"] > window / self.model.rate):
                     continue
                 items[pair["source_key"]] = (pair, query, candidate, example)
         coverage = [{"kind": "retrieval_supervision", "language": language, "split": split, "relevant": relevant,
-                     "have": len(items), "need": acceptance.minimum}
+                     "have": len(items), "need": 1 if split == "train" else acceptance.minimum}
                     for split, languages in selected.items() for language, labels in languages.items() for relevant, items in labels.items()]
         result = {"selected": selected, "coverage": coverage, "missing": [item for item in coverage if item["have"] < item["need"]]}
-        self.store.retrieval_selection_cache = (version, result)
+        if not isinstance(caches, dict):
+            caches = {}
+        caches[splits] = (version, result)
+        self.store.retrieval_selection_cache = caches
         return result
 
+    def status(self):
+        row = self.store.db.execute("SELECT certificate FROM memory_calibrations WHERE model_key=?", (self.model_key(self.model),)).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row[0])
+        except (ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def record(self, value, signature, cancel=None):
+        check(cancel)
+        key = value["model_key"]
+        if key != self.model_key(self.model):
+            return False
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        with self.store.transaction():
+            check(cancel)
+            self.store.db.execute("INSERT INTO memory_calibrations(model_key,attempt,certificate,updated) VALUES(?,?,?,?) ON CONFLICT(model_key) DO UPDATE SET attempt=excluded.attempt,certificate=excluded.certificate,updated=excluded.updated", (key, signature, encoded, time.time()))
+        return True
+
     def certificate(self):
-        value = self.store.setting("memory_calibration", {})
+        value = self.status()
         if not isinstance(value, dict) or value.get("protocol") != self.protocol:
             return {}
         expected = {"model_key": self.model_key(self.model), "evaluator_sha256": behavior_digest(), "acceptance_policy_sha256": AcceptancePolicy(self.model).digest}
@@ -12815,12 +13888,12 @@ class MemoryCalibration:
                 for pair, query, candidate, example in items.values() for row in (pair, query, candidate)]
         snapshot = self.store.evaluation_snapshot(rows)
         signature = payload_digest([identity, snapshot["sha256"], data["coverage"]])
-        if self.store.setting("memory_calibration_attempt") == signature:
+        previous = self.store.db.execute("SELECT attempt FROM memory_calibrations WHERE model_key=?", (identity["model_key"],)).fetchone()
+        if previous is not None and previous[0] == signature:
             return False
         if data["missing"]:
-            self.store.set_setting("memory_calibration_attempt", signature)
-            self.store.set_setting("memory_calibration", {**identity, "protocol": self.protocol, "passed": False,
-                                   "reason": "independent_retrieval_labels_missing", "missing": data["missing"], "coverage": data["coverage"]})
+            self.record({**identity, "protocol": self.protocol, "passed": False,
+                         "reason": "independent_retrieval_labels_missing", "missing": data["missing"], "coverage": data["coverage"]}, signature, cancel)
             return False
         measurements, records = {split: {True: [], False: []} for split in selected}, []
         np = self.model.np
@@ -12839,9 +13912,8 @@ class MemoryCalibration:
                         denominator = float(np.linalg.norm(vectors[0]) * np.linalg.norm(vectors[1]))
                         score = float(np.dot(vectors[0], vectors[1]) / denominator) if denominator > np.finfo(np.float32).eps else math.nan
                         if not math.isfinite(score):
-                            self.store.set_setting("memory_calibration_attempt", signature)
-                            self.store.set_setting("memory_calibration", {**identity, "protocol": self.protocol, "passed": False,
-                                                   "reason": "invalid_retrieval_embedding", "coverage": data["coverage"]})
+                            self.record({**identity, "protocol": self.protocol, "passed": False,
+                                         "reason": "invalid_retrieval_embedding", "coverage": data["coverage"]}, signature, cancel)
                             return False
                         measurements[split][relevant].append(score)
                         records.append({"source": source, "pair": pair["id"], "language": language, "query": query["id"], "query_sha256": query["digest"],
@@ -12857,9 +13929,44 @@ class MemoryCalibration:
         if not passed:
             value["reason"] = "retrieval_relevance_not_separated"
         value["sha256"] = payload_digest(value)
-        self.store.set_setting("memory_calibration", value)
-        self.store.set_setting("memory_calibration_attempt", signature)
-        return passed
+        return self.record(value, signature, cancel) and passed
+
+def training_checkpoint_status(model, learner=None, verify=True, cancel=None):
+    directory = safe_path(model.state, "learning")
+    active = read_json(directory / "active.json")
+    candidate = read_json(directory / "candidate.json")
+    cache = getattr(model, "checkpoint_verifications", {})
+    model.checkpoint_verifications = cache
+    def verified(pointer, root, key):
+        if type(pointer.get("steps")) is not int or pointer["steps"] < 0 or not is_digest(pointer.get("sha256")) or not isinstance(pointer.get("file"), str):
+            return False
+        try:
+            path = safe_path(root, pointer["file"])
+            info = path.stat()
+            signature = (str(path), info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev, info.st_ino, pointer["sha256"])
+            if not path.is_file() or info.st_size <= 0:
+                return False
+            if cache.get(key) != signature:
+                if not verify:
+                    return False
+                if digest_file(path, cancel) != pointer["sha256"]:
+                    return False
+                cache[key] = signature
+            return True
+        except (OSError, ValueError, TypeError, YuanError):
+            return False
+    valid = (candidate.get("identity") == model.identity() and candidate.get("base") == active.get("sha256")
+             and (learner is None or candidate.get("training_revision") == learner.training_revision))
+    manifest = candidate if valid and verified(candidate, directory, "candidate") else active
+    persisted = verified(manifest, directory, "selected")
+    saved = manifest["steps"] if persisted else 0
+    completed = max(0, int(getattr(learner, "steps", getattr(model, "steps", saved))))
+    verifier = getattr(model, "verifier", None)
+    verifier_manifest = read_json(directory / "verifier/current.json")
+    verifier_saved = verifier_manifest["steps"] if verified(verifier_manifest, directory / "verifier", "verifier") else 0
+    return {"completed_steps": completed, "saved_steps": saved, "unsaved_steps": max(0, completed - saved),
+            "checkpoint_digest": manifest.get("sha256") if persisted else None,
+            "verifier_completed_steps": getattr(verifier, "steps", verifier_saved), "verifier_saved_steps": verifier_saved}
 
 class LearningProcess:
     def __init__(self, state, model, emit, shutdown):
@@ -12869,28 +13976,42 @@ class LearningProcess:
         self.idle.set()
         self.process = None
         self.desired = False
-        self.pause_requested = None
+        self.pause_requested = self.pause_deadline = self.close_deadline = None
+        self.request_id = None
+        self.phase = "idle"
         self.failure = None
         self.latest = {}
         self.operations = {}
         self.retry_at = 0.0
         self.failures = 0
-        base = math.sqrt(model.hop / model.rate)
-        self.grace = model.policy.number("runtime", "training_pause_seconds", base, tick(), max(base, model.chunk_seconds))
+        observed = model.policy.measured("learning_control", "pause_seconds", 0.0)
+        base = max(5.0, model.chunk_seconds * 2, observed * 2)
+        self.grace = model.policy.number("runtime", "training_pause_seconds", base, max(1.0, observed), max(base, model.capacity_seconds))
+        self.pause_limit = model.policy.number("runtime", "training_pause_limit_seconds", max(self.grace * 4, model.capacity_seconds), self.grace, 3600.0)
         self.stall = model.policy.number("runtime", "training_progress_seconds", max(120.0, model.capacity_seconds), max(1.0, model.chunk_seconds), 86400.0)
         self.thread = threading.Thread(target=self.run, daemon=True, name="YuanLearningSupervisor")
         self.thread.start()
 
+    def send_control(self, action, **values):
+        if self.process is None or self.process.poll() is not None:
+            return False
+        try:
+            self.process.stdin.write(json.dumps({"action": action, **values}, ensure_ascii=False) + "\n")
+            self.process.stdin.flush()
+            return True
+        except (OSError, ValueError, BrokenPipeError):
+            return False
+
     def pause(self):
         with self.lock:
             self.desired = False
-            if self.process is not None and self.pause_requested is None:
+            if self.process is not None and self.phase not in ("paused", "pausing", "closing"):
                 self.pause_requested = time.monotonic()
-                try:
-                    self.process.stdin.write('{"action":"pause"}\n')
-                    self.process.stdin.flush()
-                except (OSError, ValueError, BrokenPipeError):
-                    pass
+                self.pause_deadline = self.pause_requested + self.grace
+                self.request_id = uuid.uuid4().hex
+                self.phase = "pausing"
+                self.idle.clear()
+                self.send_control("pause", request_id=self.request_id)
             self.wake.set()
 
     def resume(self):
@@ -12900,12 +14021,10 @@ class LearningProcess:
                 self.wake.set()
 
     def wait_idle(self, cancel):
-        deadline = time.monotonic() + self.grace * 4 + math.sqrt(tick())
-        while not self.idle.wait(min(math.sqrt(tick()), max(0.0, deadline - time.monotonic()))):
+        while not self.idle.wait(math.sqrt(tick())):
             check(cancel)
             self.ensure_running()
-            if time.monotonic() >= deadline:
-                raise EngineFault("训练进程尚未退出，未启动并行对话 / Learning process has not exited; concurrent conversation was not started", code="training_process_pending")
+        check(cancel)
         self.ensure_running()
 
     def snapshot(self):
@@ -12929,28 +14048,60 @@ class LearningProcess:
                 with self.lock:
                     if process is not self.process:
                         return
-                    if kind == "learning_snapshot":
-                        self.latest = event
-                        self.last_progress = time.monotonic()
+                    now = time.monotonic()
+                    if kind == "paused_ack":
+                        if self.phase != "pausing" or event.get("request_id") != self.request_id or event.get("resources_released") is not True:
+                            continue
+                        elapsed = now - self.pause_requested
+                        self.model.policy.observe("learning_control", "pause_seconds", elapsed)
+                        self.grace = min(self.pause_limit, max(self.grace, elapsed * 2))
+                        self.latest.update(event, training_active=False, training_state="paused")
+                        self.phase = "paused"
+                        self.pause_requested = self.pause_deadline = None
+                        self.operations.clear()
+                        self.idle.set()
+                        self.wake.set()
+                    elif kind == "resumed_ack":
+                        if self.phase != "resuming" or event.get("request_id") != self.request_id:
+                            continue
+                        self.phase = "running"
+                        self.last_progress = now
+                    elif kind == "pause_progress":
+                        if self.phase == "pausing" and event.get("request_id") == self.request_id:
+                            budget = event.get("budget_seconds", self.grace)
+                            if type(budget) in (int, float) and math.isfinite(budget) and budget > 0:
+                                self.pause_deadline = min(self.pause_requested + self.pause_limit, max(self.pause_deadline, now + budget))
+                    elif kind == "learning_snapshot":
+                        self.latest.update(event)
+                        if "completed_steps" in event:
+                            self.latest["completed_steps_confirmed"] = True
+                        if self.phase == "starting":
+                            self.phase = "running"
+                        if self.phase in ("paused", "pausing", "closing"):
+                            self.latest.update(training_active=False, training_state=self.phase)
+                        self.last_progress = now
                         self.failures = 0
+                    elif kind == "checkpoint_saved":
+                        self.latest.update(saved_steps=event.get("steps"), checkpoint_digest=event.get("checkpoint_digest"))
+                        self.last_progress = now
                     elif kind == "operation":
                         identifier = event.get("operation_id")
                         if event.get("replaceable") is True and event.get("scope") != "startup":
                             identifier = payload_digest([event.get("scope"), event.get("pid"), event.get("thread"), event.get("key")])
                         if event.get("outcome") == "begin" and identifier:
                             seconds = event.get("budget_seconds", self.stall)
-                            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
+                            if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
                                 seconds = self.stall
-                            self.operations[identifier] = time.monotonic() + min(seconds, self.stall)
+                            self.operations[identifier] = now + min(seconds, self.stall)
                         elif event.get("outcome") in ("complete", "failed", "cancelled"):
                             self.operations.pop(identifier, None)
                             if event.get("outcome") == "complete":
-                                self.last_progress = time.monotonic()
-                if kind == "learning_snapshot":
-                    self.emit("learning", key="native_learning", **event)
+                                self.last_progress = now
+                if kind in ("learning_snapshot", "paused_ack", "resumed_ack"):
+                    self.emit("learning", key="learn_yield" if kind == "paused_ack" else "native_learning", **event)
                 elif kind == "error":
-                    self.emit("notice", key="paused", component="isolated_learning", reason=event.get("reason"), progress_retained=True)
-                elif kind not in ("operation", "model", "ready", "readiness", "pipeline", "exit", "status", "policy", "deployment", "condition", None):
+                    self.emit("notice", key="paused", component="isolated_learning", reason=event.get("reason"), checkpoint=self.snapshot())
+                elif kind not in ("pause_progress", "operation", "model", "ready", "readiness", "pipeline", "exit", "status", "policy", "deployment", "condition", None):
                     event.update(scope="learning", component="isolated_learning")
                     self.emit(kind, **event)
         except (OSError, ValueError, EngineFault):
@@ -12960,13 +14111,12 @@ class LearningProcess:
         try:
             while True:
                 with self.lock:
+                    now = time.monotonic()
                     closing = self.shutdown.is_set() or self.closing.is_set()
                     if closing:
                         self.desired = False
                     process = self.process
-                    desired = self.desired
-                    now = time.monotonic()
-                    if process is None and desired and now >= self.retry_at:
+                    if process is None and self.desired and now >= self.retry_at:
                         env = workspace_environment(self.state.parent)
                         env["YUAN_TRAINER"] = "1"
                         if self.model.owned_root is not None:
@@ -12975,23 +14125,41 @@ class LearningProcess:
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                         text=True, encoding="utf-8", errors="replace", bufsize=1)
                         self.process = process
-                        self.pause_requested = None
+                        self.phase = "starting"
+                        self.pause_requested = self.pause_deadline = None
                         self.last_progress = now
                         self.operations.clear()
                         self.idle.clear()
                         self.reader = threading.Thread(target=self.receive, args=(process,), daemon=True, name="YuanLearningEvents")
                         self.reader.start()
-                    if process is not None and not desired and self.pause_requested is None:
-                        self.pause()
-                    requested = self.pause_requested
+                    if process is not None:
+                        if closing and self.phase != "closing":
+                            self.phase = "closing"
+                            self.close_deadline = self.close_deadline or now + self.grace
+                            self.send_control("close", request_id=uuid.uuid4().hex)
+                        elif not closing and not self.desired:
+                            self.pause()
+                        elif not closing and self.desired and self.phase == "paused":
+                            self.request_id = uuid.uuid4().hex
+                            self.phase = "resuming"
+                            self.last_progress = now
+                            self.idle.clear()
+                            self.send_control("resume", request_id=self.request_id, owned_root=str(self.model.owned_root) if self.model.owned_root is not None else None)
+                    phase = self.phase
+                    stalled = process is not None and phase in ("starting", "running", "resuming") and (now - self.last_progress > self.stall or any(now >= deadline for deadline in self.operations.values()))
+                    timed_out = phase == "pausing" and self.pause_deadline is not None and now >= self.pause_deadline
+                    expired_close = closing and self.close_deadline is not None and now >= self.close_deadline
                 if process is not None:
-                    with self.lock:
-                        stalled = desired and (time.monotonic() - self.last_progress > self.stall or any(time.monotonic() >= deadline for deadline in self.operations.values()))
-                    forced = process.poll() is None and (stalled or requested is not None and time.monotonic() - requested >= self.grace)
+                    forced = process.poll() is None and (stalled or timed_out or expired_close)
                     if forced:
-                        end_process(process, timeout=self.grace)
-                        self.emit("learning", key="learn_yield" if requested is not None else "paused", process_isolated=True,
-                                  forced=True, progress_retained=True, checkpoint="last_atomic_checkpoint")
+                        end_process(process, timeout=max(tick(), min(self.grace, math.sqrt(tick()))))
+                        status = training_checkpoint_status(self.model)
+                        completed = self.snapshot().get("completed_steps", self.snapshot().get("steps", status["saved_steps"]))
+                        status.update(completed_steps=completed, unsaved_steps=max(0, completed - status["saved_steps"]), completed_steps_confirmed=False)
+                        with self.lock:
+                            self.latest.update(status)
+                        self.emit("learning", key="learn_yield" if timed_out or expired_close else "paused", process_isolated=True,
+                                  forced=True, training_state="terminated", checkpoint="last_atomic_checkpoint", **status)
                     code = process.poll()
                     if code is not None:
                         self.reader.join(timeout=self.grace)
@@ -13002,15 +14170,16 @@ class LearningProcess:
                                 pass
                         with self.lock:
                             self.process = None
-                            self.pause_requested = None
-                            self.latest["training_active"] = False
-                            self.latest["training_state"] = "yielded" if requested is not None else "retry"
+                            self.pause_requested = self.pause_deadline = None
+                            self.phase = "idle"
+                            self.latest.update(training_active=False, training_state="terminated" if forced else "exited")
+                            self.operations.clear()
                             self.idle.set()
-                            if requested is None:
+                            if not closing:
                                 self.failures += 1
                                 self.retry_at = time.monotonic() + min(self.stall, max(self.grace, self.model.chunk_seconds) * self.failures ** 2)
-                        if requested is None:
-                            self.emit("learning", key="paused", exit_code=code, process_isolated=True, progress_retained=True)
+                        if not closing:
+                            self.emit("learning", key="paused", exit_code=code, process_isolated=True, checkpoint=training_checkpoint_status(self.model))
                 if closing and self.process is None:
                     return
                 self.wake.wait(math.sqrt(tick()))
@@ -13021,17 +14190,18 @@ class LearningProcess:
             if process is not None:
                 try:
                     end_process(process, timeout=self.grace)
-                except BaseException:
-                    return
                 finally:
                     if process.poll() is not None:
                         self.process = None
                         self.idle.set()
 
     def close(self, timeout):
-        self.closing.set()
-        self.pause()
-        self.thread.join(timeout=max(0.0, timeout))
+        with self.lock:
+            self.close_deadline = time.monotonic() + max(0.0, timeout)
+            self.closing.set()
+            self.desired = False
+            self.wake.set()
+        self.thread.join(timeout=max(0.0, timeout) + math.sqrt(tick()))
         return not self.thread.is_alive() and self.process is None
 
     def ensure_running(self):
@@ -13041,6 +14211,11 @@ class LearningProcess:
 class LearningSession:
     def __init__(self, state, emit, cancel):
         self.state, self.emit, self.cancel = Path(state), emit, cancel
+        self.paused, self.wake = threading.Event(), threading.Event()
+        self.control_lock = threading.RLock()
+        self.request_id = None
+        self.resume_values = {}
+        self.persistence_interrupt = threading.Event()
 
     def control(self):
         try:
@@ -13049,10 +14224,89 @@ class LearningSession:
                     action = json.loads(line)
                 except (ValueError, TypeError):
                     continue
-                if isinstance(action, dict) and action.get("action") in ("pause", "close"):
-                    break
+                if not isinstance(action, dict):
+                    continue
+                with self.control_lock:
+                    command = action.get("action")
+                    if command == "close":
+                        break
+                    if command == "pause":
+                        self.request_id = action.get("request_id")
+                        self.paused.set()
+                    elif command == "resume":
+                        self.resume_values = action
+                        self.persistence_interrupt.set()
+                        self.request_id = action.get("request_id")
+                        self.paused.clear()
+                    self.wake.set()
         finally:
             self.cancel.set()
+            self.wake.set()
+
+    def hold(self, model, learner, sources):
+        began = time.monotonic()
+        destination = model.device
+        with self.control_lock:
+            if not self.paused.is_set():
+                return
+            request_id = self.request_id
+            self.persistence_interrupt.clear()
+        def progress(stage):
+            baseline = max(5.0, model.chunk_seconds * 2, model.policy.measured("learning_control", stage + "_seconds", 0.0) * 2)
+            self.emit("pause_progress", request_id=request_id, stage=stage, budget_seconds=baseline)
+        progress("sources")
+        sources.pause()
+        sources.wait_idle(self.cancel)
+        progress("offload")
+        offload_at = time.monotonic()
+        model.training_placement(model.torch.device("cpu"), learner)
+        model.policy.observe("learning_control", "offload_seconds", elapsed_seconds(offload_at))
+        model.policy.observe("learning_control", "pause_seconds", elapsed_seconds(began))
+        self.emit("paused_ack", request_id=request_id, training_active=False, training_state="paused", resources_released=True,
+                  process_isolated=True, pid=os.getpid(), pause_seconds=elapsed_seconds(began), persistence_state="pending",
+                  **training_checkpoint_status(model, learner, verify=False))
+        saved_at = time.monotonic()
+        persistence_cancel = AnyCancel(self.cancel, self.persistence_interrupt)
+        state, failure = "saved", None
+        status = None
+        try:
+            learner.checkpoint(persistence_cancel, force=True)
+            model.verifier.checkpoint(persistence_cancel)
+            check(persistence_cancel)
+            status = training_checkpoint_status(model, learner, cancel=persistence_cancel)
+            model.policy.save()
+        except Cancelled:
+            state = "deferred"
+        except Exception as exc:
+            state, failure = "failed", concise_error(exc)
+            self.emit("notice", key="checkpoint_failure", reason=failure, in_memory_progress_retained=True,
+                      **training_checkpoint_status(model, learner, verify=False))
+        model.policy.observe("learning_control", "checkpoint_seconds", elapsed_seconds(saved_at))
+        self.emit("learning_snapshot", training_active=False, training_state="paused", persistence_state=state,
+                  checkpoint_error=failure, **(status or training_checkpoint_status(model, learner, verify=False)))
+        while self.paused.is_set() and not self.cancel.is_set():
+            self.wake.wait(math.sqrt(tick()))
+            self.wake.clear()
+        if self.cancel.is_set():
+            return
+        with self.control_lock:
+            values = dict(self.resume_values)
+        model.training_placement(destination, learner)
+        supplied = values.get("owned_root")
+        if "owned_root" in values:
+            model.owned_root = None if supplied is None else safe_path(self.state, Path(supplied).resolve().relative_to(self.state.resolve()).as_posix())
+        active = read_json(safe_path(self.state, "learning/active.json"))
+        if active.get("sha256") != model.active_digest:
+            with model.interruptible(self.cancel):
+                model.restore()
+            learner._discard_candidate()
+        learner._refresh_data()
+        if learner.candidate is not None and training_checkpoint_status(model, learner)["saved_steps"] < learner.steps:
+            learner.dirty = True
+        model.refresh_release()
+        self.emit("resumed_ack", request_id=values.get("request_id"), training_state="running", device=str(model.device), pid=os.getpid(), **training_checkpoint_status(model, learner))
+        if not self.paused.is_set():
+            sources.resume()
 
     def run(self):
         threading.Thread(target=self.control, daemon=True, name="YuanLearningControl").start()
@@ -13069,87 +14323,98 @@ class LearningSession:
             helper.model, helper.store, helper.learner = model, store, learner
             sources = PublicAudioWorker(self.state, model, self.emit, self.cancel)
             self.emit("learning_snapshot", steps=model.steps, accepted=model.accepted, training_active=False, training_state="preflight", process_isolated=True)
-            sources.resume()
+            if not self.paused.is_set():
+                sources.resume()
             failures = 0
             while not self.cancel.is_set():
+                if self.paused.is_set():
+                    self.hold(model, learner, sources)
+                    continue
+                work_cancel = AnyCancel(self.cancel, self.paused)
                 began = time.monotonic()
                 try:
-                    sources.ensure_running()
-                    learner._resume_activation(self.cancel)
-                    required = model.capacity() * model.np.dtype(model.np.float32).itemsize * 2
-                    space = StorageBudget(self.state).snapshot(required)
-                    worked = False
-                    state = "waiting_data"
-                    if not space["ready"]:
-                        sources.pause()
-                        sources.wait_idle(self.cancel)
-                        model._prune_models()
-                        model._prune_evaluations(self.cancel)
-                        space = StorageBudget(self.state).reclaim(store, self.cancel, required)
-                    if space["ready"]:
-                        sources.resume()
-                        store.recheck_audio(self.cancel)
-                        model.refresh_release()
-                        worked = helper.index_memory(self.cancel)
-                        memory = model.training_budget(learner)
-                        if memory["ready"]:
-                            try:
-                                worked = model.verifier.step(self.cancel) or worked
-                            except Cancelled:
-                                raise
-                            except (OSError, ValueError, RuntimeError, MemoryError) as exc:
-                                self.emit("notice", key="semantic_evidence_missing", reason=concise_error(exc))
-                            bootstrap = store.setting("bootstrap_state", {})
-                            contracts = bootstrap.get("stages", {})
-                            phase = model.training_phase()
-                            allowed = bool(bootstrap) and (phase in ("representation", "acoustic") or contracts.get("training_path_ready") is True and contracts.get("development_path_ready") is True)
-                            if allowed:
-                                state = "training" if learner._select()[1] is not None else "waiting_data"
-                                self.emit("learning_snapshot", steps=learner.steps, accepted=model.accepted, training_active=state == "training", training_state=state, process_isolated=True)
-                                worked = learner.step(self.cancel) or worked
+                    with model.interruptible(work_cancel):
+                        sources.ensure_running()
+                        learner._resume_activation(work_cancel)
+                        required = model.capacity() * model.np.dtype(model.np.float32).itemsize * 2
+                        space = StorageBudget(self.state).snapshot(required)
+                        worked = False
+                        state = "waiting_data"
+                        if not space["ready"]:
+                            sources.pause()
+                            sources.wait_idle(work_cancel)
+                            model._prune_models()
+                            model._prune_evaluations(work_cancel)
+                            space = StorageBudget(self.state).reclaim(store, work_cancel, required)
+                        if space["ready"]:
+                            sources.resume()
+                            store.recheck_audio(work_cancel)
+                            model.refresh_release()
+                            worked = helper.index_memory(work_cancel)
+                            memory = model.training_budget(learner)
+                            if memory["ready"]:
+                                pending = (FinalAcceptance.current(model, store, AcceptancePolicy(model))
+                                           if model.dialogue_trained and model.verifier.ready(work_cancel) else None)
+                                frozen = pending is not None and pending["status"] in ("reserved", "evaluating")
+                                if frozen:
+                                    state = "verifying"
+                                else:
+                                    try:
+                                        worked = model.verifier.step(work_cancel) or worked
+                                    except Cancelled:
+                                        raise
+                                    except (OSError, ValueError, RuntimeError, MemoryError) as exc:
+                                        self.emit("notice", key="semantic_evidence_missing", reason=concise_error(exc))
+                                    allowed = learner._select()[1] is not None
+                                    if allowed:
+                                        state = "training"
+                                        self.emit("learning_snapshot", steps=learner.steps, accepted=model.accepted, training_active=True, training_state=state, process_isolated=True)
+                                        worked = learner.step(work_cancel) or worked
+                                    else:
+                                        state = "bootstrap_blocked"
+                                    model.calibrate(work_cancel)
+                                worked = model.prepare_review(store, work_cancel) or worked
+                                worked = model.automatic_review(store, work_cancel) or worked
                             else:
-                                state = "bootstrap_blocked"
-                            model.calibrate(self.cancel)
-                            worked = model.prepare_review(store, self.cancel) or worked
-                            worked = model.automatic_review(store, self.cancel) or worked
+                                state = "resource_paused"
+                                self.emit("learning", key="memory_pause", budget=memory, **learner._state())
                         else:
-                            state = "resource_paused"
-                            self.emit("learning", key="memory_pause", budget=memory, **learner._state())
-                    else:
-                        state = "storage_paused"
-                    learner.checkpoint(self.cancel)
-                    model.verifier.checkpoint(self.cancel)
-                    model.policy.save()
-                    self.emit("learning_snapshot", steps=learner.steps, accepted=model.accepted, acoustic_ready=model.acoustic_ready,
-                              dialogue_trained=model.dialogue_trained, active_digest=model.active_digest, curriculum=(model.training_manifest or {}).get("curriculum", {}),
-                              automatic_release=getattr(model, "automatic_release_state", None), training_active=False, training_state=state,
-                              process_isolated=True, iteration_seconds=time.monotonic() - began)
-                    failures = 0
-                    delay = math.sqrt(max(tick(), time.monotonic() - began) * model.chunk_seconds) if worked else model.chunk_seconds
-                    self.cancel.wait(delay)
+                            state = "storage_paused"
+                        learner.checkpoint(work_cancel)
+                        model.verifier.checkpoint(work_cancel)
+                        model.policy.save()
+                        self.emit("learning_snapshot", steps=learner.steps, accepted=model.accepted, acoustic_ready=model.acoustic_ready,
+                                  dialogue_trained=model.dialogue_trained, active_digest=model.active_digest, curriculum=(model.training_manifest or {}).get("curriculum", {}),
+                                  automatic_release=getattr(model, "automatic_release_state", None), training_active=False, training_state=state,
+                                  process_isolated=True, iteration_seconds=time.monotonic() - began, **training_checkpoint_status(model, learner))
+                        failures = 0
+                        work_cancel.wait(0.0 if worked else model.chunk_seconds)
                 except Cancelled:
-                    raise
+                    if self.cancel.is_set():
+                        break
                 except Exception as exc:
                     failures += 1
                     self.emit("learning", key="paused", reason=concise_error(exc), **learner._state())
                     if isinstance(exc, MemoryError) or "out of memory" in str(exc).casefold():
                         model.recover_training_memory(learner)
-                    self.cancel.wait(max(model.chunk_seconds, time.monotonic() - began) * math.sqrt(failures))
+                    work_cancel.wait(max(model.chunk_seconds, time.monotonic() - began) * math.sqrt(failures))
         except Cancelled:
             pass
         finally:
             self.cancel.set()
             if sources is not None:
-                sources.close(max(tick(), math.sqrt(model.hop / model.rate)))
+                sources.close(max(5.0, model.chunk_seconds * 2))
             if learner is not None:
                 try:
                     learner.checkpoint(None, force=True)
                     model.verifier.checkpoint(None)
                     model.policy.save()
+                    self.emit("learning_snapshot", training_active=False, training_state="closed", **training_checkpoint_status(model, learner))
                 except Exception as exc:
-                    self.emit("notice", key="checkpoint_failure", reason=concise_error(exc), progress_retained=True)
+                    self.emit("notice", key="checkpoint_failure", reason=concise_error(exc), **training_checkpoint_status(model, learner))
             if store is not None:
                 store.close()
+
 
 def learning_entry(state):
     with runtime_entry(state) as (emit, cancel):
@@ -13294,7 +14559,9 @@ class Engine:
         np = self.model.np
         key = MemoryCalibration.model_key(self.model)
         certificate = MemoryCalibration(self.model, self.store).certificate()
-        if not certificate:
+        if not certificate or self.store.setting("serving_memory_key") != key:
+            self.emit("memory_matches", key="memory_recall", id=session_id, count=0, samples=0, scanned=0,
+                      model_key=key, calibrated=bool(certificate), index_ready=False, context_selected=False)
             return []
         threshold = certificate["threshold"]
         total = self.store.indexed_memory_count(key)
@@ -13378,18 +14645,45 @@ class Engine:
                       intervals=[{"sample": item[1][0], "start": item[1][1], "end": item[1][2]} for item in retained], calibration_sha256=certificate["sha256"])
         return [(item[2], item[3]) for item in retained]
 
+    def activate_memory_index(self, key, cancel):
+        check(cancel)
+        if key != MemoryCalibration.model_key(self.model):
+            return False
+        certificate = MemoryCalibration(self.model, self.store).certificate()
+        if not certificate:
+            return False
+        with self.store.transaction():
+            check(cancel)
+            if self.store.memory_index_pending(key):
+                return False
+            missing = self.store.db.execute("SELECT 1 FROM memories m WHERE m.model_key=? AND NOT EXISTS(SELECT 1 FROM memory_buckets b WHERE b.sample_id=m.sample_id AND b.model_key=m.model_key AND b.start=m.start AND b.end=m.end) LIMIT 1", (key,)).fetchone()
+            if missing is not None or key != MemoryCalibration.model_key(self.model) or not self.store.snapshot_valid(certificate.get("evaluation_snapshot")):
+                return False
+            previous = self.store.setting("serving_memory_key")
+            if previous == key:
+                if self.store.setting("building_memory_key") == key:
+                    self.store.set_setting("building_memory_key", None)
+                return False
+            if previous:
+                self.store.set_setting("previous_memory_key", previous)
+            self.store.set_setting("serving_memory_key", key)
+            self.store.set_setting("building_memory_key", None)
+            self.store.prune_memory_versions(cancel)
+        self.emit("learning_memory", model_key=key, previous_model_key=previous, index_ready=True,
+                  indexed_count=self.store.indexed_memory_count(key), calibration_sha256=certificate["sha256"])
+        return True
+
     @supervised('memory_encoding', 'learning')
     def index_memory(self, cancel):
         if not self.model.playback_ready:
             return False
         key = MemoryCalibration.model_key(self.model)
         previous = self.store.setting("serving_memory_key")
-        if previous != key:
+        building = key if previous != key else None
+        if self.store.setting("building_memory_key") != building:
             with self.store.transaction():
-                self.store.db.execute("DELETE FROM memories WHERE model_key<>?", (key,))
-                self.store.db.execute("DELETE FROM memory_progress WHERE model_key<>?", (key,))
-                self.store.set_setting("serving_memory_key", key)
-                self.store.set_setting("memory_calibration", {})
+                self.store.set_setting("building_memory_key", building)
+                self.store.prune_memory_versions(cancel)
         try:
             MemoryCalibration(self.model, self.store).refresh(cancel)
         except Cancelled:
@@ -13400,7 +14694,8 @@ class Engine:
             return True
         row = self.store.db.execute("SELECT s.*,COALESCE(m.next_start,0) AS memory_cursor FROM samples s JOIN groups g ON g.id=s.group_id JOIN sessions x ON x.id=s.group_id LEFT JOIN memory_progress m ON m.sample_id=s.id AND m.model_key=? WHERE g.origin='local' AND x.ended IS NOT NULL AND s.audio_status='ready' AND s.memory_eligible=1 AND s.count>1 AND COALESCE(m.next_start,0)<s.count AND COALESCE(m.retry_at,0)<=? ORDER BY s.created,s.id LIMIT 1", (key, time.time())).fetchone()
         if row is None:
-            return self.store.repair_memory_index(key, cancel)
+            repaired = self.store.repair_memory_index(key, cancel)
+            return repaired or self.activate_memory_index(key, cancel)
         check(cancel)
         start = row["memory_cursor"]
         take = min(row["count"] - start, max(1, int(self.model.window() * row["rate"] / self.model.rate)))
@@ -13434,7 +14729,19 @@ class Engine:
         output = self.model.respond_audio(tr("default_prompt", self.language), [], waveform, self.shutdown, max_samples=count)
         if not output.size or not np.isfinite(output).all():
             raise YuanError("端到端音频链路验证失败 / End-to-end audio pipeline validation failed")
-        self.emit("pipeline", verified=True, conversation_verified=self.model.dialogue_ready, path="ordered prompt + processed audio → Yuan audio encoder → latent dialogue core → Yuan audio decoder → autoregressive waveform",
+        config = {key: getattr(self.model, key) for key in ("rate", "hop", "width", "layers")}
+        identity = payload_digest([build_digest(), str(self.model.device), str(self.model.torch.__version__), config])
+        certificate = read_json(self.state / "training-components.json")
+        if certificate.get("identity") != identity or certificate.get("training_components_verified") is not True:
+            components = probe_training_components(self.model.torch, np, self.state, self.model.policy, self.model.device, config, self.shutdown, self.emit)
+            atomic_json(self.state / "training-components.json", {"identity": identity, **components}, self.shutdown)
+            compute = read_json(self.state / "compute-verified.json")
+            if compute.get("build_sha256") == build_digest():
+                for row in compute.get("devices", []):
+                    if row.get("device") == str(self.model.device):
+                        row.update(components)
+                atomic_json(self.state / "compute-verified.json", compute, self.shutdown)
+        self.emit("pipeline", verified=True, training_components_verified=True, conversation_verified=self.model.dialogue_ready, path="ordered prompt + processed audio → Yuan audio encoder → latent dialogue core → Yuan audio decoder → autoregressive waveform",
                   transcription=False, text_to_speech=False, external_model=False, playback=self.model.playback_ready)
 
     def readiness(self, force=False):
@@ -13466,6 +14773,9 @@ class Engine:
                 values["model_blocker"] = "semantic_evidence_missing"
         values["data_source_state"] = values["learning"].get("source_state", {})
         values["bootstrap"] = values["learning"].get("bootstrap", {})
+        values["bootstrap_phase"] = values["bootstrap"].get("phase", "initializing")
+        values["missing_source_tasks"] = values["bootstrap"].get("missing_task_count", 0)
+        values["unvalidated_import_tasks"] = values["bootstrap"].get("unvalidated_import_count", 0)
         values["model_detail"] = self.model.release_failure if self.model else None
         if not values["model_ready"] and values["data_source_state"].get("blocked"):
             values["data_blocker"] = values["model_blocker"]
@@ -13473,7 +14783,8 @@ class Engine:
                 values["model_blocker"] = "data_sources_exhausted"
             values["model_detail"] = "独立多轮录音或标注覆盖不足，正在按来源退避重试 / Independent multi-turn recordings or annotations remain insufficient; sources will be retried"
         values["delivery_source"] = str(self.model.owned_root) if self.model and self.model.owned_root else None
-        values["model_requires_action"] = not values["model_ready"] and values["model_blocker"] == "release_invalid"
+        values["model_requires_action"] = False
+        values["automatic_model_recovery"] = bool(not values["model_ready"] and values["learning_ready"])
         values["automatic_learning"] = bool(values["learning_ready"] and values["learning"].get("trainable_data") and self.session_id is None)
         values["training_active"] = values["learning"].get("training_active", False)
         values["automatic_release"] = values["learning"].get("automatic_release")
@@ -13621,9 +14932,7 @@ class Engine:
         try:
             if self.sources:
                 self.sources.pause()
-                self.sources.wait_idle(self.interrupt)
-            self.model.refresh_release()
-            self.probe_audio(self.interrupt, force=True)
+            self.probe_audio(self.interrupt)
             if not self.readiness()["conversation_ready"]:
                 self.emit("notice", key="start_rejected", id=session_id, blockers=self.readiness()["blockers"])
                 return
@@ -13635,8 +14944,15 @@ class Engine:
             self.model.input_budget = max(self.model.hop * 2, self.model.capacity() // 2)
             capture = CaptureSession(self.devices, session_id, self.interrupt, self.emit, self.writer)
             self.emit("started", id=session_id, mode="dialogue", model=self.model.serving_digest, continuous=False,
-                      acoustic_ready=self.model.acoustic_ready, dialogue_ready=True, playback_ready=True)
+                      acoustic_ready=self.model.acoustic_ready, dialogue_ready=True, playback_ready=True, reply_ready=False,
+                      training_state="pausing")
             capture.start()
+            self.emit("status", key="preparing_reply", id=session_id, reply_ready=False)
+            if self.sources:
+                self.sources.wait_idle(self.interrupt)
+            self.record_yield(self.model, action.get("_received_at"))
+            check(self.interrupt)
+            self.emit("status", key="listening", id=session_id, reply_ready=True, training_state="paused")
             while not self.shutdown.is_set():
                 check(self.interrupt)
                 row = capture.next()
@@ -13854,11 +15170,7 @@ class Engine:
                     self.model.calibrate(self.shutdown)
                     self.check_pipeline()
                 except RuntimeError as exc:
-                    if model.device.type == "cpu":
-                        raise
-                    self.emit("notice", key="device_fallback", reason=concise_error(exc))
-                    model.switch_device("cpu", self.shutdown)
-                    self.check_pipeline()
+                    raise YuanFault("加速链路验证需要修复 / Accelerator pipeline validation needs repair", category="compatibility", code="compute_backend_failed", device=str(model.device)) from exc
             self.pipeline_ready = True
             with operation(self.emit, "stage_learning"):
                 learner = AudioLearner(model, self.store, self.emit)
@@ -13885,13 +15197,14 @@ class Engine:
                         self.interrupt.clear()
                 if action:
                     self.sources.pause()
-                    if action["action"] != "close":
+                    if action["action"] not in ("close", "start"):
                         try:
                             self.sources.wait_idle(self.interrupt)
                         except Cancelled:
                             self.emit("ended", id=str(action.get("id", "")))
                             continue
-                    self.record_yield(model, action.get("_received_at"))
+                    if action["action"] != "start":
+                        self.record_yield(model, action.get("_received_at"))
                     if action["action"] == "close":
                         break
                     if action["action"] == "start":
@@ -14012,8 +15325,13 @@ class Engine:
                 "acquisition_plan": AcceptancePolicy(self.model).acquisition_plan(report), "acquisition_state": self.store.setting("acquisition_summary", {}),
                 "source_state": self.store.setting("source_coverage_state", {}),
                 "bootstrap": self.store.setting("bootstrap_state", {}),
-                "memory_calibration": {key: value for key, value in self.store.setting("memory_calibration", {}).items()
-                                       if key in ("passed", "reason", "coverage", "missing", "scope")},
+                "memory_calibration": {key: value for key, value in MemoryCalibration(self.model, self.store).status().items()
+                                       if key in ("model_key", "passed", "reason", "coverage", "missing", "scope")},
+                "memory_index": {"serving_model_key": self.store.setting("serving_memory_key"),
+                                 "building_model_key": self.store.setting("building_memory_key"),
+                                 "previous_model_key": self.store.setting("previous_memory_key"),
+                                 "current_model_key": MemoryCalibration.model_key(self.model),
+                                 "indexed_count": self.store.indexed_memory_count(MemoryCalibration.model_key(self.model))},
                 "reference_missing": report["reference_missing"], "reference_ready": report["reference_ready"],
                 "dialogue_missing": report["dialogue_missing"], "dialogue_reference_ready": report["dialogue_reference_ready"],
                 "review_pending": bool(pointer.get("review_file")), "review_model": pointer.get("model_sha256"),
@@ -14237,8 +15555,9 @@ class Engine:
 
 @contextmanager
 def runtime_entry(state):
-    state = Path(state).resolve()
-    state.mkdir(parents=True, exist_ok=True)
+    state = ensure_workspace_identity(state)
+    if state != workspace_state(state.parent).resolve():
+        raise YuanFault("运行目录与当前版本不匹配 / Runtime directory does not match this build", category="integrity", code="workspace_build_mismatch")
     env = workspace_environment(state.parent)
     os.environ.clear()
     os.environ.update(env)
@@ -14402,11 +15721,11 @@ class Mailbox:
             else:
                 replaceable = kind == "operation" and event.get("replaceable") is True
                 if replaceable or kind in self.telemetry_types or kind == "notice":
-                    key = (event.get("generation"), event.get("attempt_id"), kind, event.get("scope"), event.get("key") if kind in ("notice", "operation") else None)
+                    key = (event.get("generation"), event.get("attempt_number"), event.get("attempt_id"), event.get("id"), kind, event.get("scope"), event.get("key") if kind in ("notice", "operation") else None)
                     previous = self.latest.pop(key, {})
                     if previous:
                         self.coalesced += 1
-                    if kind in ("audio", "metrics", "devices", "model"):
+                    if kind in ("audio", "metrics", "devices", "model") and previous.get("id") == event.get("id"):
                         event = {**previous, **event}
                     event["_coalesced"] = int(previous.get("_coalesced", 0)) + int(bool(previous))
                     self.latest[key] = event
@@ -14603,9 +15922,11 @@ class RecoveryGate:
     def remaining(self):
         return max(0.0, self.total - self.used)
 
+
     @property
     def transfer_remaining(self):
         return max(0.0, self.transfer_total - self.transfer_used)
+
 
     def conditions(self):
         paths = [Path(__file__).resolve(), self.state / "policy.json", self.state / "network.json", self.state / "runtime-current.json", self.state / "runtime-lock.json"]
@@ -14660,9 +15981,10 @@ class RecoveryGate:
 
     def network_changed(self, target, reachable):
         key = payload_digest(target)
-        changed = reachable and (self.network_condition.get("target") != key or self.network_condition.get("reachable") is not True)
+        previous = self.network_condition
+        changed = bool(reachable and previous.get("target") == key and previous.get("reachable") is False)
         self.network_condition = {"target": key, "reachable": bool(reachable)}
-        return bool(changed)
+        return changed
 
     def record(self, fault, seconds, identity=None, transfer_seconds=0.0):
         details = fault.get("details", {})
@@ -14712,17 +16034,18 @@ class RecoveryGate:
         return self.can_retry()
 
     def retry_blocker(self):
-        if self.remaining <= tick():
+        if self.last.get("details", {}).get("retry_blocker") == "retry_import_unchanged":
+            return "retry_import_unchanged"
+        if self.remaining <= 0:
             return "retry_time_exhausted"
-        if self.transfer_remaining <= tick():
+        if self.transfer_remaining <= 0:
             return "retry_transfer_exhausted"
         if self.attempts >= self.maximum:
             return "retry_total_exhausted"
         if self.last.get("count", 0) >= self.per_fault:
             return "retry_same_fault_exhausted"
-        if self.last.get("details", {}).get("retry_blocker") == "retry_import_unchanged":
-            return "retry_import_unchanged"
         return None
+
 
     def can_retry(self):
         return self.retry_blocker() is None
@@ -14752,7 +16075,7 @@ class Launcher:
         self.send_lock = threading.Lock()
         self.commands = queue.Queue()
         self.sender = threading.Thread(target=self.send_loop, daemon=True, name="YuanCommands")
-        self.activity = LiveStatus(safe_path(self.workspace, STATE_NAME))
+        self.activity = LiveStatus(workspace_state(self.workspace))
         self.phase_at = time.monotonic()
         self.phase_key = "setup"
         self.retry_until = None
@@ -14762,14 +16085,14 @@ class Launcher:
         self.attempt_id = None
         self.attempt_number = 0
         self.phase_id = None
-        self.supervisor = StageSupervisor(safe_path(self.workspace, STATE_NAME), self.emit)
+        self.supervisor = StageSupervisor(workspace_state(self.workspace), self.emit)
         self.control_deadline = None
         self.control_id = None
         self.child_error = None
         self.child_fault = None
         self.engine_ever_ready = False
         self.engine_ready_at = None
-        self.gate = RecoveryGate(safe_path(self.workspace, STATE_NAME), self.emit)
+        self.gate = RecoveryGate(workspace_state(self.workspace), self.emit)
         self.sender.start()
         self.thread.start()
 
@@ -14851,7 +16174,7 @@ class Launcher:
         return True
 
     def probe_resources(self, cancel, installer=None):
-        state = safe_path(self.workspace, STATE_NAME)
+        state = workspace_state(self.workspace)
         candidates = []
         for name in ("runtime-current.json", "runtime-build.json"):
             pointer = read_json(state / name)
@@ -14901,7 +16224,7 @@ class Launcher:
             initial_free = None
         def writable():
             try:
-                state = safe_path(self.workspace, STATE_NAME)
+                state = workspace_state(self.workspace)
                 fd, path = tempfile.mkstemp(dir=state if state.is_dir() else self.workspace, prefix=".yuan-write-check-")
                 os.close(fd)
                 os.unlink(path)
@@ -15001,11 +16324,12 @@ class Launcher:
                     self.gate.probe_used += max(0.0, time.monotonic() - began)
                     self.gate.save()
                 if reachable and (self.gate.can_retry() or changed):
-                    if not self.gate.can_retry():
-                        self.gate.reset("network_restored")
-                    else:
+                    if changed:
+                        if self.gate.resume_fault("network_restored"):
+                            return True
+                    elif self.gate.can_retry():
                         self.emit("notice", key="network_restored", source=target)
-                    return True
+                        return True
             self.emit("condition_check", key="condition_check", blocked=True, mode=mode, task_running=False,
                       changed=False, next_check_seconds=self.gate.check_interval)
             began = time.monotonic()
@@ -15089,7 +16413,7 @@ class Launcher:
             output.close(math.sqrt(tick()))
 
     def run(self):
-        state = safe_path(self.workspace, STATE_NAME)
+        state = workspace_state(self.workspace)
         retained_process = False
         installer = None
         try:
@@ -15133,7 +16457,7 @@ class Launcher:
                     budgets = {"stage_import_" + name: self.supervisor.budget("stage_import_" + name) for name in RUNTIME_MODULES}
                     self.supervisor.policy.save()
                     env = {**installer.env, "YUAN_ATTEMPT_ID": self.attempt_id, "YUAN_IMPORT_BUDGETS": json.dumps(budgets),
-                           "YUAN_IMPORT_IDENTITY": self.supervisor.fingerprint, "YUAN_STARTUP_DEADLINE": str(guard.deadline)}
+                           "YUAN_IMPORT_IDENTITY": self.supervisor.fingerprint, "YUAN_STARTUP_DEADLINE": str(guard.deadline), "YUAN_COMPUTE_BACKEND": installer.compute_backend}
                     process = spawn([str(interpreter), "-B", str(Path(__file__).resolve()), "--engine", str(state)], env,
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
                     with self.lock:
@@ -15235,7 +16559,7 @@ class InterfaceState:
             self.incomplete = session is not None
         elif event.get("attempt_id") is not None and event["attempt_id"] != self.attempt_id:
             return False
-        if kind in ("status", "started", "ended", "audio", "turn") and event.get("id") is not None and event["id"] != session:
+        if kind in ("status", "started", "ended", "audio", "turn", "metrics", "devices", "model") and event.get("id") is not None and event["id"] != session:
             return False
         if kind == "progress" and event.get("phase_id") != self.phase_id:
             return False
@@ -15244,6 +16568,8 @@ class InterfaceState:
             if type(sequence) is not int or sequence <= self.sequence:
                 return False
             self.sequence = sequence
+        if self.session != session:
+            self.audio = {}
         self.session = None if kind == "attempt" else session
         if kind == "readiness":
             self.readiness = dict(event)
@@ -15340,9 +16666,9 @@ class YuanApp:
             family = next((name for name in ("Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", "Noto Sans CJK TC", "WenQuanYi Micro Hei", "Arial") if name in families), "TkDefaultFont")
             self.unit = max(6, int(round(font.nametofont("TkDefaultFont").metrics("linespace") / 2.5)))
             system_size = int(font.nametofont("TkDefaultFont").cget("size"))
-            self.base = max(1, system_size if system_size > 0 else int(round(abs(system_size) * 72 / max(1, root.winfo_fpixels("1i")))))
+            self.base = max(11, (system_size if system_size > 0 else int(round(abs(system_size) * 72 / max(1, root.winfo_fpixels("1i"))))) + 1)
             self.font = font.Font(root=root, family=family, size=self.base)
-            self.small_font = font.Font(root=root, family=family, size=max(9, self.base - 1))
+            self.small_font = font.Font(root=root, family=family, size=self.base)
             self.heading_font = font.Font(root=root, family=family, size=self.base + 10, weight="bold")
             self.brand_font = font.Font(root=root, family=family, size=self.base + 16, weight="bold")
             self.bold_font = font.Font(root=root, family=family, size=self.base, weight="bold")
@@ -15368,6 +16694,7 @@ class YuanApp:
             self.body = tk.Frame(self.viewport, bg=self.palette["bg"], padx=self.unit*2, pady=self.unit)
             self.body_window = self.viewport.create_window(0, 0, window=self.body, anchor="nw")
             self.body.grid_columnconfigure(0, weight=1)
+            self.body.grid_rowconfigure(6, weight=1)
             self.viewport.bind("<Configure>", self.resize)
             self.body.bind("<Configure>", self.measure)
             self.root.bind_all("<MouseWheel>", self.wheel)
@@ -15537,14 +16864,15 @@ class YuanApp:
         self.dock.bind("<Configure>", lambda event: self.dock_status.configure(wraplength=max(self.unit, event.width-self.dock_action.winfo_reqwidth()-self.unit*3)))
 
     def build_activity(self):
-        panel = self.tk.Frame(self.body, bg=self.palette["panel"], padx=self.unit, pady=self.unit)
-        panel.grid(row=6, column=0, sticky="ew", pady=(self.unit, 0))
-        panel.grid_columnconfigure(1, weight=1)
+        panel = self.tk.Frame(self.body, bg=self.palette["panel"], padx=self.unit, pady=self.unit, highlightthickness=1, highlightbackground=self.palette["border"])
+        panel.grid(row=6, column=0, sticky="nsew", pady=(self.unit, 0))
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(1, weight=1)
         self.label(panel, key="activity", fg=self.palette["accent"], font=self.bold_font).grid(row=0, column=0, sticky="w")
-        self.button(panel, self.show_activity, key="all_activity", pady=self.unit//2).grid(row=0, column=2, sticky="e")
-        self.activity_text = self.tk.Text(panel, height=1, width=1, wrap="word", bg=self.palette["field"], fg=self.palette["muted"],
-                                          relief="flat", bd=0, font=self.small_font, padx=self.unit, pady=self.unit//2, state="disabled")
-        self.activity_text.grid(row=0, column=1, sticky="ew", padx=self.unit)
+        self.button(panel, self.show_activity, key="all_activity", pady=self.unit//2).grid(row=0, column=1, sticky="e")
+        self.activity_text = self.tk.Text(panel, height=1, width=1, wrap="word", bg=self.palette["field"], fg=self.palette["text"], relief="flat", bd=0, font=self.small_font, padx=self.unit, pady=self.unit, state="disabled")
+        self.activity_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(self.unit, 0))
+
 
     def record_activity(self, event):
         if event.get("type") not in ("status", "error", "notice", "deployment", "learning", "network", "recovery"):
@@ -15640,9 +16968,13 @@ class YuanApp:
         self.layout_cards(3 if event.width >= self.font.measure("M") * 82 else 2 if event.width >= self.font.measure("M") * 56 else 1)
         self.root.after_idle(self.measure)
 
+
     def measure(self, event=None):
+        required = self.body.winfo_reqheight()
+        available = self.viewport.winfo_height()
+        self.viewport.itemconfigure(self.body_window, height=max(required, available))
         self.viewport.configure(scrollregion=self.viewport.bbox("all"))
-        needs_scroll = self.body.winfo_reqheight() > self.root.winfo_height()
+        needs_scroll = required > self.root.winfo_height()
         if needs_scroll:
             self.scrollbar.grid(row=0, column=1, sticky="ns")
             self.dock.grid(row=1, column=0, columnspan=2, sticky="ew")
@@ -15650,6 +16982,7 @@ class YuanApp:
             self.scrollbar.grid_remove()
             self.dock.grid_remove()
             self.viewport.yview_moveto(0)
+
 
     def wheel(self, event):
         if event.widget is self.prompt or event.widget is self.activity_text or event.widget.winfo_toplevel() is not self.root:
@@ -15702,7 +17035,7 @@ class YuanApp:
         if payload == self.last_saved_prompt:
             return True
         try:
-            atomic_json(safe_path(self.workspace, STATE_NAME) / "settings.json", payload)
+            atomic_json(workspace_state(self.workspace) / "settings.json", payload)
             self.last_saved_prompt = payload
             return True
         except (OSError, ValueError, YuanError) as exc:
@@ -15718,7 +17051,7 @@ class YuanApp:
                 self.notice_key = "recheck_requested"
         else:
             try:
-                gate = RecoveryGate(safe_path(self.workspace, STATE_NAME), lambda *args, **kwargs: None)
+                gate = RecoveryGate(workspace_state(self.workspace), lambda *args, **kwargs: None)
                 gate.reset("recheck_requested")
                 self.open_workspace(self.workspace)
             except Exception as exc:
@@ -15756,7 +17089,7 @@ class YuanApp:
             return
         lease = None
         try:
-            state = safe_path(workspace, STATE_NAME)
+            state = workspace_state(workspace)
             state.mkdir(parents=True, exist_ok=True)
             fd, test = tempfile.mkstemp(dir=state)
             os.close(fd)
@@ -15972,6 +17305,21 @@ class YuanApp:
                 self.startup_values = dict(event)
             elif kind == "runtime_profile":
                 self.startup_values.update({key: event[key] for key in ("executable", "python", "machine") if key in event})
+                if event.get("compute_backend"):
+                    self.model_values["device"] = event["compute_backend"]
+                hardware = event.get("hardware", {})
+                adapters = hardware.get("adapters", [])
+                if adapters:
+                    self.model_values["architecture"] = " · ".join(item.get("name", item.get("vendor", "")) for item in adapters)
+            elif kind == "hardware":
+                adapters = event.get("hardware", {}).get("adapters", [])
+                if adapters:
+                    self.model_values["architecture"] = " · ".join(item.get("name", item.get("vendor", "")) for item in adapters)
+            elif kind == "accelerators":
+                devices = event.get("devices", [])
+                if devices:
+                    self.model_values["device"] = " · ".join(item["device"] for item in devices)
+                    self.model_values["architecture"] = " · ".join(item["name"] for item in devices)
             elif kind == "deployment_preflight":
                 self.deployment_value = dict(event)
             elif kind == "download_complete":
@@ -16366,7 +17714,7 @@ class YuanApp:
             fault = self.current_failure.get("fault", {})
             summary = translate("fault_" + fault.get("category", "unknown")) if fault else local_message(self.reason, language).split("\n", 1)[0][:240]
             message = (message + " · " if message else "") + summary
-        if self.last_failure and not self.current_failure:
+        if self.last_failure and not self.current_failure and recovering:
             history = translate("previous_failure") + " · " + (translate("fault_" + self.last_failure["fault"].get("category", "unknown")) if self.last_failure.get("fault") else local_message(self.last_failure.get("reason", ""), language).split("\n", 1)[0][:160])
             message = message + "\n" + history if message else history
         self.notice.configure(text=message)
@@ -16541,41 +17889,144 @@ class YuanApp:
         display()
 
 
+def probe_training_components(torch, np, state, policy, device, config, cancel, emit):
+    check(cancel)
+    model = NativeAudio.__new__(NativeAudio)
+    model.torch, model.np, model.state, model.policy, model.emit = torch, np, Path(state), policy, emit
+    model.device, model.dtype, model.cancel = device, torch.float32, cancel
+    for key in ("rate", "hop", "width", "layers"):
+        setattr(model, key, config[key])
+    frames = max(8, model.layers * 2)
+    count = model.hop * frames
+    model.chunk_seconds = max(1.0, count / model.rate * 2)
+    model.capacity_seconds, model.capacity_scale = model.chunk_seconds * 4, 1.0
+    model.input_budget = None
+    model.performance_section = "preflight:" + payload_digest([str(device), config])
+    model.training_manifest = {"curriculum": {"phase": "conditional_dialogue"}}
+    network = verifier = optimizer = None
+    began = time.monotonic()
+    try:
+        network = model._build().to(device=device, dtype=torch.float32).train()
+        optimizer = torch.optim.AdamW(network.parameters(), foreach=False)
+        values = (np.sin(np.arange(count, dtype=np.float32)) * 0.1).astype(np.float32)
+        timings = []
+        for task in ("acoustic", "dialogue"):
+            optimizer.zero_grad(set_to_none=True)
+            compute_began = time.monotonic()
+            loss = model.loss(network, "Yuan", values, values[::-1].copy(), ended=True, task=task,
+                              end_label_valid=True, rollout=task == "dialogue", rollout_frames=2)
+            gradient_checkpoint(loss, cancel).backward()
+            compute_sync(torch, device)
+            if not bool(torch.isfinite(loss).item()) or not all(bool(torch.isfinite(p.grad).all().item()) for p in network.parameters() if p.grad is not None):
+                raise YuanError("真实训练损失或梯度检查失败 / Actual training loss or gradient check failed")
+            optimizer.step()
+            compute_sync(torch, device)
+            timings.append(elapsed_seconds(compute_began))
+            check(cancel)
+        if not tensors_finite(torch, network.parameters()):
+            raise YuanError("训练优化器更新检查失败 / Training optimizer update check failed")
+        optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            hidden = model._encode(network, "Yuan", values, cancel=cancel)
+            previous = network.begin
+            condition = hidden
+            for _ in range(2):
+                previous, ending, hidden = network.decode(previous, hidden, condition)
+                if not bool(torch.isfinite(previous).all().item()):
+                    raise YuanError("流式音频生成检查失败 / Streaming audio generation check failed")
+        verifier = SpeechVerifier.__new__(SpeechVerifier)
+        verifier.model, verifier.emit = model, emit
+        verifier.configure_device(device)
+        verifier.network = verifier.build().train()
+        verifier.accepted = None
+        verifier.optimizer = torch.optim.AdamW(verifier.network.parameters(), foreach=False)
+        features = verifier.features(values, cancel)
+        output = verifier.network(features, cancel=cancel).transpose(0, 1)
+        targets = torch.tensor([ord("a") + 1], dtype=torch.long)
+        try:
+            loss = verifier.ctc_loss(output, targets)
+            torch.autograd.grad(loss, output, retain_graph=True)
+        except (RuntimeError, NotImplementedError) as exc:
+            if verifier.ctc_device.type == "cpu" or not unsupported_operation(exc):
+                raise
+            verifier.ctc_device = torch.device("cpu")
+            emit("compute_partition", component="verifier_ctc_backward", device="cpu", network_device=str(device), reason=concise_error(exc))
+            loss = verifier.ctc_loss(output, targets)
+        gradient_checkpoint(loss, cancel).backward()
+        compute_sync(torch, device)
+        if not bool(torch.isfinite(loss).item()) or not all(p.grad is not None and bool(torch.isfinite(p.grad).all().item()) for p in verifier.network.parameters()):
+            raise YuanError("语音验证器训练检查失败 / Speech verifier training check failed")
+        verifier.optimizer.step()
+        if not tensors_finite(torch, verifier.network.parameters()):
+            raise YuanError("语音验证器优化器检查失败 / Speech verifier optimizer check failed")
+        return {"verifier_feature_device": str(verifier.feature_device), "verifier_ctc_device": str(verifier.ctc_device),
+                "verifier_network_device": str(device), "training_components_verified": True, "dtype": "float32",
+                "training_probe_seconds": elapsed_seconds(began), "probe_frames": frames,
+                "audio_seconds_per_frame": timings[-1] / frames,
+                "probe_configuration": config, "conversation_verified": False}
+    finally:
+        network = verifier = optimizer = None
+        module = getattr(torch, device.type, None)
+        if module is not None and hasattr(module, "empty_cache"):
+            module.empty_cache()
+
 def runtime_probe_compute(state, emit, dependencies):
-    import io
     np, torch, sf, soxr = (dependencies[name] for name in ("numpy", "torch", "soundfile", "soxr"))
-    emit("probe", key="stage_probe_compute", check="owned_network_forward_backward")
     threads = torch.get_num_threads()
     try:
         torch.set_num_threads(execution_threads(dependencies["psutil"], AdaptivePolicy(state)))
-        model = NativeAudio.__new__(NativeAudio)
-        model.torch, model.width, model.layers, model.hop = torch, 16, 1, 8
-        network = model._build()
-        ids = torch.tensor([[1, 2]], dtype=torch.long)
-        prompt = network.condition(ids)
-        hidden = network.initial(prompt, 1)
-        hidden, encoder = network.encode(torch.zeros(1, 2, model.hop), hidden, 0)
-        output, ending, hidden = network.decode(network.begin, hidden, hidden)
-        loss = output.square().mean() + ending.square().mean()
-        if not bool(torch.isfinite(loss)):
-            raise YuanError("计算检查产生无效数值 / Compute check produced invalid values")
-        loss.backward()
-        gradients = [value.grad for value in network.parameters() if value.grad is not None]
-        if not gradients or not all(bool(torch.isfinite(value).all()) for value in gradients):
-            raise YuanError("模型反向计算检查失败 / Model backward check failed")
-        for branch in (network.prompt, network.frame_encoder, network.audio_encoder, network.dialogue_core, network.decoder_condition):
-            if not any(value.grad is not None and bool(value.grad.abs().sum() > 0) for value in branch.parameters()):
-                raise YuanError("模型条件分支梯度检查失败 / Model conditioning gradient check failed")
-        emit("probe", key="stage_probe_compute", check="checkpoint_roundtrip")
-        probe_root = safe_path(state, "tmp")
-        probe_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="probe-", dir=probe_root) as directory:
-            path = Path(directory) / "weights.pt"
-            torch.save(network.state_dict(), path)
-            restored = model._build()
-            restored.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=True)
-            if not all(torch.equal(left, restored.state_dict()[key]) for key, left in network.state_dict().items()):
-                raise YuanError("权重读写检查失败 / Checkpoint round-trip check failed")
+        devices = compute_devices(torch, state, emit)
+        validated = []
+        failures = []
+        for device, name in devices:
+            try:
+                emit("probe", key="stage_probe_compute", check="owned_network_forward_backward", device=str(device), name=name)
+                model = NativeAudio.__new__(NativeAudio)
+                model.torch, model.width, model.layers, model.hop = torch, 16, 1, 8
+                network = model._build().to(device)
+                ids = torch.tensor([[1, 2]], dtype=torch.long, device=device)
+                prompt = network.condition(ids)
+                hidden = network.initial(prompt, 1)
+                hidden, encoder = network.encode(torch.zeros(1, 2, model.hop, device=device), hidden, 0)
+                output, ending, hidden = network.decode(network.begin, hidden, hidden)
+                loss = output.square().mean() + ending.square().mean()
+                if not bool(torch.isfinite(loss).cpu()):
+                    raise YuanError("计算检查产生无效数值 / Compute check produced invalid values")
+                loss.backward()
+                compute_sync(torch, device)
+                gradients = [value.grad for value in network.parameters() if value.grad is not None]
+                if not gradients or not tensors_finite(torch, gradients):
+                    raise YuanError("模型反向计算检查失败 / Model backward check failed")
+                for branch in (network.prompt, network.frame_encoder, network.audio_encoder, network.dialogue_core, network.decoder_condition):
+                    if not any(value.grad is not None and bool((value.grad.abs().sum() > 0).cpu()) for value in branch.parameters()):
+                        raise YuanError("模型条件分支梯度检查失败 / Model conditioning gradient check failed")
+                optimizer = torch.optim.AdamW(network.parameters(), foreach=False)
+                optimizer.step()
+                compute_sync(torch, device)
+                if not tensors_finite(torch, network.parameters()):
+                    raise YuanError("优化器检查失败 / Optimizer check failed")
+                emit("probe", key="stage_probe_compute", check="checkpoint_roundtrip", device=str(device))
+                probe_root = safe_path(state, "tmp")
+                probe_root.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix="probe-", dir=probe_root) as directory:
+                    path = Path(directory) / "weights.pt"
+                    expected = {key: value.detach().cpu() for key, value in network.state_dict().items()}
+                    torch.save(expected, path)
+                    restored = model._build()
+                    restored.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=True)
+                    if not all(torch.equal(left, restored.state_dict()[key]) for key, left in expected.items()):
+                        raise YuanError("权重读写检查失败 / Checkpoint round-trip check failed")
+                components = probe_training_components(torch, np, state, AdaptivePolicy(state), device,
+                                                      {"rate": 8000, "hop": model.hop, "width": model.width, "layers": model.layers}, None, emit)
+                validated.append({"device": str(device), "name": name, "identity_sha256": compute_device_identity(torch, device, name), **components})
+            except (RuntimeError, OSError, ValueError, YuanError) as exc:
+                failures.append({"device": str(device), "name": name, "reason": concise_error(exc)})
+            finally:
+                if "network" in locals():
+                    del network
+        if not validated:
+            raise YuanFault("加速计算验证未完成，继续匹配运行组件 / Accelerator computation validation incomplete; matching runtime components", category="compatibility", code="compute_backend_failed", devices=failures)
+        atomic_json(Path(state) / "compute-verified.json", {"backend": os.environ.get("YUAN_COMPUTE_BACKEND", ""), "devices": validated, "failures": failures, "build_sha256": build_digest(), "at": time.time()})
         emit("probe", key="stage_probe_compute", check="audio_file_resampling")
         values = np.linspace(-0.1, 0.1, 256, dtype=np.float32)
         stream = io.BytesIO()
@@ -16585,9 +18036,10 @@ def runtime_probe_compute(state, emit, dependencies):
         resampled = soxr.resample(recovered, rate, rate * 2)
         if not np.array_equal(values, recovered) or not len(resampled) or not np.isfinite(resampled).all():
             raise YuanError("音频读写与重采样检查失败 / Audio file and resampling check failed")
-        emit("probe", key="runtime_verify", check="complete")
+        emit("probe", key="runtime_verify", check="complete", accelerators=validated)
     finally:
         torch.set_num_threads(threads)
+
 
 def verify_installed_files(runtime, entry, emit, cancel, budget=None):
     import importlib.metadata as metadata
@@ -16713,7 +18165,7 @@ def runtime_probe(state):
 def preparation_entry(workspace, publisher=False):
     workspace = Path(workspace).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
-    state = safe_path(workspace, STATE_NAME)
+    state = workspace_state(workspace)
     env = workspace_environment(workspace)
     os.environ.update(env)
     tempfile.tempdir = env["TMPDIR"]
@@ -16734,8 +18186,9 @@ def preparation_entry(workspace, publisher=False):
         return child.returncode
 
 def prepare_release_entry(state, publisher=False):
-    state = Path(state).resolve()
-    state.mkdir(parents=True, exist_ok=True)
+    state = ensure_workspace_identity(state)
+    if state != workspace_state(state.parent).resolve():
+        raise YuanFault("运行目录与当前版本不匹配 / Runtime directory does not match this build", category="integrity", code="workspace_build_mismatch")
     env = workspace_environment(state.parent)
     os.environ.update(env)
     tempfile.tempdir = env["TMPDIR"]
@@ -16810,7 +18263,7 @@ class BrowserApp:
         workspace = self.pending_workspace
         if not workspace.is_dir():
             raise YuanError("所选目录不存在 / Selected folder does not exist")
-        state = safe_path(workspace, STATE_NAME)
+        state = workspace_state(workspace)
         state.mkdir(parents=True, exist_ok=True)
         lease = WorkspaceLease(state / "workspace.lock")
         try:
@@ -16950,7 +18403,7 @@ class BrowserApp:
                     raise YuanError("当前设置无效 / Invalid settings")
                 self.language, self.prompt = data["language"], data["prompt"]
                 if self.workspace:
-                    atomic_json(safe_path(self.workspace, STATE_NAME) / "settings.json", {"language": self.language, "prompt": self.prompt})
+                    atomic_json(workspace_state(self.workspace) / "settings.json", {"language": self.language, "prompt": self.prompt})
                 if self.launcher:
                     self.launcher.send({"action": "language", "language": self.language})
             elif command == "start":
@@ -17191,6 +18644,9 @@ class TerminalApp(BrowserApp):
                         self.launcher.activity.close()
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--probe-device-memory":
+        memory_probe_entry(sys.argv[2], sys.argv[3])
+        return
     if len(sys.argv) == 3 and sys.argv[1] in ("--prepare", "--publisher-init", "--prepare-release", "--publisher-key"):
         try:
             if sys.argv[1] in ("--prepare", "--publisher-init"):
