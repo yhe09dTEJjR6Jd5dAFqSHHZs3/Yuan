@@ -19,6 +19,7 @@ import subprocess
 import platform
 import configparser
 import errno
+import traceback
 import types
 import copy
 import zipfile
@@ -62,6 +63,7 @@ TEXT = {
     "stage_native_audio": ("自动准备音频驱动", "Preparing the audio driver automatically"),
     "stage_import_zstandard": ("导入归档组件", "Importing the archive component"),
     "native_bootstrap": ("首次准备 · 自动创建运行环境与本地音频模型", "First setup · automatically preparing the runtime and local audio model"),
+    "deployment_preflight": ("部署预检查", "Deployment preflight"),
     "native_model_created": ("已按设备资源创建 Yuan 模型 · 尚未训练", "Yuan model created for this device · not trained yet"),
     "native_learning": ("自建模型学习中", "Native model learning"),
     "native_unverified": ("对话能力尚未通过验证", "Conversation ability is not yet verified"),
@@ -88,6 +90,7 @@ TEXT = {
     "retry_total_exhausted": ("启动失败总次数达到上限", "Total startup failure limit reached"),
     "retry_same_fault_exhausted": ("同类故障达到自动重试上限", "Automatic retry limit for this fault reached"),
     "retry_import_unchanged": ("单组件导入复检仍未完成，已停止重复启动", "Isolated import recheck also timed out; repeated startup stopped"),
+    "retry_nonretryable": ("已确认故障无法通过原样重试恢复；保留诊断并等待条件变化", "Confirmed fault cannot be resolved by unchanged retries; diagnostics retained pending changed conditions"),
     "retry_requires_change": ("等待运行条件变化；保留阻塞原因与已有进度", "Waiting for changed runtime conditions; blocker and progress retained"),
     "no_startup_task": ("当前没有正在执行的启动任务", "No startup task is currently running"),
     "waiting_conditions": ("仅检查恢复条件，不重复启动", "Checking recovery conditions only; startup is not repeated"),
@@ -101,11 +104,17 @@ TEXT = {
     "download_queued": ("等待下载", "Queued"),
     "download_retrying": ("保留进度，等待续传", "Partial retained; waiting to resume"),
     "download_files": ("已校验文件", "Verified files"),
-    "download_parallel": ("并行下载", "Parallel downloads"),
+    "download_parallel": ("接收文件", "Receiving files"),
+    "download_connections": ("接收连接", "Receiving connections"),
+    "download_waiting": ("等待续传", "Waiting to resume"),
+    "download_no_progress": ("连续无进展", "Consecutive stalls"),
+    "download_resumed": ("数据接收已恢复", "Data reception resumed"),
+    "runtime_transfer": ("运行组件传输反馈", "Runtime artifact transfer feedback"),
+    "runtime_metadata_fallback": ("元数据优先解析未完成 · 自动转入完整组件校验", "Metadata-first resolution did not complete; switching to full artifact verification"),
     "download_overall": ("下载合计", "Total downloaded"),
     "download_speed": ("合计速度", "Combined speed"),
     "download_current": ("当前文件", "Current file"),
-    "download_estimate": ("预计剩余下载时间", "Estimated download time left"),
+    "download_estimate": ("当前批次预计剩余下载时间", "Estimated download time left for this batch"),
     "download_estimate_unknown": ("剩余下载时间待估算", "Download time remaining not yet known"),
     "download_campaign_remaining": ("下载预算剩余", "Remaining download budget"),
     "retry_transfer_exhausted": ("累计下载预算已用尽，已保留可续传部分", "Cumulative download budget exhausted; resumable data retained"),
@@ -116,7 +125,7 @@ TEXT = {
     "download_verifying": ("校验中", "Verifying"),
     "download_complete": ("下载项校验完成", "Download item verified"),
     "download_connection_budget": ("连接期限", "Connection deadline"),
-    "download_attempts": ("下载尝试", "Download attempt"),
+    "download_attempts": ("下载轮次", "Transfer run"),
     "startup_resources": ("启动任务资源", "Startup task resources"),
     "not_measured": ("尚未检测", "Not measured yet"),
     "process_running": ("执行中", "Running"),
@@ -200,6 +209,11 @@ TEXT = {
     "owned_release_export": ("导出已验收自有模型", "Export accepted owned model"),
     "owned_release_exported": ("自有模型交付包已导出", "Owned model delivery package exported"),
     "context_trimmed": ("历史原始音频已按预算裁剪 · 当前语句继续编码", "Historical raw audio trimmed to budget · current utterance remains encoded"),
+    "preparation_local": ("自研模型正在训练与独立验收", "Owned model training and independent acceptance in progress"),
+    "preparation_evidence": ("正在补齐中英文独立验收证据", "Collecting independent bilingual acceptance evidence"),
+    "preparation_accepted": ("自研模型通过独立验收，可开始语音对话", "Owned model accepted; voice dialogue is available"),
+    "preparation_sources": ("正在自动寻找有授权的双语对话录音", "Discovering licensed bilingual recorded dialogue"),
+    "accelerator_partition": ("已将独立语音验证任务分配给另一块显卡", "Independent speech verification assigned to a secondary GPU"),
     "input_incomplete": ("本句收音或编码不完整 · 已跳过回复，请重新说一次", "Utterance capture or encoding incomplete · reply skipped; please repeat"),
     'process_reaped': ('进程已回收', 'Process reclaimed'),
     'attempt': ('新的启动尝试', 'New startup attempt'),
@@ -808,6 +822,8 @@ def fault_details(exc, stage=None):
         details.update(url=exc.geturl(), http_status=exc.code)
     if isinstance(exc, OSError) and (exc.errno in (errno.EACCES, errno.EPERM) or getattr(exc, "winerror", None) == 5):
         details["permission_denied"] = True
+    details.setdefault("traceback", "".join(traceback.TracebackException.from_exception(
+        exc, capture_locals=False).format(chain=True)))
     return {"category": category, "code": getattr(exc, "code", category + "_failure"), "stage": getattr(exc, "stage", None) or stage,
             "details": details, "reason": concise_error(exc)}
 
@@ -831,6 +847,8 @@ class StartupControl:
         self._transfer_used = 0.0
         self._transfer_started = None
         self._transfer_depth = 0
+        self._transfer_progress = {}
+        self.transfer_estimate = None
         self.lock = threading.RLock()
 
     @property
@@ -847,10 +865,24 @@ class StartupControl:
     def deadline(self):
         return self._deadline + min(self.transfer_seconds, self.transfer_used)
 
+    def observe_transfer(self, identity, current, total, speed, idle, margin):
+        if type(current) is not int or type(total) is not int or not 0 <= current <= total or total <= 0:
+            return
+        with self.lock:
+            previous = self._transfer_progress.setdefault(identity, current)
+            quantum = min(1024 * 1024, total)
+            if current <= previous or current - previous < quantum and current != total:
+                return
+            self._transfer_progress[identity] = current
+            if isinstance(speed, (int, float)) and not isinstance(speed, bool) and math.isfinite(speed) and speed > 0:
+                estimate = max(0.0, (total - current) / speed)
+                self.transfer_estimate = estimate if self.transfer_estimate is None else (self.transfer_estimate + estimate) / 2
+
     def transfer_fault(self):
         return YuanFault("累计下载预算已用尽，已保留可续传部分 / Cumulative download budget exhausted; resumable data retained",
                          category="timeout", code="startup_transfer_deadline", stage="engine_startup",
-                         transfer_seconds=self.transfer_seconds, transfer_used_seconds=self.transfer_used)
+                         transfer_seconds=self.transfer_seconds, transfer_used_seconds=self.transfer_used,
+                         estimated_remaining_seconds=self.transfer_estimate)
 
     def is_set(self):
         if self.cancel.is_set():
@@ -944,16 +976,25 @@ class TransferRate:
         return self.value
 
 class DownloadStorage:
-    def __init__(self, directory, reserve):
+    def __init__(self, directory, reserve, interval=1.0, clock=None):
         self.directory, self.reserve = Path(directory), max(0, int(reserve))
+        self.clock = clock or time.monotonic
+        self.interval = max(tick(), interval)
+        self.checked_at, self.free = -math.inf, 0
         self.lock = threading.Lock()
 
     def write(self, stream, block):
         with self.lock:
-            if shutil.disk_usage(self.directory).free < self.reserve + len(block):
+            now = self.clock()
+            if now - self.checked_at >= self.interval or self.free < self.reserve + len(block):
+                self.free = shutil.disk_usage(self.directory).free
+                self.checked_at = now
+            if self.free < self.reserve + len(block):
                 raise YuanFault("下载将占用保留空间，已暂停 / Download would consume reserved space; paused",
                                 category="storage", code="download_disk_reserve", stage="download", reserve_bytes=self.reserve)
-            if stream.write(block) != len(block):
+            written = stream.write(block)
+            self.free -= max(0, written or 0)
+            if written != len(block):
                 raise YuanFault("下载文件写入未完成 / Download file write was incomplete", category="storage", code="download_short_write", stage="download")
 
 class DownloadLedger:
@@ -967,27 +1008,47 @@ class DownloadLedger:
         self.rows = {item["sha256"]: {"artifact_id": item["sha256"], "file": item["filename"], "file_index": index + 1,
                                     "current": 0, "total": item.get("size"), "transfer_state": "download_queued", "verified": False}
                      for index, item in enumerate(artifacts)}
+        self.selected = next(iter(self.rows), None)
 
     def update(self, artifact_id, values, transferred=0, force=False):
         with self.lock:
-            row = self.rows[artifact_id]
-            row.update(values)
+            self.rows[artifact_id].update(values)
+            self.selected = artifact_id
+            self.publish(transferred, force)
+
+    def publish(self, transferred=0, force=False):
+        with self.lock:
+            rows = list(self.rows.values())
+            if not rows:
+                return
+            receiving = [value for value in rows if not value.get("verified") and value.get("transfer_state") == "download_receiving"]
+            connecting = [value for value in rows if not value.get("verified") and value.get("transfer_state") == "download_connecting"]
+            retrying = [value for value in rows if not value.get("verified") and value.get("transfer_state") == "download_retrying"]
+            verifying = [value for value in rows if not value.get("verified") and value.get("transfer_state") == "download_verifying"]
             speed = self.rate.advance(transferred)
             now = self.clock()
+            if not receiving:
+                self.rate.at, self.rate.pending, self.rate.value = now, 0, None
+                speed = None
             if not force and now - self.last_emit < self.interval:
                 return
             self.last_emit = now
-            rows = list(self.rows.values())
-            active = [value for value in rows if not value.get("verified") and value.get("transfer_state") != "download_queued"]
-            selected = row if row in active or not active else active[0]
+            pending = receiving or connecting or retrying or verifying
+            row = self.rows[self.selected]
+            selected = row if not pending or row in pending else pending[0]
             total = sum(value["total"] for value in rows) if all(value.get("total") is not None for value in rows) else None
             current = sum(value.get("current", 0) for value in rows)
             completed = sum(bool(value.get("verified")) for value in rows)
-            eta = 0.0 if completed == len(rows) else max(0, total - current) / speed if total is not None and speed and current < total else None
+            eta = 0.0 if completed == len(rows) else max(0, total - current) / speed if receiving and total is not None and speed and current < total else None
             snapshot = {**selected, "phase_id": self.phase_id, "key": "download", "unit": "bytes", "file_count": len(rows),
-                        "files_completed": completed, "active_files": len(active), "overall_current": current, "overall_total": total,
-                        "overall_speed": speed, "eta_seconds": eta,
+                        "files_completed": completed, "active_files": len(receiving), "connecting_files": len(connecting),
+                        "retrying_files": len(retrying), "verifying_files": len(verifying),
+                        "active_connections": sum(value.get("active_connections", 1) for value in receiving),
+                        "overall_current": current, "overall_total": total, "overall_speed": speed, "eta_seconds": eta,
+                        "snapshot_at": time.time(),
                         "last_progress_at": max((value.get("last_progress_at", 0) for value in rows), default=0)}
+            if not receiving:
+                snapshot["speed"] = None
             self.emit("progress", **snapshot)
 
 class NetworkConfig:
@@ -1361,6 +1422,7 @@ class StageSupervisor:
         self.ceiling = self.policy.number("supervision", "maximum_phase_seconds", 1800.0, self.minimum, 86400.0)
         self.initial = self.policy.number("supervision", "initial_phase_seconds", 120.0, self.minimum, self.ceiling)
         self.margin = self.policy.number("supervision", "history_margin", 4.0, 1.0, 32.0)
+        self.hard_ceiling = self.policy.number("supervision", "maximum_active_seconds", self.ceiling * self.margin, self.ceiling, 86400.0)
         self.period = self.policy.number("supervision", "heartbeat_seconds", 1.0, math.sqrt(tick()), 10.0)
         self.grace = self.policy.number("supervision", "shutdown_seconds", 60.0, self.minimum, self.ceiling)
         self.policy.save()
@@ -1377,6 +1439,10 @@ class StageSupervisor:
             measured = row.get("seconds")
             if isinstance(measured, (int, float)) and not isinstance(measured, bool) and math.isfinite(measured) and measured > 0:
                 baseline = max(self.initial, measured * self.margin)
+            failure = row.get("last_failure", {})
+            measured = failure.get("elapsed_lower_bound") if isinstance(failure, dict) else None
+            if isinstance(measured, (int, float)) and not isinstance(measured, bool) and math.isfinite(measured) and measured > 0:
+                baseline = max(baseline, measured * self.margin)
         if isinstance(suggested, (int, float)) and not isinstance(suggested, bool) and math.isfinite(suggested) and suggested > 0:
             baseline = max(baseline, suggested)
         return self.policy.number("supervision", key + "_seconds", baseline, self.minimum, self.ceiling)
@@ -1432,13 +1498,20 @@ class StageSupervisor:
                     if isinstance(suggested, bool) or not isinstance(suggested, (int, float)) or not math.isfinite(suggested) or suggested <= 0:
                         suggested = budget
                     stall = self.policy.number("supervision", key + "_stall_seconds", suggested, self.minimum, budget)
-                    self.active[identifier] = {**event, "started": now, "deadline": now + budget, "budget_seconds": budget,
-                                               "stall_seconds": stall, "stall_deadline": now + stall, "progress": -1}
+                    self.active[identifier] = {**event, "started": now, "deadline": now + budget,
+                                               "hard_deadline": now + max(budget, self.hard_ceiling), "budget_seconds": budget,
+                                               "stall_seconds": stall, "stall_deadline": now + stall, "progress": -1,
+                                               "last_progress_at": now}
             elif outcome == "progress":
                 row, current = self.active.get(identifier), event.get("current")
                 if row is not None and row["key"] == key and isinstance(current, (int, float)) and not isinstance(current, bool) and math.isfinite(current) and current > row["progress"]:
                     row["progress"] = current
+                    row["last_progress_at"] = now
                     row["stall_deadline"] = now + row["stall_seconds"]
+                    row["deadline"] = min(row["hard_deadline"], max(row["deadline"], now + row["budget_seconds"]))
+                    for name in ("component", "file", "checked_files", "checked_bytes", "cached_files"):
+                        if name in event:
+                            row[name] = event[name]
             elif outcome in ("complete", "cancelled", "failed"):
                 row = self.active.get(identifier)
                 if row is None or row["key"] != key:
@@ -1479,7 +1552,9 @@ class StageSupervisor:
             if now >= deadline(row):
                 details = {"operation_id": row.get("operation_id"), "pid": row.get("pid"), "elapsed": now - row["started"],
                            "budget_seconds": row["deadline"] - row["started"],
-                           "timeout_kind": "total" if now >= row["deadline"] else "stalled", "component": row.get("component")}
+                           "timeout_kind": "total" if now >= row["deadline"] else "stalled", "component": row.get("component"),
+                           "file": row.get("file"), "progress": row.get("progress"), "checked_files": row.get("checked_files"),
+                           "checked_bytes": row.get("checked_bytes")}
                 fault = EngineFault("阶段执行期限已到 / Stage deadline reached", category="timeout", code="stage_deadline" if now >= row["deadline"] else "stage_stalled", stage=row["key"], **details)
                 if not row.get("failure_recorded"):
                     row["failure_recorded"] = True
@@ -1492,7 +1567,9 @@ class StageSupervisor:
             row = min(rows, key=deadline) if rows else None
             if row:
                 self.emit("supervision", key=row["key"], operation_id=row.get("operation_id"), pid=row.get("pid"), elapsed=now - row["started"],
-                          remaining_seconds=max(0.0, deadline(row) - now), total_remaining_seconds=max(0.0, row["deadline"] - now), total=None)
+                          remaining_seconds=max(0.0, deadline(row) - now), total_remaining_seconds=max(0.0, row["deadline"] - now),
+                          component=row.get("component"), file=row.get("file"), checked_files=row.get("checked_files"),
+                          checked_bytes=row.get("checked_bytes"), cached_files=row.get("cached_files"), total=None)
             else:
                 self.emit("supervision", complete=True)
 
@@ -1679,7 +1756,7 @@ def process_activity(pid):
             return None
     return None
 
-def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_seconds=None, stall_seconds=None, timeout_seconds=None, stage=None, events=None, adaptive=False):
+def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_seconds=None, stall_seconds=None, timeout_seconds=None, stage=None, events=None, adaptive=False, progress_ceiling_seconds=None):
     check(cancel)
     process = spawn(command, env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1)
     result = deque(maxlen=256)
@@ -1694,6 +1771,8 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
         process.stdout.close()
         raise ValueError("Invalid process deadline")
     deadline = started + budget
+    progress_ceiling = started + max(budget, progress_ceiling_seconds if isinstance(progress_ceiling_seconds, (int, float)) and not isinstance(progress_ceiling_seconds, bool) and math.isfinite(progress_ceiling_seconds) else budget)
+    event_progress = {}
     previous_activity = None
     previous_progress = None
     progress_stages = set()
@@ -1760,6 +1839,11 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
                 if event is not None:
                     if event.get("type") == "error" and isinstance(event.get("fault"), dict):
                         child_fault = event["fault"]
+                    if event.get("type") == "operation" and event.get("outcome") == "progress":
+                        identifier, current = event.get("operation_id"), event.get("current")
+                        if isinstance(identifier, str) and isinstance(current, (int, float)) and not isinstance(current, bool) and math.isfinite(current) and current > event_progress.get(identifier, -math.inf):
+                            event_progress[identifier] = current
+                            deadline = min(progress_ceiling, max(deadline, last_output + budget))
                     events(event)
                 elif progress:
                     progress(redact(line))
@@ -1913,10 +1997,17 @@ class WheelCatalog:
             if not ranks or not is_digest(digest):
                 continue
             clean = urllib.parse.urlunsplit(parsed._replace(fragment=""))
-            candidates.append((min(ranks), filename, {"name": name, "version": parts[1], "url": clean, "filename": filename, "sha256": digest}))
+            artifact = {"name": name, "version": parts[1], "url": clean, "filename": filename, "sha256": digest}
+            metadata = row.get("data-core-metadata", row.get("data-dist-info-metadata", ""))
+            if isinstance(metadata, str) and re.fullmatch(r"sha256=[0-9a-fA-F]{64}", metadata):
+                artifact["metadata_sha256"] = metadata.split("=", 1)[1].lower()
+            candidates.append((min(ranks), filename, artifact))
         if not candidates:
             raise YuanFault("当前后端没有匹配的官方运行组件 / No matching official runtime wheel for this backend", category="compatibility", code="wheel_candidate_missing", backend=base, version=version)
-        return min(candidates, key=lambda value: value[:2])[2]
+        selected = dict(min(candidates, key=lambda value: value[:2])[2])
+        selected["sources"] = list(dict.fromkeys(value[2]["url"] for value in candidates
+                                                if value[1] == selected["filename"] and value[2]["sha256"] == selected["sha256"]))
+        return selected
 
     @staticmethod
     def read(network, url, cancel):
@@ -2000,7 +2091,7 @@ class RuntimeInstaller:
         self.emit("progress", **self.progress)
 
     def command(self, command, report=False, transfer=False):
-        is_probe = any(flag in command for flag in ("--probe", "--probe-import", "--verify-install"))
+        is_probe = any(flag in command for flag in ("--probe", "--probe-fast", "--probe-import", "--verify-install"))
         def receive(event):
             self.supervisor.observe(event)
             if event.get("type") not in ("error", "exit", "ready", "status"):
@@ -2014,9 +2105,9 @@ class RuntimeInstaller:
         budget = self.supervisor.budget(self.phase, self.stall_seconds)
         env = dict(self.env)
         if is_probe:
-            names = (command[-1],) if "--probe-import" in command else () if "--verify-install" in command else RUNTIME_MODULES
+            names = (command[-1],) if "--probe-import" in command else () if "--verify-install" in command or "--probe-fast" in command else RUNTIME_MODULES
             budgets = {"stage_import_" + name: self.supervisor.budget("stage_import_" + name) for name in names}
-            if "--probe" in command:
+            if "--probe" in command or "--probe-fast" in command:
                 budgets["stage_probe_compute"] = self.supervisor.budget("stage_probe_compute")
             if "--verify-install" in command:
                 budgets["runtime_inventory"] = budget
@@ -2032,7 +2123,8 @@ class RuntimeInstaller:
             with self.cancel.transfer() if transfer and isinstance(self.cancel, StartupControl) else nullcontext():
                 result = run_command(command, env, self.cancel, self.report if report else None, heartbeat=heartbeat,
                                      heartbeat_seconds=self.heartbeat_seconds, stall_seconds=None if is_probe else self.stall_seconds,
-                                     timeout_seconds=budget, stage=self.phase, events=receive if is_probe else None, adaptive=not is_probe)
+                                     timeout_seconds=budget, stage=self.phase, events=receive if is_probe else None, adaptive=not is_probe,
+                                     progress_ceiling_seconds=max(budget, self.supervisor.hard_ceiling + self.supervisor.grace) if is_probe else None)
             self.emit("runtime_message", stage=self.phase, command=[str(value) for value in command], returncode=0, elapsed=time.monotonic()-began)
             return result
         except YuanFault as exc:
@@ -2191,6 +2283,12 @@ class RuntimeInstaller:
         for item in entry["artifacts"]:
             if not isinstance(item, dict) or not re.fullmatch(r"[a-z0-9]+(?:[-.][a-z0-9]+)*", str(item.get("name", ""))) or not re.fullmatch(r"[a-zA-Z0-9.!+_-]+", str(item.get("version", ""))) or not is_digest(item.get("sha256")):
                 raise YuanError("运行组件缺少精确版本或 SHA256 / Runtime artifact lacks an exact version or SHA256")
+            metadata_hash = item.get("metadata_sha256")
+            if metadata_hash is not None and not is_digest(metadata_hash):
+                raise InvalidDownload("运行组件元数据完整性摘要无效 / Invalid runtime metadata integrity digest")
+            sources = item.get("sources", [])
+            if not isinstance(sources, list) or not all(isinstance(source, str) for source in sources):
+                raise InvalidDownload("运行组件备用来源无效 / Invalid runtime artifact alternate sources")
             size = item.get("size")
             if size is not None and (isinstance(size, bool) or not isinstance(size, int) or size <= 0):
                 raise YuanError("运行组件大小无效 / Invalid runtime artifact size")
@@ -2228,13 +2326,28 @@ class RuntimeInstaller:
             version = str(metadata.get("version", ""))
             if urllib.parse.urlsplit(url).scheme == "file":
                 clean = urllib.parse.urlunsplit(urllib.parse.urlsplit(url)._replace(fragment=""))
-                artifact = getattr(self, "local_artifacts", {}).get(clean)
-                if not artifact or artifact["name"] != name or artifact["version"] != version or artifact["sha256"] != digest:
-                    raise YuanFault("本地组件与已核验来源不一致 / Local component differs from its verified source", category="integrity", code="local_artifact_mismatch")
+                snapshot = getattr(self, "metadata_artifacts", {}).get(clean)
+                if snapshot is not None:
+                    artifact = snapshot["artifact"]
+                    if (snapshot["sha256"] != digest or artifact["name"] != name or artifact["version"] != version
+                            or digest_file(snapshot["path"], self.cancel) != digest):
+                        raise YuanFault("解析专用元数据与已核验记录不一致 / Resolution-only metadata differs from its verified record",
+                                        category="integrity", code="resolution_metadata_mismatch")
+                else:
+                    artifact = getattr(self, "local_artifacts", {}).get(clean)
+                    if not artifact or artifact["name"] != name or artifact["version"] != version or artifact["sha256"] != digest:
+                        raise YuanFault("本地组件与已核验来源不一致 / Local component differs from its verified source", category="integrity", code="local_artifact_mismatch")
                 artifacts.append(dict(artifact))
             else:
-                artifacts.append({"name": name, "version": version, "url": url,
-                                  "filename": urllib.parse.unquote(Path(urllib.parse.urlparse(url).path).name), "sha256": digest})
+                selected = getattr(self, "selected_artifacts", {}).get(name)
+                if selected is not None:
+                    if selected["version"] != version or selected["sha256"] != digest:
+                        raise YuanFault("依赖解析替换了已锁定组件 / Dependency resolution replaced the pinned artifact",
+                                        category="integrity", code="resolved_artifact_mismatch", component=name)
+                    artifacts.append(dict(selected))
+                else:
+                    artifacts.append({"name": name, "version": version, "url": url,
+                                      "filename": urllib.parse.unquote(Path(urllib.parse.urlparse(url).path).name), "sha256": digest})
         artifacts.sort(key=lambda item: item["name"])
         entry = {"platform": platform_value, "packages": [{"name": item["name"], "version": item["version"]} for item in artifacts], "artifacts": artifacts}
         return self._validate_entry(entry, platform_value)
@@ -2254,7 +2367,7 @@ class RuntimeInstaller:
         self.stage("runtime_inventory")
         self.command([str(python), "-B", str(Path(__file__).resolve()), "--verify-install", str(self.state)], report=True)
 
-    def _probe(self, python, entry):
+    def _probe(self, python, entry, fast=False):
         self.supervisor.flush_history(force=True)
         self.supervisor = StageSupervisor(self.state, self.emit, identity=runtime_identity(self.state, entry))
         expected = {item["name"]: item["version"] for item in entry["packages"]}
@@ -2279,7 +2392,19 @@ class RuntimeInstaller:
                 raise
             self.emit("notice", key="runtime_import_diagnostic_passed", component=component)
         try:
-            self.command([str(python), "-B", str(Path(__file__).resolve()), "--probe", str(self.state)], report=True)
+            certificate = read_json(self.state / "compute-verified.json")
+            accelerated = (fast and certificate.get("build_sha256") == build_digest()
+                           and certificate.get("backend") == self.compute_backend and certificate.get("devices"))
+            if accelerated:
+                try:
+                    self.command([str(python), "-B", str(Path(__file__).resolve()), "--probe-fast", str(self.state)], report=True)
+                except YuanFault as exc:
+                    if failure_category(exc) not in ("integrity", "compatibility"):
+                        raise
+                    self.emit("notice", key="runtime_import_diagnostic", component="compute", reason=concise_error(exc))
+                    self.command([str(python), "-B", str(Path(__file__).resolve()), "--probe", str(self.state)], report=True)
+            else:
+                self.command([str(python), "-B", str(Path(__file__).resolve()), "--probe", str(self.state)], report=True)
         except YuanFault as exc:
             atomic_json(failure_path, {"identity": identity, "fault": fault_event(exc), "at": time.time()}, self.cancel)
             raise
@@ -2332,17 +2457,19 @@ class RuntimeInstaller:
         self._verify_hashes({item["name"]: item["sha256"] for item in expected["artifacts"]}, {item["name"]: item["sha256"] for item in entry["artifacts"]})
         self._verify_installation(python, entry)
         self.stage("runtime_verify")
-        self._probe(python, entry)
+        self._probe(python, entry, fast=True)
+        self.emit("notice", key="runtime_install_reused", executable=str(python))
         return python
 
-    def _download(self, artifact, position, total_files, network=None, ledger=None, storage=None, cancel=None):
+    def _download(self, artifact, position, total_files, network=None, ledger=None, storage=None, cancel=None, connections=1):
         network = network if network is not None else self.network
         cancel = cancel if cancel is not None else self.cancel
         target = safe_path(self.state, "runtime-artifacts/" + artifact["sha256"] + "/" + artifact["filename"])
         context = {"phase_id": self.phase_id, "artifact_id": artifact["sha256"], "file": artifact["filename"]}
+        saved = network.partial_size(target, artifact.get("size"), artifact["sha256"])
         progress = {**context, "key": "download", "file_index": position, "file_count": total_files,
-                    "current": 0, "total": artifact.get("size"), "unit": "bytes", "speed": None,
-                    "transfer_state": "download_connecting", "last_progress_at": time.time()}
+                    "current": saved, "total": artifact.get("size"), "unit": "bytes", "speed": None,
+                    "transfer_state": "download_connecting", "last_progress_at": 0, "active_connections": 0}
         def publish(transferred=0, force=False):
             if ledger is not None:
                 ledger.update(artifact["sha256"], progress, transferred=transferred, force=force)
@@ -2352,13 +2479,29 @@ class RuntimeInstaller:
         publish(force=True)
         def complete(path, cached=False):
             check(cancel)
+            metadata_hash = artifact.get("metadata_sha256")
+            if metadata_hash:
+                with zipfile.ZipFile(path) as archive:
+                    names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA") and name.count("/") == 1]
+                    if len(names) != 1 or archive.getinfo(names[0]).file_size > 64 * 1024 * 1024:
+                        raise InvalidDownload("运行组件元数据完整性结构无效 / Invalid runtime metadata integrity structure")
+                    digest = hashlib.sha256()
+                    with archive.open(names[0]) as stream:
+                        while True:
+                            check(cancel)
+                            block = stream.read(1024 * 1024)
+                            if not block:
+                                break
+                            digest.update(block)
+                    if digest.hexdigest() != metadata_hash:
+                        raise InvalidDownload("组件内元数据与解析用完整性摘要不一致 / Artifact metadata differs from the resolution integrity digest")
             info = path.stat()
             size = info.st_size
             with self.network.host_lock:
                 if not hasattr(self, "artifact_checks"):
                     self.artifact_checks = {}
                 self.artifact_checks[str(path)] = (artifact["sha256"], size, info.st_mtime_ns, info.st_ctime_ns)
-            progress.update(current=size, total=size, cached=cached, verified=True, transfer_state="download_complete", last_progress_at=time.time())
+            progress.update(current=size, total=size, cached=cached, verified=True, transfer_state="download_complete", active_connections=0, speed=None, last_progress_at=time.time())
             publish(force=True)
             self.emit("download_complete", key="download_complete", component="runtime_download", **context, cached=cached)
             self.policy.save()
@@ -2371,50 +2514,80 @@ class RuntimeInstaller:
                 verified = getattr(self, "artifact_checks", {}).get(str(target)) == stamp
             if (artifact.get("size") is None or info.st_size == artifact["size"]) and (verified or digest_file(target, cancel) == artifact["sha256"]):
                 return complete(target, True)
-        for attempt in range(self.download_attempts):
+        sources = [artifact["url"]]
+        for source in artifact.get("sources", []):
+            parsed = urllib.parse.urlsplit(source)
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                    or urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]) != artifact["filename"]):
+                raise InvalidDownload("运行组件备用来源无效 / Invalid runtime artifact alternate source")
+            clean = urllib.parse.urlunsplit(parsed._replace(fragment=""))
+            if clean not in sources:
+                sources.append(clean)
+        attempt = stalled = source_index = 0
+        highwater = saved
+        resuming = [False]
+        rate = TransferRate(self.heartbeat_seconds)
+        while True:
             check(cancel)
-            previous = [None, -math.inf]
-            rate = TransferRate(self.heartbeat_seconds)
-            progress.update(download_attempt=attempt + 1, download_attempts=self.download_attempts, speed=None, verified=False)
+            attempt += 1
+            previous = [None]
+            progress.update(download_attempt=attempt, download_attempts=self.download_attempts, stalled_attempts=stalled, speed=None, verified=False)
             def state_changed(key, **values):
                 progress.update(transfer_state="download_" + key, **values)
+                if key != "receiving":
+                    progress["speed"] = None
                 publish(force=True)
+                if values.get("http_status") is not None:
+                    self.emit("runtime_transfer", component="runtime_download", **context, **values)
             def report(done, total):
-                now = time.monotonic()
                 delta = max(0, done - previous[0]) if previous[0] is not None else 0
                 previous[0] = done
-                progress.update(current=done, total=total, speed=rate.advance(delta))
+                progress.update(current=max(saved, done), total=total, speed=rate.advance(delta))
                 if delta:
                     progress["last_progress_at"] = time.time()
+                    if resuming[0]:
+                        resuming[0] = False
+                        self.emit("download_resumed", key="download_resumed", component="runtime_download", **context, transferred_bytes=delta)
                 publish(transferred=delta)
-                if now - previous[1] >= self.heartbeat_seconds:
-                    self.resources()
-                    previous[1] = now
+            source = sources[source_index]
             try:
                 disk = shutil.disk_usage(self.state)
                 reserve = storage.reserve if storage is not None else self.policy.integer("runtime", "disk_reserve_bytes", 0, 0, disk.total)
-                budget = max(0, disk.free - reserve)
-                part = target.with_name(target.name + ".partial")
-                if part.is_file() and not part.is_symlink():
-                    budget += part.stat().st_size
-                path = network.download(artifact["url"], target, expected_size=artifact.get("size"), expected_hash=artifact["sha256"],
-                                        max_bytes=budget, progress=report, events=state_changed, storage=storage)
+                budget = max(0, disk.free - reserve) + network.partial_size(target, artifact.get("size"), artifact["sha256"])
+                path = network.download(source, target, expected_size=artifact.get("size"), expected_hash=artifact["sha256"],
+                                        max_bytes=budget, progress=report, events=state_changed, storage=storage, connections=connections)
                 return complete(path)
             except Cancelled:
                 raise
             except (OSError, YuanError) as exc:
                 if isinstance(exc, YuanFault):
-                    exc.details.update(artifact_id=artifact["sha256"], file=artifact["filename"])
-                if attempt + 1 >= self.download_attempts or failure_category(exc) != "network":
+                    exc.details.update(artifact_id=artifact["sha256"], file=artifact["filename"], url=source)
+                if failure_category(exc) != "network":
                     raise
-                network.note_failure(artifact["url"])
-                delay = network.connection_timeout(artifact["url"]) * math.sqrt(attempt + 1)
-                progress.update(transfer_state="download_retrying", speed=None)
+                check(cancel)
+                current = network.partial_size(target, artifact.get("size"), artifact["sha256"])
+                quantum = min(io.DEFAULT_BUFFER_SIZE, artifact.get("size") or io.DEFAULT_BUFFER_SIZE)
+                advanced = current - highwater >= quantum
+                if advanced:
+                    highwater, stalled = current, 0
+                else:
+                    stalled += 1
+                saved = current
+                network.note_failure(source)
+                resuming[0] = True
+                progress.update(current=current, transfer_state="download_retrying", speed=None, active_connections=0, stalled_attempts=stalled)
                 publish(force=True)
-                self.emit("notice", key="retry", component="runtime_download", **context, attempt=attempt + 1, reason=concise_error(exc), retry_seconds=delay)
+                if stalled >= self.download_attempts:
+                    raise YuanFault("连续恢复未取得有效数据，将保留断点等待来源恢复 / Consecutive recoveries made no useful progress; partials retained while waiting for the source",
+                                    category="network", code="network_download_stalled", stage=self.phase, url=source,
+                                    artifact_id=artifact["sha256"], file=artifact["filename"], received_bytes=current, attempts=attempt, stalled_attempts=stalled) from exc
+                delay = (min(network.connection_timeout(source), max(self.heartbeat_seconds, network.latency)) if advanced else
+                         min(network.timeout_ceiling, network.connection_timeout(source) * math.sqrt(max(1, stalled))))
+                source_index = (source_index + 1) % len(sources)
+                self.emit("notice", key="retry", component="runtime_download", **context, attempt=attempt, stalled_attempts=stalled,
+                          reason=concise_error(exc), retry_seconds=delay, source=urllib.parse.urlsplit(sources[source_index]).hostname)
                 if cancel.wait(delay):
                     raise Cancelled()
-        raise YuanError("运行组件下载失败 / Runtime download failed")
 
     def _download_all(self, artifacts):
         if not artifacts:
@@ -2424,34 +2597,113 @@ class RuntimeInstaller:
         connections = self.policy.integer("network", "pending_connections", 2, 1, 16)
         workers = self.policy.integer("runtime", "download_workers", min(connections, max(1, math.isqrt(os.cpu_count() or 1))), 1, min(connections, len(artifacts)))
         disk = shutil.disk_usage(self.state)
-        storage = DownloadStorage(self.state, self.policy.integer("runtime", "disk_reserve_bytes", 0, 0, disk.total))
+        storage = DownloadStorage(self.state, self.policy.integer("runtime", "disk_reserve_bytes", 0, 0, disk.total), self.heartbeat_seconds)
         ledger = DownloadLedger(artifacts, self.phase_id, self.emit, self.heartbeat_seconds)
         self.policy.save()
         output = [None] * len(artifacts)
+        active, active_lock = [0], threading.Lock()
+        stream_gate = threading.BoundedSemaphore(connections)
+        def capacity():
+            with active_lock:
+                return max(1, connections - active[0] + 1)
         def fetch(index, artifact):
             check(cancel)
-            network = Network(cancel, self.policy, self.network_config)
-            return self._download(artifact, index + 1, len(artifacts), network=network, ledger=ledger, storage=storage, cancel=cancel)
+            with active_lock:
+                active[0] += 1
+            try:
+                network = Network(cancel, self.policy, self.network_config)
+                network.range_capacity = capacity
+                network.stream_gate = stream_gate
+                return self._download(artifact, index + 1, len(artifacts), network=network, ledger=ledger, storage=storage, cancel=cancel, connections=connections)
+            finally:
+                with active_lock:
+                    active[0] -= 1
+        monitor_stop = threading.Event()
+        monitor_errors = []
+        def monitor():
+            try:
+                while not monitor_stop.wait(self.heartbeat_seconds):
+                    if cancel.is_set():
+                        return
+                    ledger.publish(force=True)
+                    self.resources()
+            except BaseException as exc:
+                monitor_errors.append(exc)
+                stop.set()
+        watcher = threading.Thread(target=monitor, daemon=True, name="YuanDownloadStatus")
         transfer = self.cancel.transfer() if isinstance(self.cancel, StartupControl) else nullcontext()
         with transfer:
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="YuanDownload") as executor:
-                futures = {}
-                try:
-                    for index, artifact in enumerate(artifacts):
-                        check(cancel)
-                        futures[executor.submit(fetch, index, artifact)] = index
-                    for future in as_completed(futures):
-                        check(cancel)
-                        output[futures[future]] = future.result()
-                except BaseException:
-                    stop.set()
-                    for future in futures:
-                        future.cancel()
-                    raise
+            watcher.start()
+            try:
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="YuanDownload") as executor:
+                    futures = {}
+                    try:
+                        for index, artifact in enumerate(artifacts):
+                            check(cancel)
+                            futures[executor.submit(fetch, index, artifact)] = index
+                        for future in as_completed(futures):
+                            output[futures[future]] = future.result()
+                            check(cancel)
+                    except BaseException:
+                        stop.set()
+                        for future in futures:
+                            future.cancel()
+                        if monitor_errors:
+                            raise monitor_errors[0]
+                        raise
+            finally:
+                monitor_stop.set()
+                watcher.join()
         check(self.cancel)
+        if monitor_errors:
+            raise monitor_errors[0]
+        ledger.publish(force=True)
         return output
 
-    def torch_requirement(self, python, runtime):
+    def _metadata_requirement(self, artifact, runtime):
+        from email.parser import BytesParser
+        self.stage("runtime_resolve")
+        directory = safe_path(runtime, "resolution-metadata/" + artifact["metadata_sha256"])
+        directory.mkdir(parents=True, exist_ok=True)
+        metadata_path = safe_path(directory, "METADATA")
+        parsed = urllib.parse.urlsplit(artifact["url"])
+        url = urllib.parse.urlunsplit(parsed._replace(path=parsed.path + ".metadata", fragment=""))
+        self.network.download(url, metadata_path, expected_hash=artifact["metadata_sha256"], max_bytes=64 * 1024 * 1024)
+        data = metadata_path.read_bytes()
+        message = BytesParser().parsebytes(data)
+        names, versions = message.get_all("Name", []), message.get_all("Version", [])
+        if (len(names) != 1 or len(versions) != 1 or re.sub(r"[-_.]+", "-", names[0].strip()).lower() != artifact["name"]
+                or versions[0].strip() != artifact["version"]):
+            raise InvalidDownload("组件元数据完整性标识与选定版本不一致 / Metadata integrity identity differs from the selected artifact")
+        filename = artifact["filename"]
+        fields = filename[:-4].split("-")
+        if not filename.endswith(".whl") or len(fields) not in (5, 6):
+            raise InvalidDownload("组件元数据的文件标签无效 / Invalid wheel tags for artifact metadata")
+        snapshot = safe_path(directory, filename)
+        information = fields[0] + "-" + fields[1] + ".dist-info/"
+        descriptor = "Wheel-Version: 1.0\nRoot-Is-Purelib: " + ("true" if fields[-1] == "any" else "false") + "\n"
+        descriptor += "".join("Tag: " + py + "-" + abi + "-" + platform_tag + "\n" for py in fields[-3].split(".") for abi in fields[-2].split(".") for platform_tag in fields[-1].split("."))
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix=".resolve-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w+b") as stream:
+                with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr(information + "METADATA", data)
+                    archive.writestr(information + "WHEEL", descriptor)
+                    archive.writestr(information + "RECORD", "")
+                stream.flush()
+                os.fsync(stream.fileno())
+            check(self.cancel)
+            os.replace(temporary, snapshot)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        digest = digest_file(snapshot, self.cancel)
+        uri = snapshot.resolve().as_uri()
+        self.metadata_artifacts = getattr(self, "metadata_artifacts", {})
+        self.metadata_artifacts[uri] = {"artifact": dict(artifact), "sha256": digest, "path": snapshot}
+        return artifact["name"] + " @ " + uri + "#sha256=" + digest
+
+    def torch_requirement(self, python, runtime, metadata_first=True):
         backend = self.compute_backend or ("cpu" if platform.system() in ("Linux", "Windows") else "native")
         version = self.torch_version(backend)
         if backend == "native":
@@ -2480,6 +2732,17 @@ class RuntimeInstaller:
         if parsed.hostname not in ("download.pytorch.org", "download-r2.pytorch.org") or not parsed.path.startswith("/whl/" + channel + "/") or artifact.get("name") != "torch" or str(artifact.get("version", "")).split("+", 1)[0] != version:
             path.unlink(missing_ok=True)
             raise YuanFault("组件缓存与所选后端不一致 / Component cache differs from the selected backend", category="integrity", code="wheel_catalog_identity")
+        self.selected_artifacts = getattr(self, "selected_artifacts", {})
+        self.selected_artifacts[artifact["name"]] = dict(artifact)
+        if metadata_first and is_digest(artifact.get("metadata_sha256")):
+            try:
+                return self._metadata_requirement(artifact, runtime)
+            except Cancelled:
+                raise
+            except (OSError, YuanError) as exc:
+                if failure_category(exc) not in ("network", "resolution"):
+                    raise
+                self.emit("runtime_message", key="runtime_metadata_fallback", reason=concise_error(exc))
         self.stage("download")
         local = self._download_all([artifact])[0]
         self.local_artifacts = getattr(self, "local_artifacts", {})
@@ -2826,6 +3089,31 @@ class HTTPSOnly(urllib.request.HTTPRedirectHandler):
             raise YuanFault("拒绝非加密重定向 / Refused an insecure redirect", category="configuration", code="insecure_redirect")
         return super().redirect_request(request, fp, code, message, headers, newurl)
 
+class NetworkResponse:
+    def __init__(self, response, gate):
+        self.response, self.gate = response, gate
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def __getattr__(self, name):
+        return getattr(self.response, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        try:
+            self.response.close()
+        finally:
+            self.gate.release()
+
 class Network:
     connection_registry = {}
     connection_registry_lock = threading.Lock()
@@ -2950,7 +3238,23 @@ class Network:
             raise YuanFault("拒绝非加密重定向 / Refused an insecure redirect", category="configuration", code="insecure_redirect")
         return result
 
-    def blocks(self, response, deadline=None):
+    def response(self, url, headers=None, deadline=None):
+        gate = getattr(self, "stream_gate", None)
+        if gate is None:
+            return self.request(url, headers, deadline=deadline)
+        while not gate.acquire(timeout=math.sqrt(tick())):
+            check(self.cancel)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise YuanFault("下载连接排队期限已到 / Download connection queue deadline reached",
+                                category="network", code="network_stream_queue_deadline", url=url)
+        try:
+            check(self.cancel)
+            return NetworkResponse(self.request(url, headers, deadline=deadline), gate)
+        except BaseException:
+            gate.release()
+            raise
+
+    def blocks(self, response, deadline=None, block_bytes=1024 * 1024):
         stopped = threading.Event()
         chunks = queue.Queue(maxsize=2)
         def send(value):
@@ -2964,7 +3268,7 @@ class Network:
             try:
                 reader = getattr(response, "read1", response.read)
                 while not stopped.is_set():
-                    block = reader(1024 * 1024)
+                    block = reader(block_bytes)
                     if not block:
                         break
                     send(block)
@@ -3028,6 +3332,50 @@ class Network:
             check(self.cancel)
             yield
 
+    def advance_transfer(self, identity, current, total, speed):
+        pending, seen = [self.cancel], set()
+        while pending:
+            cancel = pending.pop()
+            if cancel is None or id(cancel) in seen:
+                continue
+            seen.add(id(cancel))
+            if isinstance(cancel, StartupControl):
+                cancel.observe_transfer(identity, current, total, speed, self.read_idle_seconds, self.transfer_margin)
+            elif isinstance(cancel, AnyCancel):
+                pending.extend(cancel.events)
+
+    def probe(self, url, deadline=None):
+        limit = time.monotonic() + self.connection_timeout(url) + self.read_idle_seconds
+        deadline = min(deadline, limit) if deadline is not None else limit
+        size = io.DEFAULT_BUFFER_SIZE
+        with self.request(url, {"Range": f"bytes=0-{size - 1}", "Accept-Encoding": "identity"}, deadline=deadline) as response:
+            status = getattr(response, "status", 200)
+            if status not in (200, 206) or response.headers.get("Content-Encoding", "identity").strip().lower() not in ("", "identity"):
+                raise YuanFault("来源未提供可读取的原始数据 / Source did not provide readable original data",
+                                category="network", code="network_probe_response", url=url, http_status=status)
+            expected = response.headers.get("Content-Length")
+            expected = int(expected) if expected is not None and re.fullmatch(r"[0-9]+", expected.strip()) else None
+            if status == 206:
+                match = re.fullmatch(r"bytes 0-([0-9]+)/([0-9]+|\*)", response.headers.get("Content-Range", "").strip())
+                if match is None or int(match[1]) >= size or expected is not None and expected != int(match[1]) + 1:
+                    raise YuanFault("来源范围读取检查未通过 / Source range-read check failed", category="network", code="network_probe_range", url=url)
+                expected = int(match[1]) + 1
+            needed = min(size, expected) if expected is not None else size
+            received = 0
+            blocks = self.blocks(response, deadline=deadline, block_bytes=size)
+            try:
+                for block in blocks:
+                    received += len(block)
+                    if received >= needed:
+                        break
+            finally:
+                blocks.close()
+            check(self.cancel)
+            if received <= 0 or received < needed:
+                raise YuanFault("来源响应头可达，但数据读取未完成 / Source headers are reachable but data reading failed",
+                                category="network", code="network_probe_incomplete", url=url, received_bytes=received)
+            return {"url": response.geturl(), "http_status": status, "received_bytes": received, "range_supported": status == 206}
+
     def json(self, url, with_headers=False):
         with self.transfer():
             return self._json(url, with_headers=with_headers)
@@ -3059,25 +3407,273 @@ class Network:
             self.policy.observe("network_manifest", key, elapsed_seconds(began))
         return (result, headers) if with_headers else result
 
-    def download(self, url, target, expected_size=None, expected_hash=None, progress=None, max_bytes=None, algorithm=None, events=None, storage=None):
+    def download(self, url, target, expected_size=None, expected_hash=None, progress=None, max_bytes=None, algorithm=None, events=None, storage=None, connections=1):
         with self.transfer():
-            return self._download(url, target, expected_size, expected_hash, progress, max_bytes, algorithm, events, storage)
+            target = Path(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            storage = storage or DownloadStorage(target.parent, 0)
+            ranged = (type(expected_size) is int and expected_size > 1024 * 1024 * max(1, connections)
+                      and is_digest(expected_hash) and algorithm in (None, "sha256") and connections > 1)
+            if ranged and not getattr(self, "range_disabled", False):
+                self._download_ranges(url, target, expected_size, expected_hash, progress, max_bytes, events, storage, connections)
+            result = self._download(url, target, expected_size, expected_hash, progress, max_bytes, algorithm, events, storage)
+            if is_digest(expected_hash):
+                self._clear_ranges(target, expected_hash)
+            return result
+
+    @staticmethod
+    def partial_size(target, expected_size=None, expected_hash=None):
+        target = Path(target)
+        paths = (target.with_name(target.name + ".partial"), target.with_name(target.name + ".restart"))
+        if any(path.is_symlink() for path in paths):
+            raise InvalidDownload("拒绝链接形式的下载断点 / Refusing a linked download partial")
+        prefix = max((path.stat().st_size for path in paths if path.is_file()), default=0)
+        current = prefix
+        if is_digest(expected_hash):
+            directory = target.with_name(target.name + ".ranges-" + expected_hash)
+            if directory.is_symlink():
+                raise InvalidDownload("拒绝链接形式的下载分段 / Refusing linked download ranges")
+            if directory.is_dir():
+                for path in directory.iterdir():
+                    match = re.fullmatch(r"([0-9]+)-([0-9]+)\.part", path.name)
+                    if path.is_symlink() or not path.is_file() or match is None:
+                        raise InvalidDownload("下载分段记录无效 / Invalid download range record")
+                    start, end = int(match[1]), int(match[2])
+                    current += max(0, min(end, start + path.stat().st_size) - max(prefix, start))
+        return min(current, expected_size) if type(expected_size) is int else current
+
+    def _download_ranges(self, url, target, total, digest, progress, max_bytes, events, storage, connections):
+        target = Path(target)
+        paths = (target.with_name(target.name + ".partial"), target.with_name(target.name + ".restart"))
+        directory = target.with_name(target.name + ".ranges-" + digest)
+        if any(path.is_symlink() for path in (target, directory, *paths)):
+            raise InvalidDownload("拒绝链接形式的下载分段 / Refusing linked download ranges")
+        if target.is_file() or any(path.is_file() and path.stat().st_size >= total for path in paths):
+            return
+        if max_bytes is not None and total > max_bytes:
+            raise YuanError("下载超过当前资源预算 / Download exceeds the current resource budget")
+        directory.mkdir(parents=True, exist_ok=True)
+        part = max(paths, key=lambda path: path.stat().st_size if path.is_file() else 0)
+        prefix = [part.stat().st_size if part.is_file() else 0]
+        rows = {}
+        for path in directory.iterdir():
+            match = re.fullmatch(r"([0-9]+)-([0-9]+)\.part", path.name)
+            if path.is_symlink() or not path.is_file() or match is None:
+                raise InvalidDownload("下载分段记录无效 / Invalid download range record")
+            start, end = int(match[1]), int(match[2])
+            size = path.stat().st_size
+            if not 0 <= start < end <= total or size > end - start:
+                raise InvalidDownload("下载分段边界无效 / Invalid download range boundaries")
+            if end <= prefix[0]:
+                path.unlink()
+                continue
+            rows[start] = {"start": start, "end": end, "size": size, "path": path}
+        previous_end = 0
+        for row in sorted(rows.values(), key=lambda row: row["start"]):
+            if row["start"] < previous_end:
+                raise InvalidDownload("下载分段存在交叠 / Download ranges overlap")
+            previous_end = row["end"]
+        lock = threading.RLock()
+        budget = TransferBudget(self.transfer_seconds, self.transfer_max_seconds, self.read_idle_seconds, self.transfer_margin)
+        active = [0]
+        etag = [None]
+        identity = payload_digest([digest, "sha256", total])
+        def count():
+            return prefix[0] + sum(max(0, row["start"] + row["size"] - max(prefix[0], row["start"])) for row in rows.values())
+        def report():
+            with lock:
+                current = count()
+                budget.advance(current, total)
+                self.advance_transfer(identity, current, total, budget.speed)
+                if progress:
+                    progress(current, total)
+        def state():
+            if events:
+                events("receiving" if active[0] else "connecting", active_connections=active[0], source=urllib.parse.urlsplit(url).hostname)
+        def merge():
+            for row in sorted(list(rows.values()), key=lambda value: value["start"]):
+                check(self.cancel)
+                if row["start"] > prefix[0]:
+                    break
+                size = row["path"].stat().st_size if row["path"].is_file() else 0
+                row["size"] = size
+                if row["start"] + size > prefix[0]:
+                    with row["path"].open("rb") as source, part.open("ab") as output:
+                        source.seek(prefix[0] - row["start"])
+                        while True:
+                            check(self.cancel)
+                            block = source.read(1024 * 1024)
+                            if not block:
+                                break
+                            storage.write(output, block)
+                            prefix[0] += len(block)
+                        output.flush()
+                        os.fsync(output.fileno())
+                row["path"].unlink(missing_ok=True)
+                del rows[row["start"]]
+            report()
+        report()
+        merge()
+        if prefix[0] >= total:
+            return
+        learned_ceiling = max(1, int(connections))
+        ceiling = min(learned_ceiling, self.range_capacity()) if hasattr(self, "range_capacity") else learned_ceiling
+        limit = min(ceiling, max(1, getattr(self, "range_limit", 1)))
+        previous_rate = None
+        block_size = 1024 * 1024
+        chunk_size = block_size
+        while prefix[0] < total:
+            check(self.cancel)
+            ceiling = min(learned_ceiling, self.range_capacity()) if hasattr(self, "range_capacity") else learned_ceiling
+            limit = min(limit, ceiling)
+            pending = [row for row in sorted(rows.values(), key=lambda value: value["start"]) if row["size"] < row["end"] - row["start"]]
+            while len(pending) < limit:
+                start = prefix[0]
+                ordered = sorted(rows.values(), key=lambda value: value["start"])
+                boundary = total
+                for row in ordered:
+                    if row["end"] <= start:
+                        continue
+                    if row["start"] > start:
+                        boundary = row["start"]
+                        break
+                    start = row["end"]
+                if start >= total:
+                    break
+                end = min(boundary, start + chunk_size)
+                path = directory / (str(start) + "-" + str(end) + ".part")
+                if path.is_symlink():
+                    raise InvalidDownload("拒绝链接形式的下载分段 / Refusing a linked download range")
+                row = {"start": start, "end": end, "size": 0, "path": path}
+                rows[start] = row
+                pending.append(row)
+            pending = sorted(pending, key=lambda value: value["start"])[:limit]
+            if not pending:
+                merge()
+                if prefix[0] < total:
+                    raise YuanFault("下载分段未取得进展 / Download ranges made no progress", category="network", code="network_range_stalled", url=url)
+                break
+            stop = threading.Event()
+            local = copy.copy(self)
+            local.cancel = AnyCancel(self.cancel, stop)
+            def receive(row):
+                offset = row["start"] + row["size"]
+                while offset < row["end"]:
+                    check(local.cancel)
+                    headers = {"Range": f"bytes={offset}-{row['end'] - 1}", "Accept-Encoding": "identity"}
+                    with lock:
+                        if etag[0]:
+                            headers["If-Range"] = etag[0]
+                    with local.response(url, headers, deadline=budget.deadline) as response:
+                        status = getattr(response, "status", 200)
+                        if status == 200:
+                            raise YuanFault("来源未按范围发送，保留分段并回退续传 / Source ignored byte ranges; retaining ranges and falling back to resume",
+                                            category="network", code="network_range_unavailable", url=url)
+                        if status != 206:
+                            raise YuanFault("来源范围响应异常 / Unexpected source range response", category="network", code="network_range_status", url=url, http_status=status)
+                        match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", response.headers.get("Content-Range", "").strip())
+                        length = response.headers.get("Content-Length")
+                        if (match is None or int(match[1]) != offset or not offset <= int(match[2]) < row["end"] or int(match[3]) != total
+                                or length is not None and (not re.fullmatch(r"[0-9]+", length.strip()) or int(length) != int(match[2]) - offset + 1)
+                                or response.headers.get("Content-Encoding", "identity").strip().lower() not in ("", "identity")):
+                            raise InvalidDownload("下载分段与可信文件边界不匹配 / Download range differs from the trusted artifact boundaries")
+                        end = int(match[2]) + 1
+                        incoming = response.headers.get("ETag", "").strip()
+                        incoming = incoming if re.fullmatch(r'"[^"\r\n]*"', incoming) else None
+                        with lock:
+                            if etag[0] and incoming and etag[0] != incoming:
+                                raise InvalidDownload("下载分段的实体标识不一致 / Download range entity validators differ")
+                            if incoming:
+                                etag[0] = incoming
+                            active[0] += 1
+                            state()
+                        try:
+                            with row["path"].open("ab") as output:
+                                for block in local.blocks(response, deadline=lambda: budget.deadline):
+                                    check(local.cancel)
+                                    if offset + len(block) > end:
+                                        raise InvalidDownload("下载分段超过声明边界 / Download range exceeds its declared boundary")
+                                    storage.write(output, block)
+                                    offset += len(block)
+                                    with lock:
+                                        row["size"] = offset - row["start"]
+                                        report()
+                                output.flush()
+                                os.fsync(output.fileno())
+                        finally:
+                            with lock:
+                                active[0] -= 1
+                                state()
+                        if events:
+                            with lock:
+                                events("receiving" if active[0] else "connecting", active_connections=active[0],
+                                       requested_range=headers["Range"], content_range=response.headers.get("Content-Range"),
+                                       http_status=status, response_url=redact(response.geturl()), source=urllib.parse.urlsplit(response.geturl()).hostname)
+                        if offset != end:
+                            raise YuanFault("下载分段提前结束，已保留接收数据 / Range transfer ended early; received data retained",
+                                            category="network", code="network_incomplete", stage="download", url=url,
+                                            received_bytes=offset, expected_bytes=row["end"], response_end=end, http_status=status)
+                return row
+            started, before = time.monotonic(), count()
+            failures = []
+            with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="YuanRange") as executor:
+                futures = [executor.submit(receive, row) for row in pending]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        failures.append(exc)
+                        if isinstance(exc, Cancelled) or failure_category(exc) != "network" or getattr(exc, "code", None) == "network_range_unavailable":
+                            stop.set()
+            self.range_limit = max(1, limit // 2) if failures else limit
+            check(self.cancel)
+            merge()
+            if failures:
+                original = next((exc for exc in failures if not isinstance(exc, Cancelled)), failures[0])
+                if getattr(original, "code", None) == "network_range_unavailable":
+                    self.range_disabled = True
+                    return
+                raise original
+            measured = max(0, count() - before) / elapsed_seconds(started)
+            if measured > 0:
+                if previous_rate is not None and measured < previous_rate and limit > 1:
+                    learned_ceiling = ceiling = limit = max(1, limit - 1)
+                elif limit < ceiling:
+                    limit += 1
+                previous_rate = measured
+                self.range_limit = limit
+                chunk_size = max(block_size, min(max(block_size, (total - prefix[0]) // max(1, limit)), int(measured * max(self.connection_timeout(url), self.read_idle_seconds) / limit)))
+        if events:
+            events("verifying", active_connections=0)
+
+    def _clear_ranges(self, target, digest):
+        directory = Path(target).with_name(Path(target).name + ".ranges-" + digest)
+        if directory.is_symlink():
+            raise InvalidDownload("拒绝链接形式的下载分段 / Refusing linked download ranges")
+        if not directory.is_dir():
+            return
+        for path in directory.iterdir():
+            if path.is_symlink() or not path.is_file() or not re.fullmatch(r"[0-9]+-[0-9]+\.part", path.name):
+                raise InvalidDownload("下载分段记录无效 / Invalid download range record")
+            path.unlink()
+        directory.rmdir()
 
     def _download(self, url, target, expected_size=None, expected_hash=None, progress=None, max_bytes=None, algorithm=None, events=None, storage=None):
         budget = TransferBudget(self.transfer_seconds, self.transfer_max_seconds, self.read_idle_seconds, self.transfer_margin)
-        deadline = budget.deadline
         target = Path(target)
         part = target.with_name(target.name + ".partial")
+        restart = target.with_name(target.name + ".restart")
+        candidates = (part, restart)
         check(self.cancel)
-        if target.is_symlink() or part.is_symlink():
+        if any(path.is_symlink() for path in (target, *candidates, *(path.with_name(path.name + ".json") for path in candidates))):
             raise InvalidDownload("拒绝使用链接指向的下载文件 / Refusing a linked download target")
         target.parent.mkdir(parents=True, exist_ok=True)
         algorithm = algorithm or "sha256"
         if algorithm not in ("sha1", "sha256"):
             raise InvalidDownload("不支持的完整性算法 / Unsupported integrity algorithm")
-        if expected_size is not None and (isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size < 0):
+        if expected_size is not None and (type(expected_size) is not int or expected_size < 0):
             raise InvalidDownload("无效的下载大小 / Invalid download size")
-        if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0):
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
             raise YuanError("无效的下载资源预算 / Invalid download resource budget")
         if expected_hash:
             expected_hash = str(expected_hash).lower()
@@ -3085,120 +3681,168 @@ class Network:
                 raise InvalidDownload("无效的完整性摘要 / Invalid integrity digest")
         if max_bytes is not None and expected_size is not None and expected_size > max_bytes:
             raise YuanError("下载超过当前资源预算 / Download exceeds the current resource budget")
-        if target.is_file():
-            size = target.stat().st_size
-            size_ok = (expected_size is None or size == expected_size) and (max_bytes is None or size <= max_bytes)
-            hash_ok = not expected_hash or digest_file(target, self.cancel, algorithm) == expected_hash
-            if size_ok and hash_ok:
-                if progress:
-                    progress(size, size)
-                return target
-        offset = part.stat().st_size if part.is_file() else 0
-        if offset and (not expected_hash or max_bytes is not None and offset > max_bytes):
-            part.unlink(missing_ok=True)
-            offset = 0
-        if offset and expected_hash and digest_file(part, self.cancel, algorithm) == expected_hash and (expected_size is None or offset == expected_size):
+        identity = payload_digest([expected_hash, algorithm, expected_size])
+        storage = storage or DownloadStorage(target.parent, 0)
+        def metadata(path):
+            return path.with_name(path.name + ".json")
+        def remove(path):
+            path.unlink(missing_ok=True)
+            metadata(path).unlink(missing_ok=True)
+        def finish(path, size):
             check(self.cancel)
-            os.replace(part, target)
+            if path != target:
+                os.replace(path, target)
+            for other in candidates:
+                remove(other)
             sync_dir(target.parent)
             if progress:
-                progress(offset, offset)
+                progress(size, size)
             return target
-        if expected_size is not None and offset >= expected_size:
-            if offset == expected_size and part.is_file() and expected_hash and digest_file(part, self.cancel, algorithm) == expected_hash:
-                check(self.cancel)
-                os.replace(part, target)
-                sync_dir(target.parent)
-                if progress:
-                    progress(offset, offset)
-                return target
-            part.unlink(missing_ok=True)
-            offset = 0
-        headers = {"Accept-Encoding": "identity"}
-        if offset:
-            headers["Range"] = f"bytes={offset}-"
-        if events:
-            events("connecting", source=urllib.parse.urlsplit(url).hostname, connect_seconds=self.connection_timeout(url), read_idle_seconds=self.read_idle_seconds, transfer_seconds=self.transfer_seconds)
-        try:
-            response = self.request(url, headers, deadline=deadline)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 416 or not offset:
-                raise
-            exc.close()
-            part.unlink(missing_ok=True)
-            offset = 0
-            response = self.request(url, {"Accept-Encoding": "identity"}, deadline=deadline)
-        with response:
+        def digest_ok(path):
             if events:
-                events("receiving", source=urllib.parse.urlsplit(response.geturl()).hostname)
-            status = getattr(response, "status", 200)
-            if status not in (200, 206):
-                raise YuanError(f"下载状态异常 / Unexpected download status: {status}")
-            if response.headers.get("Content-Encoding", "identity").strip().lower() not in ("", "identity"):
-                raise YuanError("下载编码与原始文件不匹配 / Download encoding differs from the original file")
-            length = response.headers.get("Content-Length")
-            if length is not None and not re.fullmatch(r"[0-9]+", length.strip()):
-                raise YuanError("下载长度无效 / Invalid download content length")
-            length = int(length) if length is not None else None
-            response_end = None
-            if status == 206:
-                match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", response.headers.get("Content-Range", "").strip())
-                if match is None:
-                    raise YuanError("下载续传范围无效 / Invalid download content range")
-                first, last = int(match[1]), int(match[2])
-                complete = int(match[3]) if match[3] != "*" else None
-                if first != offset or last < first or complete is not None and last >= complete:
-                    raise YuanError("下载续传偏移不匹配 / Download resume offset mismatch")
-                if length is not None and length != last - first + 1:
-                    raise YuanError("下载范围与长度不匹配 / Download range and length mismatch")
-                response_end = last + 1
-                total = complete if complete is not None else expected_size
-                if total is None:
-                    raise YuanError("无法确认下载完整长度 / Cannot establish the complete download length")
-            else:
-                offset = 0
-                total = length if length is not None else expected_size
-            if expected_size is not None and total is not None and total != expected_size:
-                raise InvalidDownload("下载大小与可信清单不匹配 / Download size differs from the trusted manifest")
-            if max_bytes is not None and total is not None and total > max_bytes:
-                raise YuanError("下载超过当前资源预算 / Download exceeds the current resource budget")
-            written = offset
-            budget.advance(written, total)
-            if progress:
-                progress(written, total)
-            with part.open("ab" if offset else "wb") as stream:
-                for block in self.blocks(response, deadline=lambda: budget.deadline):
-                    check(self.cancel)
-                    written += len(block)
-                    limits = (expected_size, max_bytes, total, response_end)
-                    if any(bound is not None and written > bound for bound in limits):
-                        raise InvalidDownload("下载超过已声明大小 / Download exceeds its declared size")
-                    if storage is not None:
+                events("verifying", active_connections=0)
+            return not expected_hash or digest_file(path, self.cancel, algorithm) == expected_hash
+        if target.is_file():
+            size = target.stat().st_size
+            if (expected_size is None or size == expected_size) and (max_bytes is None or size <= max_bytes) and digest_ok(target):
+                return finish(target, size)
+        for path in candidates:
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            if not expected_hash or max_bytes is not None and size > max_bytes or expected_size is not None and size > expected_size:
+                remove(path)
+                continue
+            if expected_size is None or size == expected_size:
+                if digest_ok(path):
+                    return finish(path, size)
+                if expected_size is not None and size == expected_size:
+                    remove(path)
+        work = max(candidates, key=lambda path: path.stat().st_size if path.is_file() else 0)
+        offset = work.stat().st_size if work.is_file() else 0
+        declared = expected_size
+        budget.advance(offset, declared)
+        self.advance_transfer(identity, offset, declared, None)
+        if progress:
+            progress(offset, declared)
+        reset_response = False
+        while True:
+            check(self.cancel)
+            headers = {"Accept-Encoding": "identity"}
+            saved = read_json(metadata(work))
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
+                validator = saved.get("etag")
+                if saved.get("identity") == identity and saved.get("url") == url and isinstance(validator, str) and re.fullmatch(r'"[^"\r\n]*"', validator):
+                    headers["If-Range"] = validator
+            if events:
+                events("connecting", source=urllib.parse.urlsplit(url).hostname, connect_seconds=self.connection_timeout(url),
+                       read_idle_seconds=self.read_idle_seconds, transfer_seconds=self.transfer_seconds, active_connections=0)
+            requested = offset
+            try:
+                response = self.response(url, headers, deadline=budget.deadline)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 416 or not offset or reset_response:
+                    raise
+                range_header = exc.headers.get("Content-Range", "") if exc.headers else ""
+                match = re.fullmatch(r"bytes \*/([0-9]+)", range_header.strip())
+                exc.close()
+                if match and declared is not None and int(match[1]) != declared:
+                    raise InvalidDownload("来源长度与已锁定文件不一致 / Source length differs from the locked artifact")
+                reset_response = True
+                requested = 0
+                headers = {"Accept-Encoding": "identity"}
+                response = self.response(url, headers, deadline=budget.deadline)
+            with response:
+                status = getattr(response, "status", 200)
+                if status not in (200, 206):
+                    raise YuanFault(f"下载状态异常 / Unexpected download status: {status}", category="network", code="network_download_status", url=url)
+                if response.headers.get("Content-Encoding", "identity").strip().lower() not in ("", "identity"):
+                    raise InvalidDownload("下载编码与原始文件不匹配 / Download encoding differs from the original file")
+                length = response.headers.get("Content-Length")
+                if length is not None and not re.fullmatch(r"[0-9]+", length.strip()):
+                    raise InvalidDownload("下载长度无效 / Invalid download content length")
+                length = int(length) if length is not None else None
+                response_end = None
+                if status == 206:
+                    match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", response.headers.get("Content-Range", "").strip())
+                    if match is None:
+                        raise InvalidDownload("下载续传范围无效 / Invalid download content range")
+                    first, last = int(match[1]), int(match[2])
+                    complete = int(match[3]) if match[3] != "*" else None
+                    if first != requested or last < first or complete is not None and last >= complete:
+                        raise InvalidDownload("下载续传偏移不匹配 / Download resume offset mismatch")
+                    if length is not None and length != last - first + 1:
+                        raise InvalidDownload("下载范围与长度不匹配 / Download range and length mismatch")
+                    response_end = last + 1
+                    total = complete if complete is not None else declared
+                    if total is None or response_end > total:
+                        raise InvalidDownload("无法确认下载完整长度 / Cannot establish the complete download length")
+                    incoming = response.headers.get("ETag", "").strip()
+                    if headers.get("If-Range") and incoming and incoming != headers["If-Range"]:
+                        raise InvalidDownload("来源实体标识已变化，未拼接不同文件 / Source validator changed; different files were not joined")
+                else:
+                    total = length if length is not None else declared
+                    requested = 0
+                if declared is not None and total is not None and total != declared:
+                    raise InvalidDownload("下载大小与可信清单不匹配 / Download size differs from the trusted manifest")
+                if max_bytes is not None and total is not None and total > max_bytes:
+                    raise YuanError("下载超过当前资源预算 / Download exceeds the current resource budget")
+                if not requested and offset:
+                    work = restart if work == part else part
+                    available = shutil.disk_usage(target.parent).free - storage.reserve
+                    reusable = work.stat().st_size if work.is_file() else 0
+                    if total is not None and total > available + reusable:
+                        raise YuanFault("保留断点所需的重新下载空间不足 / Insufficient restart space while preserving the existing partial",
+                                        category="storage", code="download_restart_space", stage="download", required_bytes=total, available_bytes=max(0, available + reusable))
+                offset = requested
+                written = offset
+                etag = response.headers.get("ETag", "").strip()
+                etag = etag if re.fullmatch(r'"[^"\r\n]*"', etag) else None
+                if not offset:
+                    metadata(work).unlink(missing_ok=True)
+                if events:
+                    events("receiving", source=urllib.parse.urlsplit(response.geturl()).hostname, active_connections=1,
+                           http_status=status, content_range=response.headers.get("Content-Range"), requested_range=headers.get("Range"), response_url=redact(response.geturl()))
+                budget.advance(written, total)
+                if progress:
+                    progress(written, total)
+                with work.open("ab" if offset else "wb") as stream:
+                    atomic_json(metadata(work), {"identity": identity, "url": url, "etag": etag, "size": total}, self.cancel)
+                    for block in self.blocks(response, deadline=lambda: budget.deadline):
+                        check(self.cancel)
+                        next_size = written + len(block)
+                        if any(bound is not None and next_size > bound for bound in (declared, max_bytes, total, response_end)):
+                            raise InvalidDownload("下载超过已声明大小 / Download exceeds its declared size")
                         storage.write(stream, block)
-                    else:
-                        if shutil.disk_usage(target.parent).free < len(block):
-                            raise YuanError("所选目录空间不足 / The selected folder is out of space")
-                        stream.write(block)
-                    budget.advance(written, total)
-                    if progress:
-                        progress(written, total)
-                stream.flush()
-                os.fsync(stream.fileno())
-        check(self.cancel)
-        declared = expected_size if expected_size is not None else total
-        if (declared is not None and written != declared) or (response_end is not None and written != response_end):
-            raise YuanFault("下载提前结束，将保留已下载部分 / Download ended early; partial data retained",
-                            category="network", code="network_incomplete", stage="download", url=url,
-                            received_bytes=written, expected_bytes=declared, response_end=response_end)
-        if events:
-            events("verifying")
-        if expected_hash and digest_file(part, self.cancel, algorithm) != expected_hash:
-            part.unlink(missing_ok=True)
-            raise InvalidDownload("文件完整性校验失败 / File integrity validation failed")
-        check(self.cancel)
-        os.replace(part, target)
-        sync_dir(target.parent)
-        return target
+                        written = next_size
+                        budget.advance(written, total)
+                        self.advance_transfer(identity, written, total, budget.speed)
+                        if progress:
+                            progress(written, total)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if events:
+                    events("receiving", active_connections=0, response_received_bytes=written - requested,
+                           http_status=status, content_range=response.headers.get("Content-Range"), response_end=response_end)
+            check(self.cancel)
+            if total is not None:
+                declared = total
+            end = response_end if status == 206 else declared
+            if end is not None and written != end:
+                raise YuanFault("下载提前结束，将保留已下载部分 / Download ended early; partial data retained",
+                                category="network", code="network_incomplete", stage="download", url=url,
+                                received_bytes=written, expected_bytes=declared, response_end=response_end, http_status=status,
+                                response_received_bytes=written - requested)
+            if declared is not None and written < declared:
+                if written <= offset:
+                    raise YuanFault("范围响应未取得进展 / Range response made no progress", category="network", code="network_range_stalled", url=url)
+                offset = written
+                continue
+            if not digest_ok(work):
+                remove(work)
+                raise InvalidDownload("文件完整性校验失败 / File integrity validation failed")
+            return finish(work, written)
 
 
 
@@ -3356,6 +4000,8 @@ class AudioStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.audio = safe_path(self.root, "audio")
         self.audio.mkdir(exist_ok=True)
+        self.staging = safe_path(self.root, "staging")
+        self.staging.mkdir(exist_ok=True)
         self.db = sqlite3.connect(str(database_path(self.root, "memory.sqlite3")), timeout=math.sqrt(os.cpu_count() or 1))
         self.db.row_factory = sqlite3.Row
         self.transaction_depth = 0
@@ -3376,7 +4022,7 @@ class AudioStore:
                 with self.transaction():
                     self.db.execute("UPDATE sessions SET ended=? WHERE ended IS NULL", (time.time(),))
                     prior = self.setting("audio_repair", {})
-                    if not isinstance(prior, dict) or prior.get("phase") not in ("samples", "files"):
+                    if not isinstance(prior, dict) or prior.get("phase") not in ("samples", "files", "staging"):
                         self.set_setting("audio_repair", {"phase": "samples", "after": 0,
                                          "through": self.db.execute("SELECT COALESCE(MAX(rowid),0) FROM samples").fetchone()[0],
                                          "started_ns": time.time_ns()})
@@ -3452,7 +4098,7 @@ class AudioStore:
     def repair(self, cancel=None):
         check(cancel)
         state = self.setting("audio_repair", {})
-        if not isinstance(state, dict) or state.get("phase") not in ("samples", "files"):
+        if not isinstance(state, dict) or state.get("phase") not in ("samples", "files", "staging"):
             return False
         cpus = max(1, os.cpu_count() or 1)
         limit = self.policy.integer("storage", "repair_batch", cpus, 1, cpus * cpus)
@@ -3481,13 +4127,27 @@ class AudioStore:
                 if self.repair_iterator is None or self.repair_epoch != state["started_ns"]:
                     if self.repair_iterator is not None:
                         self.repair_iterator.close()
-                    self.repair_iterator = os.scandir(self.audio)
+                    self.repair_iterator = os.scandir(self.staging if state["phase"] == "staging" else self.audio)
                     self.repair_epoch = state["started_ns"]
                 try:
                     for _ in range(limit):
                         check(cancel)
                         entry = next(self.repair_iterator)
                         processed += 1
+                        if state["phase"] == "staging":
+                            if not re.fullmatch(r"[a-f0-9]{32}", entry.name) or not entry.is_dir(follow_symlinks=False):
+                                continue
+                            directory = safe_path(self.staging, entry.name)
+                            try:
+                                lease = WorkspaceLease(directory / "active.lock")
+                            except YuanError as exc:
+                                cause = exc.__context__
+                                if isinstance(cause, OSError) and cause.errno in (errno.EACCES, errno.EAGAIN):
+                                    continue
+                                raise
+                            lease.close()
+                            shutil.rmtree(directory)
+                            continue
                         if not re.fullmatch(r"[a-f0-9]{64}\.flac|[a-f0-9]{64}-[a-f0-9]{32}\.partial", entry.name):
                             continue
                         try:
@@ -3502,8 +4162,9 @@ class AudioStore:
                 except StopIteration:
                     self.repair_iterator.close()
                     self.repair_iterator = None
-                    state["phase"] = "done"
-                    state["completed_ns"] = time.time_ns()
+                    state["phase"] = "done" if state["phase"] == "staging" else "staging"
+                    if state["phase"] == "done":
+                        state["completed_ns"] = time.time_ns()
                 finally:
                     self.set_setting("audio_repair", state)
         return bool(processed)
@@ -3597,8 +4258,14 @@ class AudioStore:
         self.commit()
 
     def add(self, group_id, role, waveform, rate, origin, cancel=None, generated=False, eligible=True, created=None, metadata=None, task="acoustic", sample_id=None, prepared=None):
-        with self.audio_files(cancel):
-            return self._add(group_id, role, waveform, rate, origin, cancel, generated, eligible, created, metadata, task, sample_id, prepared)
+        if prepared is not None:
+            with self.audio_files(cancel):
+                return self._add(group_id, role, waveform, rate, origin, cancel, generated, eligible, created, metadata, task, sample_id, prepared)
+        with self.audio_stage(cancel) as staging:
+            prepared = self.prepare_audio(waveform, rate, staging, cancel, purpose="conversation" if origin == "local" else "learning")
+            with self.audio_files(cancel):
+                self.publish_audio(prepared, cancel)
+                return self._add(group_id, role, waveform, rate, origin, cancel, generated, eligible, created, metadata, task, sample_id, prepared)
 
     def audio_eligibility(self, group_id, checksum, eligible, generated):
         if generated:
@@ -3644,65 +4311,62 @@ class AudioStore:
         if not math.isfinite(created):
             raise YuanError("音频时间无效 / Invalid audio timestamp")
         metadata = dict(metadata or {})
-        own_preparation = prepared is None
-        prepared = self.prepare_audio(waveform, rate, cancel, purpose="conversation" if origin == "local" else "learning") if prepared is None else prepared
+        if prepared is None or prepared.get("published") is not True or prepared["rate"] != rate:
+            raise YuanError("音频尚未完成发布 / Audio publication is not complete")
         checksum = prepared["digest"]
-        try:
-            check(cancel)
-            with self.transaction():
-                if origin == "public":
-                    existing = self.db.execute("SELECT id FROM samples WHERE digest=? AND group_id=? AND role=? AND task=? ORDER BY created,id LIMIT 1", (checksum, group_id, role, task)).fetchone()
-                    if existing:
-                        sample_id = existing["id"]
-                sample_id = str(sample_id or uuid.uuid4().hex)
-                previous = self.db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
-                if previous is not None:
-                    if (previous["digest"] != checksum or previous["group_id"] != group_id or previous["role"] != role
-                            or previous["task"] != task or previous["rate"] != prepared["rate"] or previous["count"] != prepared["count"]):
-                        raise YuanError("音频片段标识与内容不一致 / Audio sample identity does not match its content")
-                    if not explicit_time:
-                        created = previous["created"]
-                    prior_metadata = json.loads(previous["metadata"])
-                    if origin != "dataset":
-                        verified_update = metadata.get("transcript_verified") is True
-                        metadata = {**prior_metadata, **metadata}
-                        if prior_metadata.get("transcript_verified") is True and not verified_update:
-                            metadata.update({key: prior_metadata[key] for key in ("transcript", "transcript_verified", "language") if key in prior_metadata})
-                self.group(group_id, origin, source_key=metadata.get("recording_id") or metadata.get("source") or group_id,
-                           retention="training_cache" if origin == "public" else "protected",
-                           provenance={key: metadata[key] for key in ("source", "url", "license", "license_url", "attribution", "source_sha256", "source_sha1") if key in metadata})
-                dialogue_eligible, exclusion = self.audio_eligibility(group_id, checksum, eligible, generated)
-                if dialogue_eligible:
-                    self.validate_transcript(checksum, sample_id, metadata)
-                encoded_metadata = json.dumps(metadata, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-                memory_reason = self.memory_reason(metadata, eligible, generated)
-                if previous is not None:
-                    changed = (previous["exclusion"] == "annotation_removed" or previous["created"] != created
-                               or self.sample_supervision(prior_metadata) != self.sample_supervision(metadata)
-                               or bool(previous["dialogue_eligible"]) != dialogue_eligible
-                               or previous["memory_exclusion"] != memory_reason)
-                    if changed:
-                        self.db.execute("UPDATE samples SET metadata=?,created=?,cursor=0,visits=0,memory_eligible=?,memory_exclusion=?,learnable=0,dialogue_eligible=?,exclusion=? WHERE id=?",
-                                        (encoded_metadata, created, int(not memory_reason), memory_reason, int(dialogue_eligible), exclusion, sample_id))
-                        self.db.execute("DELETE FROM memories WHERE sample_id=?", (sample_id,))
-                        self.db.execute("DELETE FROM memory_progress WHERE sample_id=?", (sample_id,))
-                        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_training'").fetchone():
-                            self.db.execute("DELETE FROM speech_training WHERE sample=?", (sample_id,))
-                        self.db.execute("UPDATE turn_pairs SET eligible=0,verified=0,cursor=0,visits=0,retry_at=0,failures=0,error='' WHERE user_sample=? OR assistant_sample=?", (sample_id, sample_id))
-                        self.refresh_audio_owner(checksum, sample_id if previous["learnable"] else None)
-                    elif prior_metadata != metadata:
-                        self.db.execute("UPDATE samples SET metadata=? WHERE id=?", (encoded_metadata, sample_id))
-                    return sample_id
-                owner = self.db.execute("SELECT id FROM samples WHERE digest=? AND learnable=1", (checksum,)).fetchone()
-                learnable = bool(dialogue_eligible and not generated and task == "acoustic" and owner is None)
-                self.db.execute("INSERT INTO samples(id,group_id,role,task,audio,seconds,rate,count,created,digest,file_sha256,generated,learnable,dialogue_eligible,memory_eligible,memory_exclusion,exclusion,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (sample_id, group_id, role, task, prepared["audio"], prepared["count"] / prepared["rate"], prepared["rate"], prepared["count"], created, checksum, prepared["file_sha256"], int(generated), int(learnable), int(dialogue_eligible), int(not memory_reason), memory_reason, exclusion, encoded_metadata))
-                self.refresh_audio_owner(checksum)
-            return sample_id
-        except BaseException:
-            if own_preparation:
-                self.discard_audio(prepared)
-            raise
+        check(cancel)
+        with self.transaction():
+            self.db.execute("UPDATE samples SET file_sha256=?,audio_status='ready',retry_at=0,read_failures=0,audio_error='' WHERE audio=? AND digest=? AND (file_sha256<>? OR audio_status<>'ready' OR retry_at<>0 OR read_failures<>0 OR audio_error<>'')",
+                            (prepared["file_sha256"], prepared["audio"], checksum, prepared["file_sha256"]))
+            if origin == "public":
+                existing = self.db.execute("SELECT id FROM samples WHERE digest=? AND group_id=? AND role=? AND task=? ORDER BY created,id LIMIT 1", (checksum, group_id, role, task)).fetchone()
+                if existing:
+                    sample_id = existing["id"]
+            sample_id = str(sample_id or uuid.uuid4().hex)
+            previous = self.db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+            if previous is not None:
+                if (previous["digest"] != checksum or previous["group_id"] != group_id or previous["role"] != role
+                        or previous["task"] != task or previous["rate"] != prepared["rate"] or previous["count"] != prepared["count"]):
+                    raise YuanError("音频片段标识与内容不一致 / Audio sample identity does not match its content")
+                if not explicit_time:
+                    created = previous["created"]
+                prior_metadata = json.loads(previous["metadata"])
+                if origin != "dataset":
+                    verified_update = metadata.get("transcript_verified") is True
+                    metadata = {**prior_metadata, **metadata}
+                    if prior_metadata.get("transcript_verified") is True and not verified_update:
+                        metadata.update({key: prior_metadata[key] for key in ("transcript", "transcript_verified", "language") if key in prior_metadata})
+            self.group(group_id, origin, source_key=metadata.get("recording_id") or metadata.get("source") or group_id,
+                       retention="training_cache" if origin == "public" else "protected",
+                       provenance={key: metadata[key] for key in ("source", "url", "license", "license_url", "attribution", "source_sha256", "source_sha1") if key in metadata})
+            dialogue_eligible, exclusion = self.audio_eligibility(group_id, checksum, eligible, generated)
+            if dialogue_eligible:
+                self.validate_transcript(checksum, sample_id, metadata)
+            encoded_metadata = json.dumps(metadata, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            memory_reason = self.memory_reason(metadata, eligible, generated)
+            if previous is not None:
+                changed = (previous["exclusion"] == "annotation_removed" or previous["created"] != created
+                           or self.sample_supervision(prior_metadata) != self.sample_supervision(metadata)
+                           or bool(previous["dialogue_eligible"]) != dialogue_eligible
+                           or previous["memory_exclusion"] != memory_reason)
+                if changed:
+                    self.db.execute("UPDATE samples SET metadata=?,created=?,cursor=0,visits=0,memory_eligible=?,memory_exclusion=?,learnable=0,dialogue_eligible=?,exclusion=? WHERE id=?",
+                                    (encoded_metadata, created, int(not memory_reason), memory_reason, int(dialogue_eligible), exclusion, sample_id))
+                    self.db.execute("DELETE FROM memories WHERE sample_id=?", (sample_id,))
+                    self.db.execute("DELETE FROM memory_progress WHERE sample_id=?", (sample_id,))
+                    if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_training'").fetchone():
+                        self.db.execute("DELETE FROM speech_training WHERE sample=?", (sample_id,))
+                    self.db.execute("UPDATE turn_pairs SET eligible=0,verified=0,cursor=0,visits=0,retry_at=0,failures=0,error='' WHERE user_sample=? OR assistant_sample=?", (sample_id, sample_id))
+                    self.refresh_audio_owner(checksum, sample_id if previous["learnable"] else None)
+                elif prior_metadata != metadata:
+                    self.db.execute("UPDATE samples SET metadata=? WHERE id=?", (encoded_metadata, sample_id))
+                return sample_id
+            owner = self.db.execute("SELECT id FROM samples WHERE digest=? AND learnable=1", (checksum,)).fetchone()
+            learnable = bool(dialogue_eligible and not generated and task == "acoustic" and owner is None)
+            self.db.execute("INSERT INTO samples(id,group_id,role,task,audio,seconds,rate,count,created,digest,file_sha256,generated,learnable,dialogue_eligible,memory_eligible,memory_exclusion,exclusion,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (sample_id, group_id, role, task, prepared["audio"], prepared["count"] / prepared["rate"], prepared["rate"], prepared["count"], created, checksum, prepared["file_sha256"], int(generated), int(learnable), int(dialogue_eligible), int(not memory_reason), memory_reason, exclusion, encoded_metadata))
+            self.refresh_audio_owner(checksum)
+        return sample_id
 
     def add_pair(self, group_id, user_sample, assistant_sample, source, quality=1.0, verified=False, created=None, evidence=None):
         quality = float(quality)
@@ -4008,47 +4672,111 @@ class AudioStore:
                 pass
         return recovered
 
-    def prepare_audio(self, waveform, rate, cancel=None, purpose="learning"):
+    @staticmethod
+    def audio_signature(path):
+        value = path.stat()
+        if not stat.S_ISREG(value.st_mode):
+            raise InvalidAudio("音频不是普通文件 / Audio is not a regular file")
+        return value.st_size, value.st_mtime_ns, value.st_ctime_ns, value.st_dev, value.st_ino
+
+    @contextmanager
+    def audio_stage(self, cancel=None):
+        if self.transaction_depth or self.db.in_transaction:
+            raise YuanError("音频准备不能占用数据库写事务 / Audio preparation cannot hold a database write transaction")
+        staging = {"directory": None, "prepared": []}
+        lease = None
+        try:
+            with self.audio_files(cancel):
+                directory = safe_path(self.staging, uuid.uuid4().hex)
+                directory.mkdir()
+                staging["directory"] = directory
+                lease = WorkspaceLease(directory / "active.lock")
+            yield staging
+        finally:
+            try:
+                if staging["directory"] is not None:
+                    with self.audio_files():
+                        try:
+                            for prepared in staging["prepared"]:
+                                self.discard_audio(prepared)
+                        finally:
+                            if lease is not None:
+                                lease.close()
+                            shutil.rmtree(staging["directory"])
+            finally:
+                if lease is not None:
+                    lease.close()
+
+    def prepare_audio(self, waveform, rate, staging, cancel=None, purpose="learning"):
         import numpy as np
         import soundfile as sf
+        if self.transaction_depth or self.db.in_transaction:
+            raise YuanError("音频准备不能占用数据库写事务 / Audio preparation cannot hold a database write transaction")
+        check(cancel)
         waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
-        if not waveform.size or not np.isfinite(waveform).all() or isinstance(rate, bool) or not isinstance(rate, int) or rate <= 0:
+        if not waveform.size or isinstance(rate, bool) or not isinstance(rate, int) or rate <= 0:
             raise InvalidAudio("音频样本无效 / Invalid audio sample")
-        if np.max(np.abs(waveform)) > 1:
-            raise InvalidAudio("音频超出可保存范围 / Audio is outside the supported range")
-        canonical = np.floor(waveform.astype(np.float64) * (1 << 23)).clip(-(1 << 23), (1 << 23) - 1).astype("<i4")
-        checksum = hashlib.sha256(canonical.tobytes() + str(rate).encode("ascii")).hexdigest()
-        target = safe_path(self.audio, checksum + ".flac")
-        temporary = self.audio / (checksum + "-" + uuid.uuid4().hex + ".partial")
-        new_file = not target.is_file()
+        temporary = staging["directory"] / (uuid.uuid4().hex + ".partial")
+        block = self.policy.integer("storage", "audio_write_samples", max(1, min(rate, math.isqrt(len(waveform)))), 1, max(1, len(waveform)))
+        checksum = hashlib.sha256()
         with StorageBudget(self.root.parent).reserve(waveform.nbytes * 2 + self.db_size(), purpose):
+            with sf.SoundFile(str(temporary), mode="w", samplerate=rate, channels=1, format="FLAC", subtype="PCM_24") as stream:
+                for offset in range(0, len(waveform), block):
+                    check(cancel)
+                    values = waveform[offset:offset + block]
+                    if not np.isfinite(values).all() or np.max(np.abs(values)) > 1:
+                        raise InvalidAudio("音频样本无效或超出可保存范围 / Audio is invalid or outside the supported range")
+                    canonical = np.floor(values.astype(np.float64) * (1 << 23)).clip(-(1 << 23), (1 << 23) - 1).astype("<i4")
+                    checksum.update(canonical.tobytes())
+                    stream.write(canonical.astype(np.float32) / (1 << 23))
+            check(cancel)
+            sync_written_file(temporary, self.root.parent, "audio_flush", "AudioStore.prepare_audio")
+            file_sha256 = digest_file(temporary, cancel)
+        checksum.update(str(rate).encode("ascii"))
+        checksum = checksum.hexdigest()
+        target = safe_path(self.audio, checksum + ".flac")
+        existing = None
+        try:
+            signature = self.audio_signature(target)
+            existing_hash = digest_file(target, cancel)
+            if self.audio_signature(target) == signature:
+                existing = (signature, existing_hash)
+        except FileNotFoundError:
+            pass
+        check(cancel)
+        prepared = {"audio": target.relative_to(self.root).as_posix(), "digest": checksum, "file_sha256": file_sha256,
+                    "rate": rate, "count": len(waveform), "new_file": False, "published": False,
+                    "temporary": temporary.relative_to(self.root).as_posix(), "existing": existing}
+        staging["prepared"].append(prepared)
+        return prepared
+
+    def publish_audio(self, prepared, cancel=None):
+        if self.transaction_depth or self.db.in_transaction:
+            raise YuanError("音频发布必须先于数据库写事务 / Audio publication must precede the database write transaction")
+        with self.audio_files(cancel):
+            check(cancel)
+            if prepared["published"]:
+                return
+            target = safe_path(self.root, prepared["audio"])
+            temporary = safe_path(self.root, prepared["temporary"])
             try:
+                signature = self.audio_signature(target)
+            except FileNotFoundError:
+                signature = None
+            existing = prepared["existing"]
+            existing_hash = (existing[1] if existing is not None and existing[0] == signature else
+                             digest_file(target, cancel) if signature is not None else None)
+            known = self.db.execute("SELECT 1 FROM samples WHERE audio=? AND digest=? AND file_sha256=? LIMIT 1",
+                                    (prepared["audio"], prepared["digest"], existing_hash)).fetchone()
+            if known:
+                prepared["file_sha256"] = existing_hash
+            elif existing_hash != prepared["file_sha256"]:
                 check(cancel)
-                sf.write(str(temporary), canonical.astype(np.float32) / (1 << 23), rate, format="FLAC", subtype="PCM_24")
-                with temporary.open("rb") as stream:
-                    os.fsync(stream.fileno())
-                file_sha256 = digest_file(temporary, cancel)
-                check(cancel)
-                existing_hash = None if new_file else digest_file(target, cancel)
-                known = self.db.execute("SELECT file_sha256 FROM samples WHERE audio=? LIMIT 1", (target.relative_to(self.root).as_posix(),)).fetchone()
-                if known and existing_hash == known["file_sha256"]:
-                    file_sha256 = existing_hash
-                elif new_file or existing_hash != file_sha256:
-                    os.replace(temporary, target)
-                    sync_dir(target.parent)
-                    self.integrity_cache.pop(target.relative_to(self.root).as_posix(), None)
-                    if known:
-                        with self.transaction():
-                            self.db.execute("UPDATE samples SET file_sha256=?,audio_status='ready',retry_at=0,read_failures=0,audio_error='' WHERE audio=? AND digest=?",
-                                            (file_sha256, target.relative_to(self.root).as_posix(), checksum))
-                if known:
-                    with self.transaction():
-                        self.db.execute("UPDATE samples SET audio_status='ready',retry_at=0,read_failures=0,audio_error='' WHERE audio=? AND digest=? AND audio_status='evicted' AND file_sha256=?",
-                                        (target.relative_to(self.root).as_posix(), checksum, file_sha256))
-                return {"audio": target.relative_to(self.root).as_posix(), "digest": checksum, "file_sha256": file_sha256,
-                        "rate": rate, "count": len(waveform), "new_file": new_file}
-            finally:
-                temporary.unlink(missing_ok=True)
+                os.replace(temporary, target)
+                prepared["new_file"] = signature is None
+                self.integrity_cache.pop(prepared["audio"], None)
+                sync_dir(target.parent)
+            prepared["published"] = True
 
     def discard_audio(self, prepared):
         if prepared.get("new_file") and not self.db.execute("SELECT 1 FROM samples WHERE audio=?", (prepared["audio"],)).fetchone():
@@ -4819,8 +5547,7 @@ class OwnedReleaseInstaller:
                     archive.write(path, name)
                     if digest_file(path, cancel) != mapping[name]:
                         raise YuanError("交付期间资产发生变化 / An asset changed during delivery export")
-            with temporary.open("rb") as stream:
-                os.fsync(stream.fileno())
+            sync_written_file(temporary, self.state, "release_archive_flush", "OwnedReleaseInstaller.export")
             os.replace(temporary, target)
             descriptor = ReleaseTrust(self.state).sign({"format": "yuan-owned-release-source-v2", "owner": APP_NAME,
                                                        "source": target.name, "sha256": digest_file(target, cancel),
@@ -4837,8 +5564,7 @@ class OwnedReleaseInstaller:
                 with zipfile.ZipFile(delivery_temp) as output:
                     if output.namelist() != ["Yuan.py"] or build_digest(output.read("Yuan.py").decode("utf-8")) != build_digest():
                         raise YuanError("单文件交付校验失败 / Single-file delivery validation failed")
-                with delivery_temp.open("rb") as stream:
-                    os.fsync(stream.fileno())
+                sync_written_file(delivery_temp, self.state, "release_delivery_flush", "OwnedReleaseInstaller.export")
                 os.replace(delivery_temp, delivered)
                 sync_dir(directory)
             finally:
@@ -5713,15 +6439,44 @@ class CancellableOutput:
     def tell(self):
         return self.stream.tell()
 
-def save_checkpoint(torch, payload, path, cancel, block_bytes):
+def file_operation_fault(exc, path, root, operation, mode, component, code):
+    path = Path(path)
+    try:
+        relative = path.relative_to(Path(root)).as_posix() if root is not None else path.name
+    except ValueError:
+        relative = path.name
+    invalid_descriptor = code == "file_sync_failed" and exc.errno == errno.EBADF
+    return YuanFault("文件持久化操作失败 / File durability operation failed",
+                     code="file_sync_bad_descriptor" if invalid_descriptor else code,
+                     operation=operation, file=relative, mode=mode, component=component,
+                     errno=exc.errno, winerror=getattr(exc, "winerror", None),
+                     **({"retryable": False} if invalid_descriptor else {}))
+
+def durable_sync(stream, path, root, operation, mode, component):
+    try:
+        os.fsync(stream.fileno())
+    except OSError as exc:
+        raise file_operation_fault(exc, path, root, operation, mode, component, "file_sync_failed") from exc
+
+def sync_written_file(path, root, operation, component):
+    try:
+        with Path(path).open("r+b") as stream:
+            durable_sync(stream, path, root, operation, "r+b", component)
+    except OSError as exc:
+        raise file_operation_fault(exc, path, root, operation, "r+b", component, "file_open_failed") from exc
+
+def save_checkpoint(torch, payload, path, cancel, block_bytes, *, root=None, component="save_checkpoint"):
     check(cancel)
     try:
         with open(path, "wb") as stream:
             torch.save(payload, CancellableOutput(stream, cancel, block_bytes))
             stream.flush()
             check(cancel)
-            os.fsync(stream.fileno())
+            durable_sync(stream, path, root, "checkpoint_flush", "wb", component)
             check(cancel)
+    except OSError as exc:
+        check(cancel)
+        raise file_operation_fault(exc, path, root, "checkpoint_write", "wb", component, "file_write_failed") from exc
     except BaseException:
         check(cancel)
         raise
@@ -5765,7 +6520,10 @@ class SpeechVerifier:
 
     def __init__(self, model, store, emit):
         self.model, self.store, self.emit = model, store, emit
-        self.configure_device(model.device)
+        accelerator = self.select_device(model, model.device)
+        self.configure_device(accelerator)
+        if accelerator != model.device:
+            emit("compute_partition", key="accelerator_partition", component="speech_verifier", device=str(accelerator), primary=str(model.device))
         self.root = safe_path(model.state, "learning/verifier")
         self.root.mkdir(parents=True, exist_ok=True)
         self.store.db.execute("CREATE TABLE IF NOT EXISTS speech_training(sample TEXT PRIMARY KEY REFERENCES samples(id) ON DELETE CASCADE, visits INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0)")
@@ -5779,6 +6537,25 @@ class SpeechVerifier:
         self.certificate = {}
         self.dirty = False
         self.interval = max(1, math.isqrt(model.width * model.layers))
+
+    @staticmethod
+    def select_device(model, primary):
+        accelerator = model.torch.device(primary)
+        if os.environ.get("YUAN_TRAINER") == "1" and accelerator.type in ("cuda", "xpu"):
+            for candidate in getattr(model, "accelerators", []):
+                identifier = candidate.get("device")
+                if identifier == str(accelerator) or not isinstance(identifier, str) or not identifier.startswith(accelerator.type + ":"):
+                    continue
+                try:
+                    secondary = model.torch.device(identifier)
+                    module = getattr(model.torch, secondary.type)
+                    free, total = module.mem_get_info(secondary)
+                    required = max(model.width * model.width * model.layers * 256, model.model_bytes)
+                    if free > required * 3:
+                        return secondary
+                except (AttributeError, RuntimeError, ValueError, OSError):
+                    continue
+        return accelerator
 
     def configure_device(self, device):
         self.device = self.model.torch.device(device)
@@ -6126,9 +6903,8 @@ class SpeechVerifier:
         committed = False
         try:
             with StorageBudget(self.model.state).reserve(max(1, size * 4), "checkpoint"):
-                save_checkpoint(self.model.torch, {"network": self.network.state_dict(), "optimizer": self.optimizer.state_dict(), "steps": self.steps}, temporary, cancel, self.model.width * self.model.hop * 4)
-                with temporary.open("rb") as stream:
-                    os.fsync(stream.fileno())
+                save_checkpoint(self.model.torch, {"network": self.network.state_dict(), "optimizer": self.optimizer.state_dict(), "steps": self.steps}, temporary, cancel, self.model.width * self.model.hop * 4,
+                                root=self.model.state, component="SpeechVerifier.checkpoint")
                 check(cancel)
                 os.replace(temporary, path)
                 manifest = {"identity": self.identity(), "file": name, "sha256": digest_file(path, cancel), "training_revision": self.training_revision,
@@ -6266,9 +7042,8 @@ class SpeechVerifier:
         try:
             state = {key: value.detach().cpu() for key, value in self.accepted.state_dict().items()}
             with StorageBudget(self.model.state).reserve(max(1, sum(value.numel() * value.element_size() for value in state.values())) * 2, "verifier_release"):
-                save_checkpoint(self.model.torch, {"network": state}, temporary, cancel, self.model.width * self.model.hop * 4)
-                with temporary.open("rb") as stream:
-                    os.fsync(stream.fileno())
+                save_checkpoint(self.model.torch, {"network": state}, temporary, cancel, self.model.width * self.model.hop * 4,
+                                root=self.model.state, component="SpeechVerifier.snapshot")
                 check(cancel)
                 os.replace(temporary, target)
             return {"protocol": self.protocol, "identity": self.identity(), "file": target.relative_to(safe_path(self.model.state, "learning")).as_posix(),
@@ -6339,7 +7114,7 @@ class ModelResources:
     @staticmethod
     def estimate(config):
         rate, hop, width, layers = (config[key] for key in ("rate", "hop", "width", "layers"))
-        parameters = (40 * layers + 48) * width * width + (6 * hop + 320) * width + hop * 2
+        parameters = (40 * layers + 48) * width * width + (6 * hop + 8192 + 320) * width + hop * 2
         weights = parameters * 4
         working = max(rate, hop * width) * 4 * 32 + width * layers * 4 * 72 * width
         copies = {"baseline": 1, "serving": 1, "candidate": 1, "gradients": 1, "optimizer": 2,
@@ -6744,8 +7519,8 @@ class NativeAudio:
         if learner is not None:
             relocate_network(self.torch, learner.candidate, learner.optimizer, target)
         verifier = getattr(self, "verifier", None)
-        if verifier is not None:
-            verifier.relocate(target)
+        if verifier is not None and (target.type == "cpu" or previous != target):
+            verifier.relocate(SpeechVerifier.select_device(self, target))
         self.device = target
         self.performance_section = self.performance_identity()
         if previous != target:
@@ -6867,16 +7642,33 @@ class NativeAudio:
 
     def _build(self):
         torch, width, hop, layers = self.torch, self.width, self.hop, self.layers
+        class CodecEncoder(torch.nn.Module):
+            def __init__(self, latent):
+                super().__init__()
+                block = max(1, math.isqrt(hop))
+                while hop % block:
+                    block -= 1
+                self.block = block
+                self.direct = torch.nn.Linear(hop, latent)
+                self.coarse = torch.nn.Linear(hop // block, latent)
+                self.motion = torch.nn.Linear(max(1, hop - 1), latent)
+                self.norm = torch.nn.LayerNorm(latent) if latent > 1 else torch.nn.Identity()
+            def forward(self, frames):
+                shape = frames.shape
+                coarse = frames.reshape(*shape[:-1], hop // self.block, self.block).mean(dim=-1)
+                motion = frames[..., 1:] - frames[..., :-1] if hop > 1 else frames
+                return torch.tanh(self.norm(self.direct(frames) + self.coarse(coarse) + self.motion(motion)))
         class Net(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.prompt = torch.nn.Embedding(256, width)
+                self.prompt = torch.nn.Embedding(8192, width)
                 self.prompt_recurrent = portable_recurrent(torch, width, width, batch_first=True)
+                self.prompt_attention = torch.nn.Linear(width, 1)
                 self.prompt_mix = torch.nn.Sequential(torch.nn.Linear(width, width), torch.nn.Tanh())
                 self.roles = torch.nn.Embedding(4, width)
                 self.tasks = torch.nn.Embedding(2, width)
                 latent = max(1, min(hop, width // 2))
-                self.codec_encoder = torch.nn.Sequential(torch.nn.Linear(hop, latent), torch.nn.LayerNorm(latent) if latent > 1 else torch.nn.Identity(), torch.nn.Tanh())
+                self.codec_encoder = CodecEncoder(latent)
                 self.codec_decoder = torch.nn.Sequential(torch.nn.Linear(latent, width), torch.nn.GELU(), torch.nn.Linear(width, hop), torch.nn.Tanh())
                 self.frame_encoder = torch.nn.Sequential(torch.nn.Linear(latent, width), torch.nn.LayerNorm(width), torch.nn.GELU(), torch.nn.Linear(width, width), torch.nn.Tanh())
                 self.audio_encoder = portable_recurrent(torch, width, width, num_layers=layers, batch_first=True)
@@ -6892,8 +7684,12 @@ class NativeAudio:
                 torch.nn.init.zeros_(self.output.bias)
                 torch.nn.init.zeros_(self.ending.bias)
             def condition(self, ids, hidden=None):
-                _, hidden = self.prompt_recurrent(self.prompt(ids), hidden)
-                return hidden
+                tokens = self.prompt(ids).mean(dim=-2)
+                features, hidden = self.prompt_recurrent(tokens, hidden)
+                attention = torch.softmax(self.prompt_attention(features), dim=1)
+                summary = (features * attention).sum(dim=1)
+                updated = hidden[-1] + self.prompt_mix(summary)
+                return torch.cat((hidden[:-1], updated.unsqueeze(0)), dim=0)
             def initial(self, prompt_hidden, task):
                 base = self.prompt_mix(prompt_hidden[-1]) + self.tasks.weight[task].reshape(1, -1)
                 return base.unsqueeze(0).expand(layers, -1, -1).contiguous()
@@ -7096,12 +7892,14 @@ class NativeAudio:
 
     def _prompt_ids(self, prompt):
         import psutil
-        data = str(prompt).encode("utf-8") or b"\0"
-        budget = max(self.width, available_resources(psutil)["memory"] // max(1, self.width * self.torch.tensor([], dtype=self.dtype).element_size() * 16))
+        data = unicodedata.normalize("NFC", str(prompt)) or "\0"
+        budget = max(self.width, available_resources(psutil)["memory"] // max(1, self.width * self.torch.tensor([], dtype=self.dtype).element_size() * 64))
         if len(data) > budget:
             raise YuanError("提示词超过当前内存预算 / Instructions exceed the current memory budget")
-        values = self.np.frombuffer(data, dtype=self.np.uint8).astype(self.np.int64)
-        return self.torch.from_numpy(values).to(self.device).reshape(1, -1)
+        values = self.np.fromiter((number for character in data for number in
+                                   (ord(character) % 4096, 4096 + ((ord(character) * 2654435761 >> 11) % 4096))),
+                                  dtype=self.np.int64, count=len(data) * 2).reshape(1, len(data), 2)
+        return self.torch.from_numpy(values).to(self.device)
 
     def _frames(self, waveform):
         torch = self.torch
@@ -7276,24 +8074,45 @@ class NativeAudio:
 
     def _acoustic_loss(self, prediction, target):
         torch = self.torch
-        destination = prediction.device
-        if destination.type in ("privateuseone", "mps"):
-            prediction, target = prediction.to("cpu"), target.to("cpu")
-        waveform = torch.nn.functional.smooth_l1_loss(prediction, target)
-        motion = torch.nn.functional.smooth_l1_loss(prediction[:, 1:] - prediction[:, :-1], target[:, 1:] - target[:, :-1]) if target.shape[1] > 1 else waveform * 0
+        if prediction.dtype in (torch.float16, torch.bfloat16):
+            prediction = prediction.float()
+        if target.dtype in (torch.float16, torch.bfloat16):
+            target = target.float()
+        loss_function = torch.nn.functional.smooth_l1_loss
+        waveform = loss_function(prediction, target)
+        motion = loss_function(prediction[:, 1:] - prediction[:, :-1], target[:, 1:] - target[:, :-1]) if target.shape[1] > 1 else waveform * 0
         spectra = []
         maximum = min(target.shape[1], self.hop * max(2, self.layers + 1))
-        size = self.hop
+        size = max(2, min(self.hop, maximum))
+        spectral_backend = getattr(self, "spectral_backend", None)
+        if spectral_backend is None:
+            spectral_backend = "fft" if prediction.device.type in ("cpu", "cuda", "xpu") else "envelope"
         while size <= maximum:
-            window = torch.hann_window(size, device=prediction.device, dtype=prediction.dtype)
-            left = prediction.unfold(-1, size, max(1, size // 2)) * window
-            right = target.unfold(-1, size, max(1, size // 2)) * window
-            left = torch.log1p(torch.abs(torch.fft.rfft(left, dim=-1)))
-            right = torch.log1p(torch.abs(torch.fft.rfft(right, dim=-1)))
-            spectra.append(torch.nn.functional.smooth_l1_loss(left, right))
+            if spectral_backend == "fft":
+                try:
+                    window = torch.hann_window(size, device=prediction.device, dtype=prediction.dtype)
+                    left = torch.log1p(torch.abs(torch.fft.rfft(prediction.unfold(-1, size, max(1, size // 2)) * window, dim=-1)))
+                    right = torch.log1p(torch.abs(torch.fft.rfft(target.unfold(-1, size, max(1, size // 2)) * window, dim=-1)))
+                except (RuntimeError, NotImplementedError) as exc:
+                    if not unsupported_operation(exc):
+                        raise
+                    self.spectral_backend = "envelope"
+                    spectral_backend = "envelope"
+                    spectra.clear()
+                    size = max(2, min(self.hop, maximum))
+                    continue
+            else:
+                try:
+                    left = torch.nn.functional.avg_pool1d(prediction.abs().unsqueeze(1), size, stride=max(1, size // 2)).squeeze(1)
+                    right = torch.nn.functional.avg_pool1d(target.abs().unsqueeze(1), size, stride=max(1, size // 2)).squeeze(1)
+                except (RuntimeError, NotImplementedError) as exc:
+                    if not unsupported_operation(exc):
+                        raise
+                    break
+            spectra.append(loss_function(left, right))
             size *= 2
         spectrum = sum(spectra) / len(spectra) if spectra else waveform * 0
-        return (waveform + motion + spectrum).to(destination)
+        return waveform + motion + spectrum
 
     def loss(self, network, prompt, source, target, ended=False, context=(), rollout=False, task="acoustic", prefix=None, end_label_valid=False, contrasts=(), rollout_frames=None, rollout_weight=1.0):
         torch = self.torch
@@ -7412,7 +8231,7 @@ class NativeAudio:
         return copy.deepcopy(self.network).to(self.device, dtype=self.dtype)
 
     def identity(self):
-        payload = ["yuan-owned-audio-codec-v8-staged-training", self.rate, self.hop, self.width, self.layers]
+        payload = ["yuan-owned-audio-codec-v9-unicode-multiband-attention", self.rate, self.hop, self.width, self.layers]
         return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
 
     def _load_network(self, manifest, cancel=None, state=None):
@@ -7558,9 +8377,8 @@ class NativeAudio:
                 saved = {key: value.detach().cpu().contiguous() for key, value in network.state_dict().items()}
                 if not all(self.torch.isfinite(value).all() for value in saved.values()):
                     raise YuanError("拒绝保存无效模型权重 / Refusing to save invalid model weights")
-                save_checkpoint(self.torch, saved, temporary, cancel, self.width * self.hop * 4)
-                with temporary.open("rb") as stream:
-                    os.fsync(stream.fileno())
+                save_checkpoint(self.torch, saved, temporary, cancel, self.width * self.hop * 4,
+                                root=self.state, component="NativeAudio._persist")
                 check(cancel)
                 verified = self.torch.load(str(temporary), map_location="cpu", weights_only=True)
                 if set(verified) != set(saved) or any(not self.torch.equal(verified[key], value) for key, value in saved.items()):
@@ -8155,8 +8973,7 @@ class NativeAudio:
                     with sf.SoundFile(str(path), mode="w", samplerate=self.rate, channels=1, format="FLAC", subtype="PCM_24") as output_file:
                         for block in self.audio_blocks(values, cancel):
                             output_file.write(block)
-                    with path.open("rb") as stream:
-                        os.fsync(stream.fileno())
+                    sync_written_file(path, self.state, "review_audio_flush", "NativeAudio.prepare_review")
                 cases.append({"generation": generation, "history": history_records, "scenarios": evidence.get("scenarios", []), "id": case_id, "pair": row["id"], "language": evidence["language"], "prompt": evidence["prompt"], "recording_id": row["source_key"],
                               "user_digest": user["digest"], "target_digest": target["digest"], "annotation_digest": payload_digest(evidence),
                               "input_samples": user["count"], "input_start": 0, "input_end": user["count"],
@@ -8709,8 +9526,7 @@ class NativeAudio:
                     generation = {}
                     values = self.respond_audio(alternative["prompt"], alternative["context"], alternative["source"], cancel, network=self.network, evaluation=generation)
                     sf.write(str(path), values, self.rate, format="FLAC", subtype="PCM_24")
-                    with path.open("rb") as stream:
-                        os.fsync(stream.fileno())
+                    sync_written_file(path, self.state, "task_audio_flush", "NativeAudio._task_case")
                     artifact = {"file": path.relative_to(directory).as_posix(), "sha256": digest_file(path, cancel), "generation": generation}
                     atomic_json(record_path, {"identity": identity, "artifact": artifact}, cancel)
             else:
@@ -8894,9 +9710,8 @@ class AudioLearner:
                         payload = {"network": {key: value.detach().cpu().contiguous() for key, value in self.candidate.state_dict().items()},
                                    "optimizer": self.optimizer.state_dict(), "steps": self.steps, "training_loss": self.training_loss,
                                    "last_validation_step": self.last_validation_step, "training_seconds": self.training_seconds, "validation_seconds": self.validation_seconds}
-                        save_checkpoint(self.model.torch, payload, temporary, cancel, self.model.width * self.model.hop * 4)
-                        with temporary.open("rb") as stream:
-                            os.fsync(stream.fileno())
+                        save_checkpoint(self.model.torch, payload, temporary, cancel, self.model.width * self.model.hop * 4,
+                                        root=self.model.state, component="AudioLearner.checkpoint")
                         check(cancel)
                         os.replace(temporary, target)
                         atomic_json(directory / "candidate.json", {"identity": self.model.identity(), "base": self.model.active_digest,
@@ -9692,7 +10507,10 @@ class AudioLearner:
                 horizon = max(1, min(frames, int(horizon / math.sqrt(1 + failures))))
                 weight = self.model.policy.ratio(section, "loss_weight", math.sqrt(horizon / frames))
                 self.rollout_training = {"frames": horizon, "weight": weight}
-                loss = self.model.loss(self.candidate, **features, rollout=True, rollout_frames=horizon, rollout_weight=weight)
+                mixed = self.model.device.type == "cuda" and bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+                precision = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if mixed else nullcontext()
+                with precision:
+                    loss = self.model.loss(self.candidate, **features, rollout=True, rollout_frames=horizon, rollout_weight=weight)
                 retrieval = self.retrieval_loss(cancel)
                 if retrieval is not None:
                     retrieval_loss, retrieval_metrics = retrieval
@@ -9802,11 +10620,10 @@ class DatasetImporter:
         return "dataset_" + payload_digest([self.namespace, identifier])
 
     @supervised('dataset_import', 'learning')
-    def step(self, cancel, paths=None):
-        with self.store.audio_files(cancel):
-            return self._step(cancel, paths)
+    def step(self, cancel, paths=None, on_publish=None):
+        return self._step(cancel, paths, on_publish)
 
-    def _step(self, cancel, paths=None):
+    def _step(self, cancel, paths=None, on_publish=None):
         import numpy as np
         import soundfile as sf
         import psutil
@@ -9815,7 +10632,7 @@ class DatasetImporter:
             if path.is_symlink():
                 continue
             staged = []
-            published = False
+            resources = ExitStack()
             checksum = None
             try:
                 checksum = digest_file(path, cancel)
@@ -9830,8 +10647,17 @@ class DatasetImporter:
                 file_key = "dataset_file_" + payload_digest([self.namespace, path.name])
                 if self.store.setting(file_key) not in (None, key):
                     raise YuanError("同一数据集文件不能更换数据集身份 / A dataset file cannot change its dataset identity")
-                if self.store.setting(key) == checksum:
-                    self.store.set_setting(file_key, key)
+                previous_checksum = self.store.setting(key)
+                if previous_checksum == checksum:
+                    if digest_file(path, cancel) != checksum:
+                        raise YuanError("导入期间标注发生变化 / Annotations changed during import")
+                    with self.store.transaction():
+                        if self.store.setting(file_key) not in (None, key) or self.store.setting(key) != checksum:
+                            raise YuanError("数据集在准备期间被更新 / Dataset was updated during preparation")
+                        if on_publish is not None:
+                            on_publish(path, data, cancel)
+                        self.store.set_setting(file_key, key)
+                    self.failures.pop(path.name, None)
                     continue
                 required = ("recording_id", "reviewer", "annotation_id", "prompt", "license")
                 if data.get("format") != "yuan-paired-audio-v1" or data.get("origin") != "human_recording" or data.get("language") not in ("中文", "English") or not all(isinstance(data.get(field), str) and data[field].strip() for field in required):
@@ -9868,119 +10694,141 @@ class DatasetImporter:
                         if prior is None or prior["role"] != "user" or prior["speaker"] == turn["speaker"] or turn.get("response_verified") is not True:
                             raise YuanError("回复关系或说话人未经标注 / Reply relation or speaker not annotated")
                     planned.append((turn, target))
+                staging = resources.enter_context(self.store.audio_stage(cancel))
                 for turn, target in planned:
                     check(cancel)
-                    waveform, rate = sf.read(str(target), dtype="float32", always_2d=True)
+                    with sf.SoundFile(str(target)) as stream:
+                        rate = stream.samplerate
+                        if stream.frames <= 0 or rate <= 0 or stream.channels <= 0:
+                            raise InvalidAudio("数据集音频格式无效 / Invalid dataset audio format")
+                        if stream.frames * stream.channels * np.dtype(np.float32).itemsize > available_resources(psutil)["memory"] // max(2, self.model.layers + 1):
+                            raise MemoryError("音频超过当前导入预算 / Audio exceeds the current import memory budget")
+                        waveform = np.empty((stream.frames, stream.channels), dtype=np.float32)
+                        block = max(1, min(stream.frames, int(self.model.chunk_seconds * rate)))
+                        for offset in range(0, len(waveform), block):
+                            check(cancel)
+                            count = min(block, len(waveform) - offset)
+                            values = stream.read(count, dtype="float32", always_2d=True)
+                            if len(values) != count:
+                                raise InvalidAudio("导入期间音频被截断 / Audio was truncated during import")
+                            waveform[offset:offset + count] = values
                     if digest_file(target, cancel) != turn["sha256"]:
                         raise InvalidAudio("导入期间音频发生变化 / Audio changed during import")
                     processed = self.model.normalize(waveform, int(rate))
-                    prepared = self.store.prepare_audio(processed, self.model.rate, cancel)
+                    check(cancel)
+                    prepared = self.store.prepare_audio(processed, self.model.rate, staging, cancel)
                     staged.append((turn, prepared))
-                    del waveform, processed
+                    del waveform, processed, values
                 if digest_file(path, cancel) != checksum:
                     raise YuanError("导入期间标注发生变化 / Annotations changed during import")
-                with self.store.transaction():
-                    self.store.group(group, "dataset", forced=split, source_key=data["recording_id"])
-                    if self.store.setting(file_key) not in (None, key):
-                        raise YuanError("同一数据集文件不能更换数据集身份 / A dataset file cannot change its dataset identity")
-                    old_manifest = self.store.setting(key + "_manifest", {})
-                    if old_manifest and old_manifest.get("recording_id") != data["recording_id"]:
-                        raise YuanError("同一数据集文件不能更换录音来源身份 / A dataset file cannot change its recording identity")
-                    changed = self.store.setting(key) not in (None, checksum)
-                    if changed:
-                        kind = ("content" if old_manifest.get("training_sha256") != fingerprints["training_sha256"] else
-                                "evaluation" if old_manifest.get("evaluation_sha256") != fingerprints["evaluation_sha256"] else "metadata")
-                        self.store.revise(group, kind)
-                    retained_ids = {payload_digest([data["recording_id"], turn["id"]]) for turn in data["turns"]}
-                    retired_digests = set()
-                    previous_rows = self.store.db.execute("SELECT id,digest,metadata FROM samples WHERE group_id=?", (group,)).fetchall()
-                    for previous in previous_rows:
-                        if previous["id"] not in retained_ids and (previous["id"] in old_manifest.get("samples", []) or json.loads(previous["metadata"]).get("annotation_id") == data["annotation_id"]):
-                            self.store.db.execute("UPDATE samples SET learnable=0,dialogue_eligible=0,memory_eligible=0,exclusion='annotation_removed',memory_exclusion='annotation_removed' WHERE id=?", (previous["id"],))
-                            self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE user_sample=? OR assistant_sample=?", (previous["id"], previous["id"]))
-                            self.store.db.execute("DELETE FROM memories WHERE sample_id=?", (previous["id"],))
-                            retired_digests.add(previous["digest"])
-                    recorded = {}
-                    base_time = self.store.db.execute("SELECT created FROM groups WHERE id=?", (group,)).fetchone()[0]
+                with self.store.audio_files(cancel):
                     for turn, prepared in staged:
-                        check(cancel)
-                        sample = self.store.add(group, turn["role"], None, self.model.rate, "dataset", cancel, created=base_time + turn["start_seconds"], sample_id=payload_digest([data["recording_id"], turn["id"]]),
-                                                metadata={"recording_id": data["recording_id"], "speaker": turn["speaker"], "raw_sha256": turn["sha256"], "license": data["license"], "annotation": checksum, "annotation_id": data["annotation_id"], "utterance_final": turn.get("utterance_final"), "language": data["language"], "transcript": turn.get("transcript", ""), "transcript_verified": turn.get("transcript_verified") is True}, prepared=prepared)
-                        recorded[turn["id"]] = (turn, self.store.sample(sample))
-                        if turn["role"] == "assistant":
-                            user_turn, user = recorded[turn["reply_to"]]
-                            assistant = self.store.sample(sample)
-                            evidence = {"method": "human_audio_annotation", "reviewer": data["reviewer"], "annotation_id": data["annotation_id"], "recording_id": data["recording_id"],
-                                        "language": data["language"], "prompt": data["prompt"], "user_speaker": user_turn["speaker"], "assistant_speaker": turn["speaker"], "roles_verified": True,
-                                        "response_verified": True, "user_sha256": user["digest"], "assistant_sha256": assistant["digest"], "annotation_sha256": checksum}
-                            scenarios = turn.get("scenarios", data.get("scenarios", []))
-                            if not isinstance(scenarios, list) or any(value not in AcceptancePolicy.dimensions for value in scenarios) or len(scenarios) != len(set(scenarios)):
-                                raise YuanError("人工场景标注无效 / Invalid human scenario annotation")
-                            evidence["scenarios"] = scenarios
-                            retrieval = turn.get("retrieval")
-                            if retrieval is not None:
-                                if not isinstance(retrieval, dict) or retrieval.get("verified") is not True or retrieval.get("method") != "human_retrieval_relevance_v1" or not isinstance(retrieval.get("examples"), list) or not retrieval["examples"]:
-                                    raise YuanError("检索相关性标注无效 / Invalid retrieval relevance annotations")
-                                examples = []
-                                for item in retrieval["examples"]:
-                                    if not isinstance(item, dict) or type(item.get("relevant")) is not bool or item.get("sample") not in recorded:
-                                        raise YuanError("检索标注缺少已记录音频 / Retrieval annotation lacks a recorded audio reference")
-                                    reference = recorded[item["sample"]][1]
-                                    left, right = item.get("start_seconds", 0.0), item.get("end_seconds", reference["seconds"])
-                                    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in (left, right)) or not 0 <= left < right <= reference["seconds"]:
-                                        raise YuanError("检索标注区间无效 / Invalid annotated retrieval interval")
-                                    examples.append({"sample": reference["id"], "start": int(round(left * reference["rate"])), "end": min(reference["count"], int(round(right * reference["rate"]))), "relevant": item["relevant"]})
-                                evidence["retrieval"] = {"method": retrieval["method"], "verified": True, "examples": examples}
-                            if "dialogue" in turn:
-                                evidence["dialogue"] = copy.deepcopy(turn["dialogue"])
-                            if "semantic" in turn:
-                                evidence["semantic"] = copy.deepcopy(turn["semantic"])
-                            if "reference_checks" in turn:
-                                evidence["reference_checks"] = dict(turn["reference_checks"])
-                            controls = turn.get("contrasts", {})
-                            if not isinstance(controls, dict) or any(value not in AcceptancePolicy.dimensions for value in controls):
-                                raise YuanError("对照标注无效 / Invalid contrast annotation")
-                            contrasts = {}
-                            for dimension, control in controls.items():
-                                if not isinstance(control, dict) or control.get("requires_different_reply") is not True or control.get("verified") is not True:
-                                    raise YuanError("对照必须由人工确认需要不同回复 / Human confirmation that the contrast requires a different reply is required")
-                                if dimension == "prompt":
-                                    alternative = control.get("prompt")
-                                    if not isinstance(alternative, str) or not alternative.strip() or alternative == data["prompt"]:
-                                        raise YuanError("提示词对照无效 / Invalid prompt contrast")
-                                    contrasts[dimension] = {"prompt": alternative}
-                                elif dimension == "input":
-                                    other = recorded.get(control.get("turn_id"))
-                                    if other is None or other[0]["role"] != "user" or other[1]["id"] == user["id"]:
-                                        raise YuanError("输入对照必须引用不同的真实用户音频 / Input contrast must reference different real user audio")
-                                    contrasts[dimension] = {"sample": other[1]["id"]}
-                                else:
-                                    identifiers = control.get("turn_ids")
-                                    if not isinstance(identifiers, list) or len(identifiers) != len(set(identifiers)) or any(identifier not in recorded for identifier in identifiers):
-                                        raise YuanError("历史对照引用无效 / Invalid history contrast references")
-                                    alternate = [recorded[identifier][1]["id"] for identifier in identifiers]
-                                    if user["id"] in alternate or sample in alternate:
-                                        raise YuanError("历史对照不能包含当前输入或目标 / History contrast cannot contain the current input or target")
-                                    contrasts[dimension] = {"samples": alternate}
-                            for dimension, specification in contrasts.items():
-                                if "semantic" in controls[dimension]:
-                                    specification["semantic"] = copy.deepcopy(controls[dimension]["semantic"])
-                            evidence["contrasts"] = contrasts
-                            self.store.add_pair(group, user["id"], sample, "annotated_human_audio", verified=True, evidence=evidence)
-                    retained_pairs = {(recorded[turn["reply_to"]][1]["id"], recorded[turn["id"]][1]["id"]) for turn in data["turns"] if turn["role"] == "assistant"}
-                    for prior in self.store.db.execute("SELECT id,user_sample,assistant_sample,evidence FROM turn_pairs WHERE group_id=?", (group,)).fetchall():
-                        if ((prior["user_sample"], prior["assistant_sample"]) not in retained_pairs
-                                and json.loads(prior["evidence"]).get("annotation_id") in (old_manifest.get("annotation_id"), data["annotation_id"])):
-                            self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE id=?", (prior["id"],))
-                    retained = {sample[1]["id"] for sample in recorded.values()}
-                    for retired_digest in retired_digests:
-                        self.store.refresh_audio_owner(retired_digest)
-                    self.store.assert_independent([group])
-                    self.store.set_setting(file_key, key)
-                    self.store.set_setting(key, checksum)
-                    self.store.set_setting(key + "_manifest", {"namespace": self.namespace, "dataset_id": data.get("dataset_id", path.name),
-                                                              "recording_id": data["recording_id"], "annotation_id": data["annotation_id"], "samples": sorted(retained), **fingerprints})
-                published = True
+                        self.store.publish_audio(prepared, cancel)
+                    with self.store.transaction():
+                        if self.store.setting(key) != previous_checksum:
+                            raise YuanError("数据集在准备期间被更新 / Dataset was updated during preparation")
+                        self.store.group(group, "dataset", forced=split, source_key=data["recording_id"])
+                        if self.store.setting(file_key) not in (None, key):
+                            raise YuanError("同一数据集文件不能更换数据集身份 / A dataset file cannot change its dataset identity")
+                        if on_publish is not None:
+                            on_publish(path, data, cancel)
+                        old_manifest = self.store.setting(key + "_manifest", {})
+                        if old_manifest and old_manifest.get("recording_id") != data["recording_id"]:
+                            raise YuanError("同一数据集文件不能更换录音来源身份 / A dataset file cannot change its recording identity")
+                        changed = self.store.setting(key) not in (None, checksum)
+                        if changed:
+                            kind = ("content" if old_manifest.get("training_sha256") != fingerprints["training_sha256"] else
+                                    "evaluation" if old_manifest.get("evaluation_sha256") != fingerprints["evaluation_sha256"] else "metadata")
+                            self.store.revise(group, kind)
+                        retained_ids = {payload_digest([data["recording_id"], turn["id"]]) for turn in data["turns"]}
+                        retired_digests = set()
+                        previous_rows = self.store.db.execute("SELECT id,digest,metadata FROM samples WHERE group_id=?", (group,)).fetchall()
+                        for previous in previous_rows:
+                            if previous["id"] not in retained_ids and (previous["id"] in old_manifest.get("samples", []) or json.loads(previous["metadata"]).get("annotation_id") == data["annotation_id"]):
+                                self.store.db.execute("UPDATE samples SET learnable=0,dialogue_eligible=0,memory_eligible=0,exclusion='annotation_removed',memory_exclusion='annotation_removed' WHERE id=?", (previous["id"],))
+                                self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE user_sample=? OR assistant_sample=?", (previous["id"], previous["id"]))
+                                self.store.db.execute("DELETE FROM memories WHERE sample_id=?", (previous["id"],))
+                                retired_digests.add(previous["digest"])
+                        recorded = {}
+                        base_time = self.store.db.execute("SELECT created FROM groups WHERE id=?", (group,)).fetchone()[0]
+                        for turn, prepared in staged:
+                            check(cancel)
+                            sample = self.store.add(group, turn["role"], None, self.model.rate, "dataset", cancel, created=base_time + turn["start_seconds"], sample_id=payload_digest([data["recording_id"], turn["id"]]),
+                                                    metadata={"recording_id": data["recording_id"], "speaker": turn["speaker"], "raw_sha256": turn["sha256"], "license": data["license"], "annotation": checksum, "annotation_id": data["annotation_id"], "utterance_final": turn.get("utterance_final"), "language": data["language"], "transcript": turn.get("transcript", ""), "transcript_verified": turn.get("transcript_verified") is True}, prepared=prepared)
+                            recorded[turn["id"]] = (turn, self.store.sample(sample))
+                            if turn["role"] == "assistant":
+                                user_turn, user = recorded[turn["reply_to"]]
+                                assistant = self.store.sample(sample)
+                                evidence = {"method": "human_audio_annotation", "reviewer": data["reviewer"], "annotation_id": data["annotation_id"], "recording_id": data["recording_id"],
+                                            "language": data["language"], "prompt": data["prompt"], "user_speaker": user_turn["speaker"], "assistant_speaker": turn["speaker"], "roles_verified": True,
+                                            "response_verified": True, "user_sha256": user["digest"], "assistant_sha256": assistant["digest"], "annotation_sha256": checksum}
+                                scenarios = turn.get("scenarios", data.get("scenarios", []))
+                                if not isinstance(scenarios, list) or any(value not in AcceptancePolicy.dimensions for value in scenarios) or len(scenarios) != len(set(scenarios)):
+                                    raise YuanError("人工场景标注无效 / Invalid human scenario annotation")
+                                evidence["scenarios"] = scenarios
+                                retrieval = turn.get("retrieval")
+                                if retrieval is not None:
+                                    if not isinstance(retrieval, dict) or retrieval.get("verified") is not True or retrieval.get("method") != "human_retrieval_relevance_v1" or not isinstance(retrieval.get("examples"), list) or not retrieval["examples"]:
+                                        raise YuanError("检索相关性标注无效 / Invalid retrieval relevance annotations")
+                                    examples = []
+                                    for item in retrieval["examples"]:
+                                        if not isinstance(item, dict) or type(item.get("relevant")) is not bool or item.get("sample") not in recorded:
+                                            raise YuanError("检索标注缺少已记录音频 / Retrieval annotation lacks a recorded audio reference")
+                                        reference = recorded[item["sample"]][1]
+                                        left, right = item.get("start_seconds", 0.0), item.get("end_seconds", reference["seconds"])
+                                        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in (left, right)) or not 0 <= left < right <= reference["seconds"]:
+                                            raise YuanError("检索标注区间无效 / Invalid annotated retrieval interval")
+                                        examples.append({"sample": reference["id"], "start": int(round(left * reference["rate"])), "end": min(reference["count"], int(round(right * reference["rate"]))), "relevant": item["relevant"]})
+                                    evidence["retrieval"] = {"method": retrieval["method"], "verified": True, "examples": examples}
+                                if "dialogue" in turn:
+                                    evidence["dialogue"] = copy.deepcopy(turn["dialogue"])
+                                if "semantic" in turn:
+                                    evidence["semantic"] = copy.deepcopy(turn["semantic"])
+                                if "reference_checks" in turn:
+                                    evidence["reference_checks"] = dict(turn["reference_checks"])
+                                controls = turn.get("contrasts", {})
+                                if not isinstance(controls, dict) or any(value not in AcceptancePolicy.dimensions for value in controls):
+                                    raise YuanError("对照标注无效 / Invalid contrast annotation")
+                                contrasts = {}
+                                for dimension, control in controls.items():
+                                    if not isinstance(control, dict) or control.get("requires_different_reply") is not True or control.get("verified") is not True:
+                                        raise YuanError("对照必须由人工确认需要不同回复 / Human confirmation that the contrast requires a different reply is required")
+                                    if dimension == "prompt":
+                                        alternative = control.get("prompt")
+                                        if not isinstance(alternative, str) or not alternative.strip() or alternative == data["prompt"]:
+                                            raise YuanError("提示词对照无效 / Invalid prompt contrast")
+                                        contrasts[dimension] = {"prompt": alternative}
+                                    elif dimension == "input":
+                                        other = recorded.get(control.get("turn_id"))
+                                        if other is None or other[0]["role"] != "user" or other[1]["id"] == user["id"]:
+                                            raise YuanError("输入对照必须引用不同的真实用户音频 / Input contrast must reference different real user audio")
+                                        contrasts[dimension] = {"sample": other[1]["id"]}
+                                    else:
+                                        identifiers = control.get("turn_ids")
+                                        if not isinstance(identifiers, list) or len(identifiers) != len(set(identifiers)) or any(identifier not in recorded for identifier in identifiers):
+                                            raise YuanError("历史对照引用无效 / Invalid history contrast references")
+                                        alternate = [recorded[identifier][1]["id"] for identifier in identifiers]
+                                        if user["id"] in alternate or sample in alternate:
+                                            raise YuanError("历史对照不能包含当前输入或目标 / History contrast cannot contain the current input or target")
+                                        contrasts[dimension] = {"samples": alternate}
+                                for dimension, specification in contrasts.items():
+                                    if "semantic" in controls[dimension]:
+                                        specification["semantic"] = copy.deepcopy(controls[dimension]["semantic"])
+                                evidence["contrasts"] = contrasts
+                                self.store.add_pair(group, user["id"], sample, "annotated_human_audio", verified=True, evidence=evidence)
+                        retained_pairs = {(recorded[turn["reply_to"]][1]["id"], recorded[turn["id"]][1]["id"]) for turn in data["turns"] if turn["role"] == "assistant"}
+                        for prior in self.store.db.execute("SELECT id,user_sample,assistant_sample,evidence FROM turn_pairs WHERE group_id=?", (group,)).fetchall():
+                            if ((prior["user_sample"], prior["assistant_sample"]) not in retained_pairs
+                                    and json.loads(prior["evidence"]).get("annotation_id") in (old_manifest.get("annotation_id"), data["annotation_id"])):
+                                self.store.db.execute("UPDATE turn_pairs SET verified=0,eligible=0 WHERE id=?", (prior["id"],))
+                        retained = {sample[1]["id"] for sample in recorded.values()}
+                        for retired_digest in retired_digests:
+                            self.store.refresh_audio_owner(retired_digest)
+                        self.store.assert_independent([group])
+                        self.store.set_setting(file_key, key)
+                        self.store.set_setting(key, checksum)
+                        self.store.set_setting(key + "_manifest", {"namespace": self.namespace, "dataset_id": data.get("dataset_id", path.name),
+                                                                  "recording_id": data["recording_id"], "annotation_id": data["annotation_id"], "samples": sorted(retained), **fingerprints})
                 self.failures.pop(path.name, None)
                 self.emit("dataset_import", file=path.name, group=group, turns=len(recorded), annotation_sha256=checksum, annotation_gaps=annotation_gaps)
                 if hasattr(self.model, "policy"):
@@ -9996,9 +10844,7 @@ class DatasetImporter:
                 self.failures[path.name] = {"checksum": checksum, "attempts": attempts, "retry_at": time.monotonic() + delay}
                 self.emit("notice", key="dataset_rejected", file=path.name, reason=concise_error(exc), retry_seconds=delay)
             finally:
-                if not published:
-                    for turn, prepared in staged:
-                        self.store.discard_audio(prepared)
+                resources.close()
         return False
 
     def select_split(self, data):
@@ -10160,6 +11006,17 @@ class WorkspaceAudio:
         value = path.stat()
         return [value.st_size, value.st_mtime_ns, value.st_ctime_ns, value.st_dev, value.st_ino]
 
+    def claim_manifest(self, path, data, cancel):
+        for turn in data["turns"]:
+            check(cancel)
+            audio = safe_path(path.parent, turn["audio"])
+            previous = self.store.setting(self.key(audio), {})
+            if previous.get("group"):
+                result = self.store.db.execute("UPDATE samples SET learnable=0,dialogue_eligible=0,memory_eligible=0,exclusion='annotated_history',memory_exclusion='annotated_history' WHERE group_id=? AND (learnable=1 OR dialogue_eligible=1 OR memory_eligible=1)", (previous["group"],))
+                if result.rowcount:
+                    self.store.revise(previous["group"])
+            self.store.set_setting("history_claim_" + payload_digest(audio.relative_to(self.root).as_posix()), True)
+
     def manifest(self, path, cancel):
         import psutil
         if path.stat().st_size > available_resources(psutil)["memory"] // max(2, self.model.layers + 1):
@@ -10167,27 +11024,14 @@ class WorkspaceAudio:
         data = checked_json(path)
         if not isinstance(data, dict) or data.get("format") != "yuan-paired-audio-v1":
             return False
-        DatasetImporter.validate_annotations(data)
         namespace = "history:" + path.parent.relative_to(self.root).as_posix()
         importer = self.importers.get(namespace)
         if importer is None:
             importer = DatasetImporter(self.state, self.store, self.model, self.emit, namespace=namespace, root=path.parent)
             self.importers[namespace] = importer
-        with self.store.audio_files(cancel), self.store.transaction():
-            for turn in data["turns"]:
-                check(cancel)
-                audio = safe_path(path.parent, turn["audio"])
-                previous = self.store.setting(self.key(audio), {})
-                if previous.get("group"):
-                    result = self.store.db.execute("UPDATE samples SET learnable=0,dialogue_eligible=0,memory_eligible=0,exclusion='annotated_history',memory_exclusion='annotated_history' WHERE group_id=? AND (learnable=1 OR dialogue_eligible=1)", (previous["group"],))
-                    if result.rowcount:
-                        self.store.revise(previous["group"])
-            worked = importer.step(cancel, (path,))
-            if importer.failures.get(path.name):
-                raise YuanError("历史对话标注或音频未通过校验 / History dialogue annotations or audio did not pass verification")
-            for turn in data["turns"]:
-                audio = safe_path(path.parent, turn["audio"])
-                self.store.set_setting("history_claim_" + payload_digest(audio.relative_to(self.root).as_posix()), True)
+        worked = importer.step(cancel, (path,), on_publish=self.claim_manifest)
+        if importer.failures.get(path.name):
+            raise YuanError("历史对话标注或音频未通过校验 / History dialogue annotations or audio did not pass verification")
         return worked
 
     def recording(self, path, record, cancel):
@@ -10331,24 +11175,61 @@ class PublicDialogue:
             names.add(item["file"])
 
     @staticmethod
-    def channel_turns(values):
+    def channel_turns(values, rate=16000):
         import numpy as np
         values = np.asarray(values, dtype=np.float32)
-        if values.ndim != 2 or values.shape[1] != 2 or not len(values) or not np.isfinite(values).all():
+        if values.ndim != 2 or values.shape[1] != 2 or not len(values) or not np.isfinite(values).all() or rate <= 0:
             raise InvalidAudio("公开对话必须是有效的双声道真人录音 / Public dialogue must be a valid stereo human recording")
-        active = np.abs(values) > np.finfo(np.float32).eps
-        if np.any(active[:, 0] & active[:, 1]):
-            raise IneligibleSample("声道发生重叠，不作为自动配对证据 / Overlapping channels cannot establish automatic pair supervision")
-        indices = np.flatnonzero(np.any(active, axis=1))
-        if len(indices) < 2:
-            raise IneligibleSample("公开对话缺少有效发言 / Public dialogue has insufficient speech")
-        speakers = active[indices].argmax(axis=1)
-        switches = np.flatnonzero(speakers[1:] != speakers[:-1]) + 1
-        if not len(switches):
-            raise IneligibleSample("公开对话没有说话人轮换 / Public dialogue has no speaker turns")
-        boundaries = [0, *[((int(indices[position - 1]) + int(indices[position]) + 1) // 2) for position in switches], len(values)]
-        channels = [int(speakers[0]), *[int(speakers[position]) for position in switches]]
-        return [(start, end, channel) for start, end, channel in zip(boundaries, boundaries[1:], channels)]
+        frame = max(16, int(round(rate * 0.02)))
+        length = int(math.ceil(len(values) / frame))
+        padded = np.pad(values, ((0, length * frame - len(values)), (0, 0)))
+        energy = np.sqrt(np.mean(padded.reshape(length, frame, 2).astype(np.float64) ** 2, axis=1))
+        noise = np.quantile(energy, 0.2, axis=0)
+        variation = np.median(np.abs(energy - noise), axis=0)
+        peaks = np.quantile(energy, 0.98, axis=0)
+        floor = np.maximum(np.finfo(np.float32).eps * math.sqrt(rate), noise + variation * math.sqrt(max(2, length)))
+        floor = np.minimum(np.maximum(floor, peaks / max(2.0, math.sqrt(length))), np.maximum(peaks, floor))
+        dominant = energy.argmax(axis=1)
+        strongest = np.max(energy, axis=1)
+        weakest = np.min(energy, axis=1)
+        foreground = strongest > floor[dominant]
+        ratios = strongest / np.maximum(weakest, np.finfo(np.float64).eps)
+        candidate = ratios[foreground]
+        separation = max(math.sqrt(2.0), min(4.0, float(np.quantile(candidate, 0.25)) if len(candidate) else 2.0))
+        reliable = foreground & (ratios >= separation)
+        labels = np.where(reliable, dominant, -1)
+        overlap = foreground & (weakest > np.minimum(floor[0], floor[1])) & ~reliable
+        minimum = max(2, int(round(rate * 0.08 / frame)))
+        runs = []
+        beginning = None
+        speaker = None
+        for index in range(length + 1):
+            current = int(labels[index]) if index < length else -1
+            if current != speaker and speaker is not None:
+                if index - beginning >= minimum:
+                    runs.append((beginning, index, speaker))
+                speaker = None
+                beginning = None
+            if current >= 0 and speaker is None:
+                speaker, beginning = current, index
+        if len(runs) < 2 or len({row[2] for row in runs}) < 2:
+            raise IneligibleSample("公开对话没有可靠的双人轮换 / Public dialogue lacks confidently separated speaker turns")
+        turns = []
+        previous = 0
+        join_gap = max(frame, int(math.sqrt(rate * frame)))
+        for first, last, channel in runs:
+            start = first * frame
+            end = min(len(values), last * frame)
+            uncertain = bool(np.any(overlap[previous:first]))
+            previous = last
+            if turns and channel == turns[-1][2] and not uncertain and start - turns[-1][1] <= join_gap:
+                before = turns[-1]
+                turns[-1] = (before[0], end, channel, before[3])
+            else:
+                turns.append((start, end, channel, uncertain))
+        if len(turns) < 2:
+            raise IneligibleSample("公开对话没有足够的可信轮次 / Public dialogue has insufficient reliable turns")
+        return turns
 
     def import_recording(self, asset, path, cancel):
         import soundfile as sf
@@ -10361,50 +11242,49 @@ class PublicDialogue:
         values, rate = sf.read(str(path), dtype="float32", always_2d=True)
         if digest_file(path, cancel) != asset["sha256"]:
             raise InvalidDownload("公开对话音频摘要不匹配 / Public dialogue audio checksum mismatch")
-        turns = self.channel_turns(values)
+        turns = self.channel_turns(values, rate)
         first_channel = turns[0][2]
         recording = "dailytalk:" + Path(asset["file"]).stem
         group = "corpus-" + payload_digest(recording)
         prompt = "Respond naturally in English to the other speaker, using the preceding conversation."
-        staged, published = [], False
-        try:
+        staged = []
+        with self.store.audio_stage(cancel) as staging:
+            for index, (start, end, channel, uncertain) in enumerate(turns):
+                check(cancel)
+                processed = self.model.normalize(values[start:end, channel], rate)
+                if len(processed) < self.model.hop:
+                    continue
+                prepared = self.store.prepare_audio(processed, self.model.rate, staging, cancel)
+                metadata = {"corpus": self.repository, "recording_id": recording, "revision": self.catalog["revision"],
+                            "source_file_sha256": asset["sha256"], "license": self.catalog["license"],
+                            "attribution": "DailyTalk: Keon Lee, Kyumin Park, Daeyoung Kim; stereo arrangement: Kyutai",
+                            "source_url": "https://huggingface.co/datasets/" + self.repository + "/resolve/" + self.catalog["revision"] + "/" + asset["file"],
+                            "source_start": start, "source_end": end, "source_rate": rate, "channel": channel,
+                            "turn_index": index, "channel_separation_verified": True, "utterance_final": not uncertain,
+                            "preceding_overlap": uncertain, "language": "English", "training_only": True}
+                staged.append((index, start, "user" if channel == first_channel else "assistant", metadata, prepared))
+            if len(staged) < 2 or len({item[2] for item in staged}) < 2:
+                raise IneligibleSample("有效说话轮次不足 / Insufficient valid separated speech turns")
             with self.store.audio_files(cancel):
-                for index, (start, end, channel) in enumerate(turns):
-                    check(cancel)
-                    processed = self.model.normalize(values[start:end, channel], rate)
-                    if len(processed) < self.model.hop:
-                        raise IneligibleSample("公开对话轮次过短 / Public dialogue turn is too short")
-                    prepared = self.store.prepare_audio(processed, self.model.rate, cancel)
-                    metadata = {"corpus": self.repository, "recording_id": recording, "revision": self.catalog["revision"],
-                                "source_file_sha256": asset["sha256"], "license": self.catalog["license"],
-                                "attribution": "DailyTalk: Keon Lee, Kyumin Park, Daeyoung Kim; stereo arrangement: Kyutai",
-                                "source_url": "https://huggingface.co/datasets/" + self.repository + "/resolve/" + self.catalog["revision"] + "/" + asset["file"],
-                                "source_start": start, "source_end": end, "source_rate": rate, "channel": channel,
-                                "turn_index": index, "channel_separation_verified": True, "utterance_final": True,
-                                "training_only": True}
-                    staged.append((index, start, "user" if channel == first_channel else "assistant", metadata, prepared))
+                for index, start, role, metadata, prepared in staged:
+                    self.store.publish_audio(prepared, cancel)
                 with self.store.transaction():
                     self.store.group(group, "dataset", source_key=recording, retention="training_cache",
                                      provenance={key: staged[0][3][key] for key in ("corpus", "recording_id", "revision", "source_file_sha256", "license", "attribution", "source_url")})
                     base_time = self.store.db.execute("SELECT created FROM groups WHERE id=?", (group,)).fetchone()[0]
-                    prior = None
+                    prior = prior_index = None
                     for index, start, role, metadata, prepared in staged:
                         check(cancel)
                         sample = self.store.add(group, role, None, self.model.rate, "dataset", cancel, created=base_time + start / rate,
                                                 sample_id=payload_digest([recording, asset["sha256"], index]), metadata=metadata, prepared=prepared)
-                        if role == "assistant" and prior is not None:
+                        if role == "assistant" and prior is not None and index == prior_index + 1 and not metadata["preceding_overlap"]:
                             self.store.add_corpus_pair(group, prior, sample, prompt)
-                        prior = sample if role == "user" else None
+                        prior, prior_index = (sample, index) if role == "user" else (None, None)
                     self.store.assert_independent([group])
                     self.store.set_setting("corpus_import_" + payload_digest([self.repository, asset["file"]]), asset["sha256"])
-                published = True
-            self.emit("dataset_import", key="public_dialogue_import", corpus=self.repository, group=group, turns=len(staged),
-                      training_only=True, semantic_acceptance=False)
-            return True
-        finally:
-            if not published:
-                for index, start, role, metadata, prepared in staged:
-                    self.store.discard_audio(prepared)
+        self.emit("dataset_import", key="public_dialogue_import", corpus=self.repository, group=group, turns=len(staged),
+                  training_only=True, semantic_acceptance=False)
+        return True
 
     @supervised("public_dialogue", "learning")
     def step(self, cancel):
@@ -11604,6 +12484,7 @@ class AudioDevices:
         self.input_faults = 0
         self.input_callbacks = self.output_callbacks = 0
         self.last_input_callback = self.last_output_callback = time.monotonic()
+        self.audio_integrity = {}
         self.callback_timeout = model.policy.number("audio", "callback_timeout_seconds", max(1.0, model.chunk_seconds * 2), model.hop / model.rate, 3600.0)
         self.output_faults = 0
         self.vad_rate = model.rate
@@ -11930,7 +12811,43 @@ class AudioDevices:
             raise
         self.emit("notice", key="full_duplex", component="separate_streams", reasons=reasons)
 
+    def _integrity_test(self, cancel):
+        import numpy as np
+        check(cancel)
+        rate = self.model.rate
+        period = max(self.model.hop * 4, int(rate * self.model.policy.number("audio", "integrity_test_seconds", 0.06, self.model.hop / rate, 1.0)))
+        position = np.arange(period, dtype=np.float64)
+        probe = (np.sin(position * (2 * np.pi / max(4, math.sqrt(period)))) * 0.15).astype(np.float32)
+        ring = SampleRing(max(period * 2, self.model.hop * 8), rate)
+        start = time.monotonic()
+        ring.write(probe, start)
+        pieces = []
+        while ring.count:
+            check(cancel)
+            chunk, _, gap = ring.read_block(min(self.model.hop, ring.count))
+            if gap:
+                raise YuanError("音频环形缓冲出现不连续 / Ring buffer self-test became discontinuous")
+            pieces.append(chunk.copy())
+        recovered = np.concatenate(pieces)
+        if recovered.shape != probe.shape or not np.allclose(recovered, probe, rtol=0, atol=np.finfo(np.float32).eps * 16):
+            raise YuanError("音频缓冲区自检失败 / Audio buffer self-test failed")
+        discontinuity = SampleRing(max(period * 2, self.model.hop * 8), rate)
+        midpoint = max(1, period // 2)
+        discontinuity.write(probe[:midpoint], start)
+        discontinuity.write(probe[midpoint:], start + (midpoint + max(1, self.model.hop)) / rate)
+        first, _, first_gap = discontinuity.read_block(period)
+        second, _, second_gap = discontinuity.read_block(period)
+        if first_gap or not second_gap or len(first) + len(second) != period:
+            raise YuanError("音频时间戳中断自检失败 / Audio discontinuity detection self-test failed")
+        resampler = AudioPreprocessor(rate, rate)
+        converted = np.concatenate((resampler.process(probe[:period // 2]), resampler.process(probe[period // 2:], final=True)))
+        if converted.shape != probe.shape or not np.array_equal(converted, probe):
+            raise YuanError("连续音频处理自检失败 / Continuous audio processing self-test failed")
+        self.audio_integrity = {"ring": True, "discontinuity_detection": True, "continuous_preprocess": True, "checked_at": time.time(), "samples": period}
+        self.emit("audio_integrity", **self.audio_integrity)
+
     def _preflight(self, cancel, deadline):
+        self._integrity_test(cancel)
         self._close_streams()
         initial_input, initial_output = self.input_callbacks, self.output_callbacks
         try:
@@ -12788,7 +13705,12 @@ class SourceRegistry:
                   "conversation_verified": bool(model.service_ready())}
         phase = ("accepted" if stages["conversation_verified"] else "acquiring_training_evidence" if training else
                  "acquiring_independent_evidence" if development or final else "training_and_evaluating")
+        quotas = {language: {split: {"have": sum(cell["have"] for cell in report["cells"] if cell["language"] == language and cell["split"] == split),
+                                   "need": sum(cell["need"] for cell in report["cells"] if cell["language"] == language and cell["split"] == split)}
+                             for split in ("train", "validation", "guard", "release")}
+                  for language in AcceptancePolicy.languages}
         state = {"protocol": "yuan-autonomous-bootstrap-v3-import-evidence", "stages": stages, "tasks": enriched,
+                 "language_coverage": quotas, "learning_active_without_conversation": not stages["conversation_verified"],
                  "phase": phase, "build_sha256": build_digest(), "requires_user_dataset_preparation": False,
                  "model_creation_is_capability_acceptance": False, "missing_task_count": len(enriched),
                  "unvalidated_import_count": sum(not task["source_contract_ready"] for task in enriched),
@@ -13012,6 +13934,8 @@ class AnnotatedAcquisition:
         language = {"中文": "Chinese", "English": "English"}.get(task.get("language"), "")
         queries = [{"search": " ".join(value for value in (language, "annotated audio dialogue") if value)},
                    {"search": " ".join(value for value in (language, "recorded conversation") if value)},
+                   {"search": " ".join(value for value in (language, "human conversational speech with speaker turns") if value)},
+                   {"search": " ".join(value for value in (language, "annotated multi turn dialogue") if value)},
                    {"search": "speech dialogue"}, {"filter": "yuan-paired-audio-v1"}, {"search": "yuan-paired-audio"}]
         if task.get("gap_kind") == "retrieval_supervision":
             queries = [{"search": language + " speech retrieval relevance"}, {"search": "annotated spoken memory"}, *queries]
@@ -13453,21 +14377,17 @@ class PublishedSpeech:
             raise IneligibleSample("原生语料片段过短 / Native corpus utterance is too short")
         metadata = {**descriptor, "corpus": self.repository, "revision": source["revision"], "license": self.specification["license"], "attribution": self.specification["attribution"], "raw_sha256": raw_digest, "source_shard": json.loads(source["item"]), "source_url": "https://huggingface.co/datasets/" + self.repository + "/tree/" + source["revision"]}
         group = "native-" + payload_digest(descriptor["recording_id"])
-        prepared, published = None, False
-        try:
+        with self.store.audio_stage(cancel) as staging:
+            prepared = self.store.prepare_audio(values, self.model.rate, staging, cancel)
             with self.store.audio_files(cancel):
-                prepared = self.store.prepare_audio(values, self.model.rate, cancel)
+                self.store.publish_audio(prepared, cancel)
                 with self.store.transaction():
                     self.store.group(group, "dataset", forced=descriptor["split"], source_key=descriptor["recording_id"], retention="training_cache", provenance={key: metadata[key] for key in ("corpus", "revision", "license", "attribution", "source_url", "source_identity_scope")})
                     created = previous["created"] if previous is not None else time.time()
                     self.store.add(group, "user", None, self.model.rate, "dataset", cancel, created=created, sample_id=identifier, metadata=metadata, prepared=prepared)
                     self.store.assert_independent([group])
-                published = True
-            self.emit("dataset_import", key="public_speech_import", corpus=self.repository, sample=identifier, language=descriptor["language"], split=descriptor["split"], evidence_scope="human_transcript_supervision", semantic_acceptance=False)
-            return True
-        finally:
-            if prepared is not None and not published:
-                self.store.discard_audio(prepared)
+        self.emit("dataset_import", key="public_speech_import", corpus=self.repository, sample=identifier, language=descriptor["language"], split=descriptor["split"], evidence_scope="human_transcript_supervision", semantic_acceptance=False)
+        return True
 
     def open_source(self, source, cancel):
         import pyarrow.parquet as pq
@@ -13769,6 +14689,9 @@ class CaptureSession:
         self.saved = self.consumed = 0
         self.packet_sequence = 0
         self.inference_dropped = 0
+        self.barge_in_at = None
+        self.barge_in_events = 0
+        self.last_echo = {}
         self.failure = None
         self.inference = UtteranceQueue(self.model.capacity() * self.model.np.dtype(self.model.np.float32).itemsize,
                                          max(1, math.isqrt(self.model.capacity() // self.model.hop)))
@@ -13958,6 +14881,8 @@ class CaptureSession:
                     segment_quality = list(quality_frames)
                     segment_start = timestamp + take / model.rate - (sum(len(value) for value in gate.frames) if result is None else len(result)) / model.rate
                 if interrupted_speech and not self.utterance_confirmed:
+                    self.barge_in_at = time.monotonic()
+                    self.barge_in_events += 1
                     self.reply_epoch += 1
                     if before:
                         self.utterance_id = uuid.uuid4().hex
@@ -13979,6 +14904,8 @@ class CaptureSession:
                 now = time.monotonic()
                 if now - last_levels >= math.sqrt(gate.frame_seconds):
                     last_levels = now
+                    self.last_echo = {"state": echo.reference_state, "correlation": echo.correlation, "reduction": echo.reduction,
+                                      "double_talk": echo.double_talk, "reference_complete": echo.reference_complete}
                     self.emit("audio", id=self.session_id, level=float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))), probability=gate.confidence, noise_state=gate.noise_state, faults=devices.faults + devices.ring.overflows,
                               input_faults=devices.input_faults + devices.ring.overflows, output_faults=devices.output_faults, recorded=sum(len(value) for value in gate.frames) / model.rate, continuous=True, speech_active=gate.active, trusted_speech_active=self.trusted_speaking,
                               pending=self.inference.pending(), pending_storage=self.writer.queue.pending(), dropped_samples=devices.ring.dropped, echo_correlation=echo.correlation, echo_reduction=echo.reduction, echo_state=echo.reference_state, double_talk=echo.double_talk, echo_paths=len(echo.paths), nearend_candidate=echo.nearend_candidate, nearend_seconds=echo.nearend_seconds, playback_overlap=overlap)
@@ -14792,18 +15719,37 @@ class Engine:
                   "capture": {"id": None, "continuous": False, "speech_active": False, "pending": 0}}
         if self.devices and self.devices.capture:
             capture = self.devices.capture
-            values["capture"] = {"id": capture.session_id, "continuous": capture.connected, "speech_active": capture.speaking, "trusted_speech_active": capture.trusted_speaking, "pending": capture.inference.pending(), "pending_storage": capture.writer.queue.pending()}
+            values["capture"] = {"id": capture.session_id, "continuous": capture.connected, "speech_active": capture.speaking, "trusted_speech_active": capture.trusted_speaking,
+                                 "pending": capture.inference.pending(), "pending_storage": capture.writer.queue.pending(),
+                                 "dropped_utterances": capture.inference_dropped, "barge_in_events": capture.barge_in_events,
+                                 "echo": capture.last_echo, "callback_errors": dict(self.devices.callback_errors),
+                                 "audio_integrity": self.devices.audio_integrity}
         if self.devices:
             values["audio_clocks"] = {key: {"source": "hardware" if row["hardware"] else "sample_count", "arrival": row["arrival"]}
                                       for key, row in getattr(self.devices, "clock_states", {}).copy().items()}
         if self.writer:
             values["storage"] = self.writer.status()
-        if self.model and self.model.device.type == "cuda":
-            try:
-                free, total = self.model.torch.cuda.mem_get_info()
-                values.update(gpu_used=total - free, gpu_total=total)
-            except RuntimeError:
-                pass
+        if self.model:
+            values["accelerators"] = []
+            for item in getattr(self.model, "accelerators", []):
+                identifier = item.get("device", "")
+                verification = getattr(self.model, "verifier", None)
+                role = "primary" if identifier == str(self.model.device) else "verifier" if verification is not None and identifier == str(verification.device) else "available"
+                details = {"device": identifier, "name": item.get("name", identifier), "role": role}
+                try:
+                    target = self.model.torch.device(identifier)
+                    module = getattr(self.model.torch, target.type, None)
+                    if module is not None and hasattr(module, "mem_get_info"):
+                        free, total = module.mem_get_info(target)
+                        details.update(used_bytes=int(total - free), total_bytes=int(total))
+                    if target.type == "cuda" and hasattr(self.model.torch.cuda, "utilization"):
+                        details["utilization"] = int(self.model.torch.cuda.utilization(target))
+                except (RuntimeError, TypeError, ValueError, AttributeError, ImportError, OSError):
+                    pass
+                values["accelerators"].append(details)
+            primary = next((item for item in values["accelerators"] if item["device"] == str(self.model.device)), {})
+            if "used_bytes" in primary:
+                values.update(gpu_used=primary["used_bytes"], gpu_total=primary["total_bytes"])
         self.emit("metrics", **values)
 
     def persist_policy(self, force=False):
@@ -15050,6 +15996,18 @@ class Engine:
                 values["model_blocker"] = "dialogue_benchmark_missing"
             elif values["learning"].get("automatic_release") == "semantic_evidence_missing":
                 values["model_blocker"] = "semantic_evidence_missing"
+        values["preparation_stages"] = {
+            "environment": bool(values["runtime_ready"] and values["pipeline_ready"]),
+            "recording": bool(values["audio_ready"] and values["storage_ready"]),
+            "model_created": self.model is not None,
+            "training_data": bool(values["learning"].get("trainable_data")),
+            "development_data": bool(values["learning"].get("validation_ready")),
+            "independent_acceptance": bool(values["model_ready"]),
+            "voice_dialogue": bool(values["conversation_ready"])}
+        values["preparation_stage"] = ("preparation_accepted" if values["conversation_ready"] else
+                                       "preparation_sources" if not values["preparation_stages"]["training_data"] else
+                                       "preparation_evidence" if not values["preparation_stages"]["development_data"] else
+                                       "preparation_local")
         values["data_source_state"] = values["learning"].get("source_state", {})
         values["bootstrap"] = values["learning"].get("bootstrap", {})
         values["bootstrap_phase"] = values["bootstrap"].get("phase", "initializing")
@@ -15334,11 +16292,19 @@ class Engine:
                             mode = "failed"
                         elif interrupted:
                             mode = "interrupted"
-                            self.emit("notice", key="barge_in", sample=row["id"])
+                            if capture.barge_in_at is not None:
+                                timings["barge_in_cancel_seconds"] = max(0.0, time.monotonic() - capture.barge_in_at)
+                                self.model.policy.observe("audio", "barge_in_cancel_seconds", timings["barge_in_cancel_seconds"])
+                                capture.barge_in_at = None
+                            self.emit("notice", key="barge_in", sample=row["id"], cancellation_seconds=timings.get("barge_in_cancel_seconds"))
                 except Cancelled:
                     mode = "interrupted"
+                    if capture.barge_in_at is not None:
+                        timings["barge_in_cancel_seconds"] = max(0.0, time.monotonic() - capture.barge_in_at)
+                        self.model.policy.observe("audio", "barge_in_cancel_seconds", timings["barge_in_cancel_seconds"])
+                        capture.barge_in_at = None
                     if not self.interrupt.is_set():
-                        self.emit("notice", key="barge_in", sample=row["id"])
+                        self.emit("notice", key="barge_in", sample=row["id"], cancellation_seconds=timings.get("barge_in_cancel_seconds"))
                 except Exception as exc:
                     mode = "failed"
                     self.emit("notice", reason=concise_error(exc), component="reply", input_sample=row["id"])
@@ -16160,6 +17126,9 @@ class RecoveryGate:
         self.used = float(used) if isinstance(used, (float, int)) and not isinstance(used, bool) and math.isfinite(used) and used >= 0 else 0.0
         transferred = saved.get("transfer_used_seconds", 0.0) if valid else 0.0
         self.transfer_used = float(transferred) if isinstance(transferred, (int, float)) and not isinstance(transferred, bool) and math.isfinite(transferred) and transferred >= 0 else 0.0
+        allowance = saved.get("transfer_total_seconds", self.transfer_total) if valid else self.transfer_total
+        if isinstance(allowance, (int, float)) and not isinstance(allowance, bool) and math.isfinite(allowance) and allowance > 0:
+            self.transfer_total = min(self.transfer_total, allowance)
         attempts = saved.get("attempts", 0) if valid else 0
         self.attempts = int(attempts) if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0 else 0
         self.last = saved.get("last", {}) if valid else {}
@@ -16231,7 +17200,7 @@ class RecoveryGate:
     def save(self):
         try:
             atomic_json(self.path, {"code": self.code, "conditions": self.conditions(), "faults": self.records, "last": self.last,
-                                    "used_seconds": self.used, "transfer_used_seconds": self.transfer_used, "attempts": self.attempts,
+                                    "used_seconds": self.used, "transfer_used_seconds": self.transfer_used, "transfer_total_seconds": self.transfer_total, "attempts": self.attempts,
                                     "wait_seconds": self.waited, "probe_seconds": self.probe_used,
                                     "network_condition": self.network_condition, "updated": time.time()})
         except (OSError, YuanError) as exc:
@@ -16327,6 +17296,8 @@ class RecoveryGate:
         return self.can_retry()
 
     def retry_blocker(self):
+        if self.last.get("retryable") is False or self.last.get("details", {}).get("retryable") is False:
+            return "retry_nonretryable"
         if self.last.get("details", {}).get("retry_blocker") == "retry_import_unchanged":
             return "retry_import_unchanged"
         if self.remaining <= 0:
@@ -16524,7 +17495,11 @@ class Launcher:
                       attempts=self.gate.attempts, attempts_limit=self.gate.maximum, remaining_seconds=self.gate.remaining,
                       transfer_remaining_seconds=self.gate.transfer_remaining, wait_seconds=self.gate.waited,
                       probe_seconds=self.gate.probe_used, probe_limit_seconds=self.gate.probe_seconds)
-        if category in ("timeout", "engine", "unknown") and self.gate.can_retry():
+        count = self.gate.last.get("count", 0)
+        unchanged_timeout = (fault.get("code") in ("stage_deadline", "stage_stalled")
+                             and fault.get("stage") == "runtime_inventory" and type(count) is int and count > 1)
+        if (category in ("timeout", "engine", "unknown") and not unchanged_timeout and fault.get("retryable") is not False
+                and fault.get("details", {}).get("retryable") is not False and self.gate.can_retry()):
             delay = self.gate.retry_delay()
             publish("automatic_retry", delay)
             began = time.monotonic()
@@ -16578,14 +17553,7 @@ class Launcher:
                 try:
                     deadline = began + self.gate.probe_seconds
                     network = Network(interrupted, self.gate.policy)
-                    try:
-                        response = network.request(target, method="HEAD", deadline=deadline)
-                    except urllib.error.HTTPError as exc:
-                        exc.close()
-                        if exc.code not in (405, 501):
-                            raise
-                        response = network.request(target, deadline=deadline)
-                    response.close()
+                    network.probe(target, deadline=deadline)
                     check(interrupted)
                     reachable = True
                     changed = self.gate.network_changed(target, True)
@@ -17163,8 +18131,11 @@ class YuanApp:
                 return
             if event.get("outcome") not in ("begin", "complete", "cancelled", "failed"):
                 return
-        elif kind not in ("attempt", "status", "error", "notice", "deployment", "learning", "network", "recovery", "runtime_message", "dependency_loaded"):
+        elif kind not in ("attempt", "status", "error", "notice", "deployment", "learning", "network", "recovery", "runtime_message", "runtime_transfer", "download_resumed", "download_complete", "dependency_loaded"):
             return
+        if kind == "runtime_transfer":
+            values = {key: event[key] for key in ("http_status", "requested_range", "content_range", "source", "response_received_bytes", "response_end") if event.get(key) is not None}
+            event = {**event, "detail": json.dumps(values, ensure_ascii=False, separators=(",", ":"))}
         event = {key: event[key] for key in ("at", "type", "key", "reason", "action_key", "fault", "component", "version", "file", "elapsed", "outcome", "attempt_number", "detail") if key in event}
         self.recent_activity.append(event)
         limit = max(1, self.root.winfo_screenheight() // max(1, self.small_font.metrics("linespace")))
@@ -17557,9 +18528,9 @@ class YuanApp:
                     self.model_values["architecture"] = " · ".join(item["name"] for item in devices)
             elif kind == "deployment_preflight":
                 self.deployment_value = dict(event)
-            elif kind == "download_complete":
+            elif kind in ("download_complete", "download_resumed"):
                 context = (event.get("attempt_id"), event.get("phase_id"), event.get("artifact_id"))
-                if self.notice_context == context and not self.current_failure:
+                if self.notice_key == "retry" and self.notice_context == context and not self.current_failure:
                     self.notice_key = self.reason = ""
                     self.notice_context = None
             elif kind == "process_reaped" and event.get("scope") == "runtime_probe":
@@ -17571,7 +18542,15 @@ class YuanApp:
                     return
                 if not event.get("phase_id") and event.get("key") != self.status_key:
                     return
+                previous = self.progress_value
                 self.progress_value = event
+                context = (event.get("attempt_id"), event.get("phase_id"), event.get("artifact_id"))
+                if (self.notice_key == "retry" and self.notice_context == context and not self.current_failure
+                        and event.get("transfer_state") == "download_receiving"
+                        and previous.get("artifact_id") == event.get("artifact_id")
+                        and event.get("current", 0) > previous.get("current", 0)):
+                    self.notice_key = self.reason = ""
+                    self.notice_context = None
             elif kind == "source_progress":
                 self.source_values = event
             elif kind == "phase":
@@ -17786,6 +18765,9 @@ class YuanApp:
         else:
             self.fault_button.grid_remove()
         self.learning_button.configure(state="normal" if self.runtime_ready and self.workspace and not self.session_id and not self.closing else "disabled")
+        stage = flags.get("preparation_stage")
+        if self.runtime_ready and stage and not recovering and not self.session_id:
+            detail = translate(stage) + "\n" + detail
         self.status_detail.configure(text=detail, fg=self.palette["accent"] if self.ready else self.palette["warning"] if self.runtime_ready else self.palette["muted"])
         button_key = "ending" if self.ending else "stop" if self.session_id else "start"
         enabled = not self.closing and not self.ending and bool(self.session_id or self.can_start())
@@ -17808,10 +18790,12 @@ class YuanApp:
         audio = self.audio_values
         elapsed = time.monotonic() - self.session_started if self.session_started else audio.get("elapsed", 0.0)
         latency = audio.get("latency")
+        capture_health = self.resource_values.get("capture", {})
         self.card("audio", [f"{audio.get('turns', 0)} {translate('turns')} · {int(elapsed)//60:02}:{int(elapsed)%60:02}",
                             f"{translate('input')} {float(audio.get('input_seconds', audio.get('recorded', 0))):.1f}s · {translate('output')} {float(audio.get('output_seconds', 0)):.1f}s",
                             ("响应 " if language == "中文" else "Response ") + (f"{latency:.2f}s" if latency is not None else "—") + (" · " + translate(audio["generation_end"]) if audio.get("generation_end") else ""),
-                            f"{translate('input_faults')} {audio.get('input_faults', 0)} · {translate('output_faults')} {audio.get('output_faults', 0)} · {translate('pending')} {audio.get('pending', 0)} · {translate('storage_queue')} {audio.get('pending_storage', 0)}"])
+                            f"{translate('input_faults')} {audio.get('input_faults', 0)} · {translate('output_faults')} {audio.get('output_faults', 0)} · {translate('pending')} {audio.get('pending', 0)} · " +
+                            ("打断 " if language == "中文" else "Interruptions ") + str(capture_health.get("barge_in_events", 0))])
         learning = self.learning_values
         learning_label = self.learning_key if self.model_values else "native_bootstrap" if self.workspace else "idle"
         self.card("learning", [translate(learning_label),
@@ -17819,6 +18803,13 @@ class YuanApp:
                                f"{translate('serving_versions')} {learning_state.get('serving_versions', 0)}",
                                translate("contrast_pending") if learning_state.get("review_pending") else translate("candidate_isolated") if learning_state.get("candidate_isolated") else f"{translate('steps')} {learning.get('steps', 0)}"])
         resources = self.resource_values
+        accelerators = resources.get("accelerators", [])
+        primary_gpu = next((item for item in accelerators if item.get("role") == "primary"), {})
+        if primary_gpu and "used_bytes" in primary_gpu:
+            suffix = f"GPU {human_bytes(primary_gpu['used_bytes'])}/{human_bytes(primary_gpu['total_bytes'])}"
+            if primary_gpu.get("utilization") is not None:
+                suffix += f" · {primary_gpu['utilization']}%"
+            self.card_rows["model"][1].configure(text=self.card_rows["model"][1].cget("text") + " · " + suffix)
         samples = resources.get("samples", {})
         local, public, dialogue = samples.get("local", {}), samples.get("public", {}), samples.get("dialogue", {})
         history = samples.get("history", {})
@@ -17895,8 +18886,11 @@ class YuanApp:
         if batch:
             overall = translate("download_overall") + " · " + human_bytes(current) + " / " + (human_bytes(total) if total is not None else translate("unknown_total"))
             overall += " · " + translate("download_files") + f" {progress.get('files_completed', 0)}/{progress.get('file_count', 0)}"
-            if progress.get("active_files"):
-                overall += " · " + translate("download_parallel") + " " + str(progress["active_files"])
+            overall += " · " + translate("download_parallel") + " " + str(progress.get("active_files", 0))
+            if progress.get("active_connections", 0) > progress.get("active_files", 0):
+                overall += " · " + translate("download_connections") + " " + str(progress["active_connections"])
+            if progress.get("retrying_files"):
+                overall += " · " + translate("download_waiting") + " " + str(progress["retrying_files"])
             if progress.get("overall_speed") is not None:
                 overall += " · " + translate("download_speed") + " " + human_bytes(progress["overall_speed"]) + "/s"
             if progress.get("files_completed", 0) < progress.get("file_count", 0):
@@ -17910,7 +18904,9 @@ class YuanApp:
         if progress.get("source"):
             suffix += " · " + str(progress["source"])
         if progress.get("download_attempt"):
-            suffix += " · " + translate("download_attempts") + f" {progress['download_attempt']}/{progress.get('download_attempts', '—')}"
+            suffix += " · " + translate("download_attempts") + f" {progress['download_attempt']}"
+            if progress.get("stalled_attempts"):
+                suffix += " · " + translate("download_no_progress") + f" {progress['stalled_attempts']}/{progress.get('download_attempts', '—')}"
         if progress.get("connect_seconds") is not None and progress.get("transfer_state") == "download_connecting":
             suffix += " · " + translate("download_connection_budget") + f" {progress['connect_seconds']:.1f}s"
         if not batch and progress.get("speed") is not None:
@@ -17935,6 +18931,14 @@ class YuanApp:
             since = max(0.0, time.monotonic() - supervised["received_at"])
             detail = translate(supervised.get("key", "supervision")) + f" · {supervised.get('elapsed', 0.0) + since:.1f}s"
             suffix = " · " + translate("unknown_total") + " · " + translate("remaining") + f" {max(0.0, supervised.get('remaining_seconds', 0.0) - since):.1f}s"
+            if supervised.get("component"):
+                suffix += " · " + str(supervised["component"])
+            if supervised.get("file"):
+                suffix += " · " + str(supervised["file"]).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            if isinstance(supervised.get("checked_files"), int):
+                suffix += " · " + translate("download_files") + " " + str(supervised["checked_files"])
+            if isinstance(supervised.get("checked_bytes"), int):
+                suffix += " · " + human_bytes(supervised["checked_bytes"])
             if supervised.get("pid"):
                 suffix += " · PID " + str(supervised["pid"])
         self.progress_label.configure(text=detail + suffix, wraplength=max(self.unit*4, self.progress_label.master.winfo_width()))
@@ -18245,7 +19249,8 @@ def runtime_probe_compute(state, emit, dependencies):
                 with tempfile.TemporaryDirectory(prefix="probe-", dir=probe_root) as directory:
                     path = Path(directory) / "weights.pt"
                     expected = {key: value.detach().cpu() for key, value in network.state_dict().items()}
-                    torch.save(expected, path)
+                    save_checkpoint(torch, expected, path, None, model.width * model.hop * 4,
+                                    root=state, component="runtime_probe_compute")
                     restored = model._build()
                     restored.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=True)
                     if not all(torch.equal(left, restored.state_dict()[key]) for key, left in expected.items()):
@@ -18275,7 +19280,7 @@ def runtime_probe_compute(state, emit, dependencies):
         torch.set_num_threads(threads)
 
 
-def verify_installed_files(runtime, entry, emit, cancel, budget=None):
+def verify_installed_files(runtime, entry, emit, cancel, budget=None, full_interval=86400.0):
     import importlib.metadata as metadata
     import base64
     import csv
@@ -18293,16 +19298,40 @@ def verify_installed_files(runtime, entry, emit, cancel, budget=None):
         distributions[name] = distribution
     if set(distributions) - set(expected) - {"pip", "setuptools", "wheel"} or any(name not in distributions or distributions[name].version != version for name, version in expected.items()):
         raise YuanFault("运行环境版本与锁定记录不一致 / Runtime versions differ from the lock", category="integrity", code="installed_versions_mismatch")
-    checked = unhashed = 0
+    cache_path = runtime / "inventory-verified.json"
+    identity = payload_digest([payload_digest(entry), str(runtime), sys.version_info[:3]])
+    cache = {} if cache_path.is_symlink() else read_json(cache_path)
+    now_wall = time.time()
+    last_full = cache.get("full_verified_at", 0)
+    fresh = (cache.get("version") == 1 and cache.get("identity") == identity
+             and isinstance(last_full, (int, float)) and not isinstance(last_full, bool) and math.isfinite(last_full)
+             and 0 <= now_wall - last_full <= full_interval and isinstance(cache.get("files"), dict)
+             and isinstance(cache.get("records"), dict))
+    previous_files = cache["files"] if fresh else {}
+    previous_records = cache["records"] if fresh else {}
+    updated_files = {}
+    updated_records = {}
+    checked = unhashed = verified_bytes = cached_files = rehashed_files = 0
     last_progress = -math.inf
     period = max(tick(), math.sqrt(tick()))
     with operation(emit, "runtime_inventory", "verification", budget_seconds=budget, stall_seconds=budget) as operation_id:
+        def advance(component, file, force=False):
+            nonlocal last_progress
+            now = time.monotonic()
+            if force or now - last_progress >= period:
+                last_progress = now
+                emit("operation", key="runtime_inventory", scope="verification", operation_id=operation_id,
+                     outcome="progress", current=verified_bytes + checked, checked_bytes=verified_bytes,
+                     checked_files=checked, cached_files=cached_files, component=component, file=file, pid=os.getpid())
         for name in expected:
             check(cancel)
             distribution = distributions[name]
             record = distribution.read_text("RECORD")
             if not record:
                 raise YuanFault("缺少组件安装文件清单 / Installed file manifest is missing", category="integrity", code="installed_record_missing", component=name)
+            record_digest = hashlib.sha256(record.encode("utf-8")).hexdigest()
+            updated_records[name] = record_digest
+            reuse_record = fresh and previous_records.get(name) == record_digest
             hashed = 0
             seen = set()
             for fields in csv.reader(io.StringIO(record)):
@@ -18321,7 +19350,8 @@ def verify_installed_files(runtime, entry, emit, cancel, budget=None):
                     continue
                 if not path.is_file():
                     raise YuanFault("组件安装文件缺失 / Installed component file is missing", category="integrity", code="installed_file_missing", component=name, file=item)
-                if recorded_size and path.stat().st_size != int(recorded_size):
+                info = path.stat()
+                if recorded_size and info.st_size != int(recorded_size):
                     raise YuanFault("组件安装文件大小不符 / Installed component file size mismatch", category="integrity", code="installed_file_size", component=name, file=item)
                 if recorded_hash:
                     try:
@@ -18329,28 +19359,49 @@ def verify_installed_files(runtime, entry, emit, cancel, budget=None):
                         digest = hashlib.new(algorithm)
                         if digest.digest_size < hashlib.sha256().digest_size:
                             raise ValueError("Weak file hash")
-                    except ValueError as exc:
+                    except (ValueError, TypeError) as exc:
                         raise YuanFault("组件文件哈希算法无效 / Invalid component file hash algorithm", category="integrity", code="installed_hash_algorithm", component=name, file=item) from exc
-                    with path.open("rb") as stream:
-                        for block in iter(lambda: stream.read(1024 * 1024), b""):
-                            check(cancel)
-                            digest.update(block)
-                    actual = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
-                    if actual != expected_hash:
-                        raise YuanFault("组件安装文件哈希不匹配 / Installed component file hash mismatch", category="integrity", code="installed_file_hash", component=name, file=item)
+                    file_key = path.relative_to(runtime).as_posix()
+                    stamp = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, recorded_hash]
+                    if reuse_record and previous_files.get(file_key) == stamp:
+                        cached_files += 1
+                        verified_bytes += info.st_size
+                    else:
+                        with path.open("rb") as stream:
+                            while True:
+                                check(cancel)
+                                block = stream.read(1024 * 1024)
+                                if not block:
+                                    break
+                                digest.update(block)
+                                verified_bytes += len(block)
+                                advance(name, item)
+                        actual = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
+                        if actual != expected_hash:
+                            raise YuanFault("组件安装文件哈希不匹配 / Installed component file hash mismatch", category="integrity", code="installed_file_hash", component=name, file=item)
+                        rehashed_files += 1
+                        after = path.stat()
+                        after_stamp = [after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino, recorded_hash]
+                        if stamp != after_stamp:
+                            raise YuanFault("校验期间安装文件发生变化 / Installed file changed during verification", category="integrity", code="installed_file_changed", component=name, file=item)
+                    updated_files[file_key] = stamp
                     hashed += 1
                 else:
                     unhashed += 1
                 checked += 1
-                now = time.monotonic()
-                if now - last_progress >= period:
-                    last_progress = now
-                    emit("operation", key="runtime_inventory", scope="verification", operation_id=operation_id,
-                         outcome="progress", current=checked, component=name, pid=os.getpid())
+                advance(name, item)
             if not hashed:
                 raise YuanFault("组件没有可核验的文件哈希 / No verifiable installed file hashes", category="integrity", code="installed_hashes_missing", component=name)
-    emit("probe", key="runtime_install_verified", checked_files=checked, unhashed_files=unhashed, packages=len(expected))
-    return {"checked_files": checked, "unhashed_files": unhashed, "packages": len(expected)}
+        advance("runtime_inventory", "", force=True)
+    try:
+        atomic_json(cache_path, {"version": 1, "identity": identity, "full_verified_at": last_full if fresh else time.time(),
+                                 "files": updated_files, "records": updated_records}, cancel)
+    except OSError as exc:
+        emit("notice", key="journal_failure", component="runtime_inventory_cache", reason=concise_error(exc))
+    emit("probe", key="runtime_install_verified", checked_files=checked, unhashed_files=unhashed, packages=len(expected),
+         cached_files=cached_files, rehashed_files=rehashed_files, checked_bytes=verified_bytes)
+    return {"checked_files": checked, "unhashed_files": unhashed, "packages": len(expected),
+            "cached_files": cached_files, "rehashed_files": rehashed_files, "checked_bytes": verified_bytes}
 
 def runtime_install_verify(state):
     state = Path(state).resolve()
@@ -18361,7 +19412,10 @@ def runtime_install_verify(state):
                 raise YuanFault("仅允许校验所选目录内的候选环境 / Verification requires a workspace candidate runtime", category="configuration", code="runtime_inventory_location")
             entry = checked_json(runtime / "lock.json")
             budgets = json.loads(os.environ.get("YUAN_IMPORT_BUDGETS", "{}"))
-            verify_installed_files(runtime, entry, emit, cancel, budgets.get("runtime_inventory"))
+            policy = AdaptivePolicy(state)
+            full_interval = policy.number("runtime", "inventory_full_interval_seconds", 86400.0, 3600.0, 7 * 86400.0)
+            verify_installed_files(runtime, entry, emit, cancel, budgets.get("runtime_inventory"), full_interval)
+            policy.save()
         except BaseException as exc:
             emit("error", key="failure", reason=concise_error(exc), fatal=True, fault=fault_event(exc, "runtime_inventory"))
             raise SystemExit(1) from None
@@ -18385,13 +19439,38 @@ def runtime_probe_import(state, component):
             emit("error", key="failure", reason=concise_error(exc), fatal=True, fault=fault_event(exc, "stage_import_" + component))
             raise SystemExit(1) from None
 
-def runtime_probe(state):
+def runtime_probe(state, fast=False):
     state = Path(state).resolve()
     with runtime_entry(state) as (emit, cancel):
         try:
-            dependencies = load_runtime_modules(state, emit, cancel)
-            with operation(emit, "stage_probe_compute"):
-                runtime_probe_compute(state, emit, dependencies)
+            if fast:
+                import torch
+                with operation(emit, "stage_probe_compute"):
+                    certificate = read_json(state / "compute-verified.json")
+                    expected = os.environ.get("YUAN_COMPUTE_BACKEND", "")
+                    if certificate.get("backend") != expected or certificate.get("build_sha256") != build_digest():
+                        raise YuanFault("计算验证缓存与当前运行环境不一致 / Compute verification cache does not match the runtime", category="compatibility", code="compute_certificate_stale")
+                    certified = {item["device"]: item for item in certificate.get("devices", []) if isinstance(item, dict) and item.get("training_components_verified") is True and isinstance(item.get("device"), str)}
+                    devices = compute_devices(torch, state, emit)
+                    devices = [(device, name) for device, name in devices if certified.get(str(device), {}).get("identity_sha256") == compute_device_identity(torch, device, name)]
+                    if not devices:
+                        raise YuanFault("计算设备已变化，需要完整重新验证 / Compute devices changed and require full verification", category="compatibility", code="compute_certificate_stale")
+                    for device, name in devices:
+                        check(cancel)
+                        try:
+                            values = torch.randn(32, 32, device=device, requires_grad=True)
+                            result = (values @ values).square().mean()
+                            result.backward()
+                            compute_sync(torch, device)
+                            if not bool(torch.isfinite(result).item()) or values.grad is None or not bool(torch.isfinite(values.grad).all().item()):
+                                raise YuanFault("加速计算快速检查失败 / Accelerator quick verification failed", category="compatibility", code="compute_backend_failed", device=str(device))
+                        except RuntimeError as exc:
+                            raise YuanFault("加速计算快速检查需要完整复检 / Accelerator smoke test requires full verification", category="compatibility", code="compute_backend_failed", device=str(device)) from exc
+                        emit("probe", key="stage_probe_compute", check="cached_device_verified", device=str(device), name=name)
+            else:
+                dependencies = load_runtime_modules(state, emit, cancel)
+                with operation(emit, "stage_probe_compute"):
+                    runtime_probe_compute(state, emit, dependencies)
         except BaseException as exc:
             emit("error", key="failure", reason=concise_error(exc), fatal=True, fault=fault_event(exc, "runtime_verify"))
             raise SystemExit(1) from None
@@ -18768,7 +19847,7 @@ class BrowserApp:
 <header><h1>Yuan</h1><span class="muted">原生音频 · Native audio</span><span class="spacer"></span><select id="language"><option>中文</option><option>English</option></select><button id="close">退出 / Exit</button></header>
 <div id="controls"><button id="choose">选择文件夹 / Choose folder</button><span id="folder">尚未选择 / No folder selected</span><button id="toggle" disabled>开始对话 / Start conversation</button><button id="recheck">重新检查 / Recheck</button></div>
 <label for="prompt" class="muted">提示词 / Instructions</label><textarea id="prompt" spellcheck="false"></textarea>
-<div id="grid"><section class="card wide"><h2>当前状态 / Status</h2><div id="status">选择工作目录 / Choose a workspace</div><div id="reason"></div><progress id="progress" hidden></progress></section>
+<div id="grid"><section class="card wide"><h2>当前状态 / Status</h2><div id="status">选择工作目录 / Choose a workspace</div><div id="stage" class="muted" aria-live="polite"></div><div id="reason"></div><progress id="progress" hidden></progress></section>
 <section class="card"><h2>就绪条件 / Readiness</h2><dl id="readiness"></dl></section><section class="card"><h2>语音对话 / Voice conversation</h2><dl id="audio"></dl></section><section class="card"><h2>设备资源 / Device resources</h2><dl id="resources"></dl></section><section class="card"><h2>自主学习 / Autonomous learning</h2><dl id="learning"></dl></section>
 <section class="card"><h2>数据缺口 / Data coverage gaps</h2><div id="missing"><div id="coverage-legend" class="muted"></div><table id="coverage"></table></div></section><section class="card"><h2>运行状态 / Activity</h2><div id="notices"></div></section></div>
 <dialog id="picker"><h2>选择工作目录 / Choose workspace</h2><input id="path"><div class="row"><button id="go">打开 / Open</button><button id="up">上一级 / Parent</button><select id="roots"></select></div><div id="directories"></div><div class="row"><button id="previous">上一页 / Previous</button><button id="next">下一页 / Next</button><button id="use">选择此目录 / Use this folder</button><button id="cancel">取消 / Cancel</button></div></dialog>
@@ -18777,10 +19856,10 @@ async function call(path,data){const response=await fetch(path,{method:data?'POS
 function error(e){clientError=e.message||String(e);$('reason').textContent=clientError;}function rows(id,values){const target=$(id);target.replaceChildren();for(const [label,value] of values){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label.includes(' / ')?label.split(' / ')[state.language==='English'?1:0]:label;dd.textContent=value??'—';target.append(dt,dd);}}const yes=x=>x===true?'✓':x===false?'…':'—';const seconds=x=>typeof x==='number'?x.toFixed(3)+' s':'—';const size=x=>typeof x==='number'?(x/1048576).toFixed(0)+' MiB':'—';
 function named(value){const labels={no_accepted_baseline:['无已验收版本','No accepted model'],serving_current:['当前版本已验收','Serving model accepted'],waiting_candidate_evaluation:['等待验证候选','Awaiting candidate evaluation'],evaluating:['正在验证','Evaluating'],accepted_task_evidence:['限定任务验收通过','Annotated tasks accepted'],waiting_independent_verifier:['等待独立验证模型','Awaiting independent verifier'],evaluating_tasks:['正在验证任务与回归','Evaluating tasks and regressions'],semantic_evidence_missing:['语义能力尚未验证','Semantic capability not verified'],yielded:['已让出资源','Yielded'],candidate_isolated:['候选未通过','Candidate isolated'],calibrating:['正在校准','Calibrating'],speech:['人声','Speech'],elevated_noise:['噪声升高','Elevated noise'],tracking:['正在监测','Tracking']};return labels[value]?.[state.language==='English'?1:0]||value||'—';}
 function coverage(learning){const cells=learning.coverage||learning.missing||[],english=state.language==='English',table=$('coverage');table.replaceChildren();$('coverage-legend').textContent=english?'Input · instructions · history':'输入 · 提示词 · 历史';if(!cells.length){table.textContent='—';return;}const head=document.createElement('tr');for(const value of ['', '中文','English']){const th=document.createElement('th');th.textContent=value;head.append(th);}table.append(head);const splits={train:['训练','Training'],validation:['验证','Validation'],guard:['保护','Guard'],release:['听测','Listening review']};for(const [split,label] of Object.entries(splits)){const tr=document.createElement('tr'),th=document.createElement('th');th.textContent=label[english?1:0];tr.append(th);for(const language of ['中文','English']){const td=document.createElement('td'),values=cells.filter(x=>x.language===language&&x.split===split);values.sort((a,b)=>['input','prompt','history'].indexOf(a.scenario)-['input','prompt','history'].indexOf(b.scenario));td.textContent=values.map(x=>`${x.have}/${x.need}`).join(' · ')||'—';if(split==='release')td.title=(english?'Complete reference annotations: ':'完整参考标注：')+values.map(x=>`${x.reference_sources??0}/${x.need}`).join(' · ');tr.append(td);}table.append(tr);}}
-function render(value){if(Number.isFinite(value.revision)&&Number.isFinite(state.revision)&&value.revision<state.revision)return;state=value;document.documentElement.lang=state.language==='English'?'en':'zh-CN';const r=value.readiness||{},a=value.audio||{},m=value.metrics||{},l=r.learning||{};$('folder').textContent=value.workspace||'尚未选择 / No folder selected';$('status').textContent=value.status;$('reason').textContent=clientError||value.reason||r.model_detail||(!r.model_ready&&r.model_blocker?value.status:'');$('toggle').textContent=value.ending?'正在结束 / Ending':value.session?'结束对话 / End conversation':'开始对话 / Start conversation';$('toggle').disabled=value.closing||value.ending||(!value.session&&!value.ready);$('choose').disabled=!!value.session||value.closing;$('prompt').disabled=!!value.session||value.closing;$('language').disabled=!!value.session||value.closing;$('recheck').disabled=!!value.session||value.closing;if(!dirty&&document.activeElement!==$('prompt'))$('prompt').value=value.prompt||'';if(!dirty&&document.activeElement!==$('language'))$('language').value=value.language||'中文';
-rows('readiness',[['运行环境 / Runtime',yes(r.runtime_ready)],['音频链路 / Pipeline',yes(r.pipeline_ready)],['音频设备 / Devices',yes(r.audio_ready)],['对话模型 / Model',yes(r.model_ready)],['存储 / Storage',yes(r.storage_ready)],['服务版本 / Serving',(r.serving_model||'—').slice(0,16)]]);
-rows('audio',[['持续收音 / Listening',yes(a.continuous)],['正在说话 / Speech',yes(a.speech_active)],['响应时延 / Response',seconds(a.latency)],['轮次 / Turns',a.turns],['等待处理 / Pending',a.pending],['噪声状态 / Noise',named(a.noise_state)]]);
-rows('resources',[['CPU',typeof m.cpu==='number'?m.cpu.toFixed(0)+'%':'—'],['可用内存 / Available RAM',size(m.ram_available)],['进程内存 / Process RAM',size(m.process_ram)],['剩余磁盘 / Free disk',size(m.disk_free)]]);
+function render(value){if(Number.isFinite(value.revision)&&Number.isFinite(state.revision)&&value.revision<state.revision)return;state=value;document.documentElement.lang=state.language==='English'?'en':'zh-CN';const r=value.readiness||{},a=value.audio||{},m=value.metrics||{},l=r.learning||{};const phases={preparation_local:['本地自研模型已创建 · 持续学习中','Owned local model created · learning'],preparation_sources:['自动获取双语训练数据','Acquiring bilingual training data'],preparation_evidence:['补齐独立验收证据','Collecting independent acceptance evidence'],preparation_accepted:['已验收 · 可语音对话','Accepted · voice dialogue available']};$('stage').textContent=(phases[r.preparation_stage]||['准备环境中','Preparing environment'])[state.language==='English'?1:0];$('folder').textContent=value.workspace||'尚未选择 / No folder selected';$('status').textContent=value.status;$('reason').textContent=clientError||value.reason||r.model_detail||(!r.model_ready&&r.model_blocker?value.status:'');$('toggle').textContent=value.ending?'正在结束 / Ending':value.session?'结束对话 / End conversation':'开始对话 / Start conversation';$('toggle').disabled=value.closing||value.ending||(!value.session&&!value.ready);$('choose').disabled=!!value.session||value.closing;$('prompt').disabled=!!value.session||value.closing;$('language').disabled=!!value.session||value.closing;$('recheck').disabled=!!value.session||value.closing;if(!dirty&&document.activeElement!==$('prompt'))$('prompt').value=value.prompt||'';if(!dirty&&document.activeElement!==$('language'))$('language').value=value.language||'中文';
+rows('readiness',[['运行环境 / Runtime',yes(r.runtime_ready)],['音频链路 / Pipeline',yes(r.pipeline_ready)],['音频设备 / Devices',yes(r.audio_ready)],['对话模型 / Model',yes(r.model_ready)],['存储 / Storage',yes(r.storage_ready)],['服务版本 / Serving',(r.serving_model||'—').slice(0,16)],['本地模型 / Local model',yes(r.preparation_stages?.model_created)],['独立验收 / Acceptance',yes(r.preparation_stages?.independent_acceptance)]]);
+rows('audio',[['持续收音 / Listening',yes(a.continuous)],['正在说话 / Speech',yes(a.speech_active)],['响应时延 / Response',seconds(a.latency)],['轮次 / Turns',a.turns],['等待处理 / Pending',a.pending],['噪声状态 / Noise',named(a.noise_state)],['打断次数 / Interruptions',m.capture?.barge_in_events??0],['输入丢失 / Dropped input',m.capture?.dropped_utterances??0],['回声状态 / Echo',named(m.capture?.echo?.state)]]);
+rows('resources',[['CPU',typeof m.cpu==='number'?m.cpu.toFixed(0)+'%':'—'],['可用内存 / Available RAM',size(m.ram_available)],['进程内存 / Process RAM',size(m.process_ram)],['剩余磁盘 / Free disk',size(m.disk_free)],['显卡 / GPU',(m.accelerators||[]).map(x=>`${x.device} ${typeof x.utilization==='number'?x.utilization+'%':'—'} ${typeof x.used_bytes==='number'?size(x.used_bytes)+'/'+size(x.total_bytes):''}`).join(' · ')||'—']]);
 rows('learning',[['正在训练 / Training',yes(r.training_active)],['可训练数据 / Data',yes(l.trainable_data)],['验证数据 / Validation',yes(l.validation_ready)],['首发参考标注 / First-release annotations',yes(l.reference_ready)],['候选改善 / Improvements',l.candidate_improvements],['服务更新 / Updates',l.serving_versions],['自动验收 / Acceptance',named(l.automatic_release)],['历史片段 / History clips',m.samples?.history?.count],['网络片段 / Online clips',m.samples?.public?.count]]);
 coverage(l);$('notices').textContent=(value.notices||[]).slice(-6).join('\n');const p=value.progress||{};$('progress').hidden=!(Number.isFinite(p.total)&&p.total>0);if(!$('progress').hidden){$('progress').max=p.total;$('progress').value=Math.max(0,p.current||0);}}
 async function action(payload){const value=await call('/api/action',payload);clientError='';render(value);return value;}async function save(){if(savingTask)return savingTask;if(!dirty)return;savingTask=(async()=>{while(dirty){const version=dirtyVersion,payload={action:'settings',language:$('language').value,prompt:$('prompt').value};await action(payload);if(version===dirtyVersion)dirty=false;}})();try{await savingTask;}finally{savingTask=null;}}function changed(){dirty=true;dirtyVersion++;clearTimeout(saving);saving=setTimeout(()=>save().catch(error),450);}$('prompt').addEventListener('input',changed);$('language').addEventListener('change',changed);
@@ -18900,8 +19979,8 @@ def main():
         sys.stdout.write(json.dumps(runtime_resource_snapshot(sys.argv[2], details), allow_nan=False) + "\n")
         sys.stdout.flush()
         return
-    if len(sys.argv) == 3 and sys.argv[1] == "--probe":
-        runtime_probe(sys.argv[2])
+    if len(sys.argv) == 3 and sys.argv[1] in ("--probe", "--probe-fast"):
+        runtime_probe(sys.argv[2], fast=sys.argv[1] == "--probe-fast")
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--learn":
         learning_entry(sys.argv[2])
