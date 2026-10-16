@@ -12582,7 +12582,7 @@ class AudioDevices:
             indices.append(selected[0])
             devices.append(selected[1])
         self.emit("devices", input=devices[0]["name"], output=devices[1]["name"], input_rate=int(devices[0]["default_samplerate"]), output_rate=int(devices[1]["default_samplerate"]),
-                  input_channels=devices[0]["selected_channels"], output_channels=devices[1]["selected_channels"], continuous=True)
+                  input_channels=devices[0]["selected_channels"], output_channels=devices[1]["selected_channels"], continuous=False)
         return indices, devices
 
     def _abort(self):
@@ -14691,6 +14691,7 @@ class CaptureSession:
         self.inference_dropped = 0
         self.barge_in_at = None
         self.barge_in_events = 0
+        self.reply_active = False
         self.last_echo = {}
         self.failure = None
         self.inference = UtteranceQueue(self.model.capacity() * self.model.np.dtype(self.model.np.float32).itemsize,
@@ -14787,6 +14788,7 @@ class CaptureSession:
                     self.emit("notice", key="capture_recover", reason=concise_error(exc))
                 finally:
                     self.connected = self.speaking = self.trusted_speaking = self.utterance_confirmed = False
+                    self.reply_active = False
                     self.cancel_input("capture_stopped" if self.is_set() else "capture_gap")
                     self.emit("audio", id=self.session_id, continuous=False, speech_active=False, level=0.0)
                     self.reply_epoch += 1
@@ -14872,7 +14874,8 @@ class CaptureSession:
                 result = gate.push(frame, timestamp)
                 voiced = bool((before or gate.active or result is not None) and gate.noise_state == "speech")
                 quality["user_speech"] = bool(voiced and (not overlap or echo.double_talk and residual_clean))
-                interrupted_speech = echo.confirm_nearend(overlap, voiced, timestamp, take / model.rate)
+                confirmed_speech = echo.confirm_nearend(overlap, voiced, timestamp, take / model.rate)
+                interrupted_speech = confirmed_speech and (overlap or self.reply_active)
                 quality["interruption_speech"] = interrupted_speech
                 if not before and (gate.active or result is not None):
                     self.utterance_id = uuid.uuid4().hex
@@ -14880,9 +14883,10 @@ class CaptureSession:
                     self.utterance_confirmed = False
                     segment_quality = list(quality_frames)
                     segment_start = timestamp + take / model.rate - (sum(len(value) for value in gate.frames) if result is None else len(result)) / model.rate
-                if interrupted_speech and not self.utterance_confirmed:
-                    self.barge_in_at = time.monotonic()
-                    self.barge_in_events += 1
+                if confirmed_speech and not self.utterance_confirmed:
+                    if interrupted_speech:
+                        self.barge_in_at = time.monotonic()
+                        self.barge_in_events += 1
                     self.reply_epoch += 1
                     if before:
                         self.utterance_id = uuid.uuid4().hex
@@ -15622,7 +15626,28 @@ class LearningSession:
                 store.close()
 
 
+def lower_background_priority():
+    try:
+        import psutil
+    except ImportError:
+        return
+    try:
+        process = psutil.Process()
+        if os.name == "nt":
+            process.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            target = min(19, max(1, round(math.sqrt(max(1, os.cpu_count() or 1)) * 3)))
+            present = os.nice(0)
+            if present < target:
+                os.nice(target - present)
+            if sys.platform.startswith("linux") and hasattr(psutil, "IOPRIO_CLASS_IDLE"):
+                process.ionice(psutil.IOPRIO_CLASS_IDLE)
+    except (OSError, ValueError, AttributeError, psutil.Error):
+        pass
+
+
 def learning_entry(state):
+    lower_background_priority()
     with runtime_entry(state) as (emit, cancel):
         try:
             with WorkspaceLease(Path(state) / "training.lock"):
@@ -16272,6 +16297,7 @@ class Engine:
                 try:
                     if not reply_cancel.is_set():
                         mode = "dialogue"
+                        capture.reply_active = True
                         self.emit("status", key="thinking", id=session_id)
                         output = self.model.stream_audio(prompt, (), processed, reply_cancel, hidden=utterance["hidden"],
                                                          reference_rms=math.sqrt(utterance["energy"] / max(1, utterance["samples"])))
@@ -16316,6 +16342,7 @@ class Engine:
                         if self.model.torch.cuda.is_available():
                             self.model.torch.cuda.empty_cache()
                 finally:
+                    capture.reply_active = False
                     retain("user", processed, metadata)
                     if heard is not None and len(heard):
                         heard = self.model.np.ascontiguousarray(heard, dtype=self.model.np.float32)
