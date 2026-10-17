@@ -1619,20 +1619,62 @@ class WorkspaceLease:
         self.close()
 
 def workspace_state(workspace):
-    return ensure_workspace_identity(safe_path(workspace, STATE_NAME + "-" + build_digest()))
+    workspace = Path(workspace).resolve()
+    if (workspace / STATE_NAME).is_symlink():
+        raise YuanFault("运行目录不能是符号链接 / Runtime workspace must not be a symbolic link", category="integrity", code="workspace_symlink")
+    state = safe_path(workspace, STATE_NAME)
+    if not state.exists() and not state.is_symlink() and workspace.is_dir():
+        candidates = []
+        for path in workspace.iterdir():
+            if not re.fullmatch(re.escape(STATE_NAME) + r"-[a-f0-9]{64}", path.name) or path.is_symlink() or not path.is_dir():
+                continue
+            identity = read_json(path / "workspace-identity.json")
+            if (identity.get("protocol") != "yuan-workspace-v1" or identity.get("schema_version") != 1
+                    or identity.get("build_sha256") != path.name.rsplit("-", 1)[-1]):
+                continue
+            active = read_json(path / "learning/active.json")
+            trained = (active.get("steps", 0) if type(active.get("steps")) is int and active.get("steps") >= 0
+                       and isinstance(active.get("file"), str) and Path(active["file"]).name == active["file"]
+                       and (path / "learning" / active["file"]).is_file() else 0)
+            evidence = int((path / "memory/memory.sqlite3").is_file()) + int((path / "runtime-current.json").is_file())
+            candidates.append(((int(trained > 0), trained, evidence, path.stat().st_mtime_ns), path))
+        if candidates:
+            source = max(candidates, key=lambda item: item[0])[1]
+            if not state.exists() and not state.is_symlink():
+                with ExitStack() as leases:
+                    for name in ("engine.lock", "training.lock"):
+                        leases.enter_context(WorkspaceLease(source / name))
+                    if not state.exists() and not state.is_symlink():
+                        try:
+                            source.rename(state)
+                        except FileExistsError:
+                            pass
+                        sync_dir(workspace)
+    return ensure_workspace_identity(state)
 
 def ensure_workspace_identity(state, verified_assets=False):
     state = Path(state).resolve()
-    identity = {"protocol": "yuan-workspace-v1", "build_sha256": build_digest(), "schema_version": 1}
     path = safe_path(state, "workspace-identity.json")
     if path.exists():
-        if checked_json(path) != identity:
-            raise YuanFault("数据空间属于其他版本，已拒绝复用 / Workspace belongs to another build; reuse refused", category="integrity", code="workspace_build_mismatch")
+        old = checked_json(path)
+        if (old.get("protocol") == "yuan-workspace-v2" and old.get("schema_version") == 1
+                and is_digest(old.get("created_build_sha256"))
+                and ("migrated_from" not in old or is_digest(old["migrated_from"]))):
+            return state
+        if (old.get("protocol") != "yuan-workspace-v1" or old.get("schema_version") != 1
+                or not is_digest(old.get("build_sha256"))
+                or (re.fullmatch(re.escape(STATE_NAME) + r"-[a-f0-9]{64}", state.name)
+                    and state.name.rsplit("-", 1)[-1] != old["build_sha256"])):
+            raise YuanFault("数据空间身份无法验证，已保留原文件 / Workspace identity cannot be verified; original files retained", category="integrity", code="workspace_identity_mismatch")
+        identity = {"protocol": "yuan-workspace-v2", "schema_version": 1,
+                    "created_build_sha256": build_digest(), "migrated_from": old["build_sha256"]}
     else:
-        if any((state / name).exists() for name in ("memory/memory.sqlite3", "runtime-current.json", "policy-effective.json")) or (state / "learning").exists() and not verified_assets:
-            raise YuanFault("数据空间缺少当前版本身份，已保留且不加载 / Existing workspace has no current-build identity; preserved without loading", category="integrity", code="workspace_identity_missing")
+        if (any((state / name).exists() for name in ("memory/memory.sqlite3", "runtime-current.json", "policy-effective.json"))
+                or (state / "learning").exists()) and not verified_assets:
+            raise YuanFault("数据空间缺少版本身份，已保留且不加载 / Existing workspace identity is missing; assets retained", category="integrity", code="workspace_identity_missing")
+        identity = {"protocol": "yuan-workspace-v2", "schema_version": 1, "created_build_sha256": build_digest()}
         state.mkdir(parents=True, exist_ok=True)
-        atomic_json(path, identity)
+    atomic_json(path, identity)
     return state
 
 def workspace_environment(workspace):
@@ -1652,9 +1694,6 @@ def workspace_environment(workspace):
     env = NetworkConfig(state).apply(os.environ.copy())
     for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "PYTHONSTARTUP"):
         env.pop(key, None)
-    for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
-        if env.get(key) in ("", "-1"):
-            env.pop(key, None)
     for key, path in values.items():
         path = safe_path(state, path.relative_to(state).as_posix())
         path.mkdir(parents=True, exist_ok=True)
@@ -1665,6 +1704,19 @@ def workspace_environment(workspace):
         "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "PIP_CONFIG_FILE": os.devnull, "UV_NO_MODIFY_PATH": "1", "UV_PYTHON_INSTALL_BIN": "0",
     })
     return env
+
+def accelerator_visibility_masked(vendor, environment=None):
+    source = os.environ if environment is None else environment
+    if vendor == "nvidia":
+        keys = ("CUDA_VISIBLE_DEVICES",)
+    elif vendor == "amd":
+        keys = ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+    elif vendor == "intel":
+        keys = ("ZE_AFFINITY_MASK",)
+    else:
+        return False
+    return any(key in source and str(source[key]).strip().casefold() in ("", "-1", "none") for key in keys)
+
 
 def host_python():
     path = Path(sys.executable)
@@ -1712,6 +1764,59 @@ def end_process(process, timeout=None):
 def spawn(command, env, **kwargs):
     options = {"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
     return subprocess.Popen(command, env=env, cwd=env["YUAN_WORKSPACE"], **options, **kwargs)
+
+def collect_child_diagnostics(process, state, component, limit):
+    source = process.stderr
+    if source is None:
+        return
+    output = None
+    current = 0
+    try:
+        try:
+            target = safe_path(Path(state), "diagnostics/" + component + ".log")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            previous = safe_path(Path(state), "diagnostics/" + component + ".previous.log")
+            if target.is_file() and target.stat().st_size >= limit:
+                os.replace(target, previous)
+            output = target.open("ab")
+            current = output.tell()
+        except (OSError, ValueError, YuanError):
+            output = None
+        while True:
+            chunk = source.readline(65536)
+            if not chunk:
+                break
+            if output is None:
+                continue
+            data = redact(chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk).encode("utf-8", "replace")
+            data = data[-limit:]
+            try:
+                if current + len(data) > limit:
+                    output.close()
+                    output = None
+                    os.replace(target, previous)
+                    output = target.open("wb")
+                    current = 0
+                output.write(data)
+                current += len(data)
+            except OSError:
+                if output is not None:
+                    output.close()
+                output = None
+    except (OSError, ValueError):
+        pass
+    finally:
+        if output is not None:
+            try:
+                output.flush()
+                output.close()
+            except OSError:
+                pass
+        try:
+            source.close()
+        except (OSError, ValueError):
+            pass
+
 
 def process_activity(pid):
     if os.name == "nt":
@@ -2221,9 +2326,10 @@ class RuntimeInstaller:
 
     def backend_candidates(self):
         system = self.hardware["system"]
-        devices = self.hardware.get("adapters", [])
+        devices = [item for item in self.hardware.get("adapters", [])
+                   if not accelerator_visibility_masked(str(item.get("vendor", "")).casefold(), self.env)]
         vendors = {str(item.get("vendor", "")).casefold() for item in devices}
-        nvidia = bool(self.hardware.get("cuda") or "nvidia" in vendors)
+        nvidia = "nvidia" in vendors or bool(self.hardware.get("cuda") and not accelerator_visibility_masked("nvidia", self.env))
         if system == "Darwin":
             return ["native"]
         if nvidia:
@@ -2763,10 +2869,11 @@ class RuntimeInstaller:
             except Cancelled:
                 raise
             except Exception as exc:
-                if failure_category(exc) != "compatibility":
+                category = failure_category(exc)
+                if category not in ("compatibility", "resolution"):
                     raise
-                failures.append({"backend": backend, "reason": concise_error(exc)})
-                self.emit("notice", key="backend_next", backend=backend, reason=concise_error(exc))
+                failures.append({"backend": backend, "category": category, "reason": concise_error(exc)})
+                self.emit("notice", key="backend_next", backend=backend, reason=concise_error(exc), category=category)
         raise YuanFault("正在匹配显卡与运行组件 / Matching graphics hardware and runtime components", category="compatibility", code="compute_candidates_exhausted", stage=self.phase, candidates=failures)
 
 
@@ -3187,19 +3294,28 @@ class Network:
         def connect():
             result = None
             try:
-                opener = self.config.opener() if self.config else urllib.request.build_opener(HTTPSOnly())
-                result = opener.open(request, timeout=max(connect_budget, self.read_idle_seconds))
-                if abandoned.is_set():
-                    result.close()
-                else:
-                    result_box.append(result)
+                if not abandoned.is_set():
+                    opener = self.config.opener() if self.config else urllib.request.build_opener(HTTPSOnly())
+                    if not abandoned.is_set():
+                        result = opener.open(request, timeout=max(tick(), min(connect_budget, deadline - time.monotonic())))
+                        if not abandoned.is_set():
+                            result_box.append(result)
             except BaseException as exc:
-                result_box.append(exc)
+                if not abandoned.is_set():
+                    result_box.append(exc)
+                elif hasattr(exc, "close"):
+                    try:
+                        exc.close()
+                    except (OSError, ValueError):
+                        pass
             finally:
+                if abandoned.is_set() and result is not None:
+                    try:
+                        result.close()
+                    except (OSError, ValueError):
+                        pass
                 self.connection_gate.release()
                 done.set()
-                if abandoned.is_set() and result is not None:
-                    result.close()
         try:
             check(self.cancel)
             if time.monotonic() >= deadline:
@@ -3218,12 +3334,16 @@ class Network:
                 raise YuanFault("网络连接期限已到 / Network connection deadline reached", category="network", code="network_connect_deadline", url=url, connect_seconds=connect_budget)
         except BaseException:
             abandoned.set()
-            if result_box and not isinstance(result_box[0], BaseException):
-                result_box[0].close()
+            if result_box and hasattr(result_box[0], "close"):
+                try:
+                    result_box[0].close()
+                except (OSError, ValueError):
+                    pass
             raise
         result = result_box[0]
         if isinstance(result, BaseException):
             if isinstance(result, urllib.error.HTTPError):
+                result.close()
                 raise result
             raise YuanFault("网络连接未完成 / Network connection failed", category=failure_category(result) if failure_category(result) != "unknown" else "network", code="network_connect_failed", url=url) from result
         elapsed = time.monotonic() - before
@@ -3236,6 +3356,12 @@ class Network:
         if urllib.parse.urlparse(result.geturl()).scheme != "https":
             result.close()
             raise YuanFault("拒绝非加密重定向 / Refused an insecure redirect", category="configuration", code="insecure_redirect")
+        try:
+            connection = getattr(getattr(getattr(result, "fp", None), "raw", None), "_sock", None)
+            if connection is not None:
+                connection.settimeout(self.read_idle_seconds)
+        except (OSError, ValueError, AttributeError):
+            pass
         return result
 
     def response(self, url, headers=None, deadline=None):
@@ -4031,22 +4157,21 @@ class AudioStore:
             raise
 
     def _initialize_schema(self):
-        expected = (1, build_digest())
-        def ready():
-            tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if not tables:
-                return False
+        expected = (1, "yuan-memory-schema-v1")
+        tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        previous = None
+        if tables:
             row = self.db.execute("SELECT schema_version,build_sha256 FROM workspace_identity WHERE singleton=1").fetchone() if "workspace_identity" in tables else None
-            if row is None or tuple(row) != expected:
-                raise YuanFault("数据库版本身份不匹配，已拒绝读取旧数据 / Database build identity mismatch; old data will not be read", category="integrity", code="database_build_mismatch")
-            return "settings" in tables and self.setting("schema_ready") == expected[1]
-        if ready():
-            return
-        with self.transaction():
-            if ready():
+            if row is None or row[0] != expected[0] or "settings" not in tables:
+                raise YuanFault("数据库结构版本不兼容，原文件已保留 / Database schema is incompatible; originals retained", category="integrity", code="database_schema_mismatch")
+            if row[1] == expected[1] and self.setting("schema_ready") == expected[1]:
                 return
-            self.db.execute("CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,build_sha256 TEXT NOT NULL)")
-            self.db.execute("INSERT OR IGNORE INTO workspace_identity VALUES(1,?,?)", expected)
+            previous = row[1]
+            identity = read_json(self.root.parent / "workspace-identity.json")
+            if (not is_digest(previous) or self.setting("schema_ready") != previous
+                    or previous not in (identity.get("migrated_from"), identity.get("created_build_sha256"))):
+                raise YuanFault("旧数据库身份验证失败，原文件已保留 / Legacy database identity could not be verified; originals retained", category="integrity", code="database_build_mismatch")
+        with self.transaction():
             schema = """
         CREATE TABLE IF NOT EXISTS groups(id TEXT PRIMARY KEY, split TEXT NOT NULL CHECK(split IN ('train','validation','guard','release')), origin TEXT NOT NULL, created REAL NOT NULL, source_key TEXT NOT NULL, retention TEXT NOT NULL DEFAULT 'protected' CHECK(retention IN ('protected','training_cache')), provenance TEXT NOT NULL DEFAULT '{}');
         CREATE INDEX IF NOT EXISTS group_source ON groups(source_key,split);
@@ -4084,15 +4209,36 @@ class AudioStore:
         CREATE TABLE IF NOT EXISTS final_acceptance_runs(id TEXT PRIMARY KEY,identity_sha256 TEXT NOT NULL UNIQUE,receipt TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('reserved','evaluating','accepted','rejected','stale')),updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS final_acceptance_sources(source TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES final_acceptance_runs(id));
             """
+            statements = []
             statement = ""
             for line in schema.splitlines():
                 statement += line + "\n"
                 if sqlite3.complete_statement(statement):
-                    self.db.execute(statement)
+                    statements.append(statement)
                     statement = ""
             if statement.strip():
                 raise YuanError("数据库结构定义不完整 / Incomplete database schema")
+            if previous is not None:
+                with sqlite3.connect(":memory:") as reference:
+                    reference.execute("CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,build_sha256 TEXT NOT NULL)")
+                    for item in statements:
+                        reference.execute(item)
+                    self._revision_triggers(reference)
+                    def definitions(connection):
+                        return {(row[0], row[1]): " ".join(row[2].split()) for row in connection.execute(
+                            "SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")}
+                    if definitions(self.db) != definitions(reference):
+                        raise YuanFault("旧数据库结构与预期不一致，已保留原数据 / Legacy database structure differs; originals retained", category="integrity", code="database_schema_mismatch")
+                if (self.db.execute("PRAGMA quick_check").fetchone()[0] != "ok"
+                        or self.db.execute("PRAGMA foreign_key_check").fetchone() is not None):
+                    raise YuanFault("旧数据库完整性验证失败，原数据已保留 / Legacy database integrity check failed; originals retained", category="integrity", code="database_integrity_mismatch")
+            self.db.execute("CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),schema_version INTEGER NOT NULL,build_sha256 TEXT NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO workspace_identity VALUES(1,?,?)", expected)
+            for item in statements:
+                self.db.execute(item)
             self._revision_triggers()
+            if previous is not None:
+                self.db.execute("UPDATE workspace_identity SET build_sha256=? WHERE singleton=1 AND build_sha256=?", (expected[1], previous))
             self.set_setting("schema_ready", expected[1])
 
     def repair(self, cancel=None):
@@ -4933,7 +5079,7 @@ class AudioStore:
             self.memory_index_repair = True
         return True
 
-    def _revision_triggers(self):
+    def _revision_triggers(self, connection=None):
         def bump(key, condition="1"):
             return ("INSERT INTO settings(key,value) SELECT '" + key + "','1' WHERE " + condition +
                     " ON CONFLICT(key) DO UPDATE SET value=CAST(COALESCE(CAST(settings.value AS INTEGER),0)+1 AS TEXT);")
@@ -5006,7 +5152,7 @@ class AudioStore:
         statements.append("CREATE TRIGGER " + name + " AFTER UPDATE OF prompt,language ON sessions WHEN " + changed(("prompt", "language"))
                           + " BEGIN " + body + " END;")
         for statement in statements:
-            self.db.execute(statement)
+            (self.db if connection is None else connection).execute(statement)
 
     def evaluation_snapshot(self, rows):
         rows = tuple(rows)
@@ -6384,6 +6530,9 @@ class CooperativeCompute:
         self.model, self.component = model, component
         self.device = model.device if device is None else device
         self.section = "cooperative_" + component
+        self.last_sync = time.monotonic()
+        self.pending_frames = 0
+        self.pending_blocks = 0
 
     def target(self):
         frame = self.model.hop / self.model.rate
@@ -6400,18 +6549,21 @@ class CooperativeCompute:
 
     def run(self, operation, frames, cancel):
         check(cancel)
-        began = time.monotonic()
         result = operation()
-        module = getattr(self.model.torch, self.device.type, None)
-        if self.device.type in ("cuda", "xpu") and module is not None and hasattr(module, "current_stream"):
-            module.current_stream(self.device).synchronize()
-        else:
+        self.pending_frames += max(1, frames)
+        self.pending_blocks += 1
+        accelerated = self.device.type in ("cuda", "xpu", "mps")
+        interval = self.model.policy.integer("compute", "synchronize_blocks", max(1, math.isqrt(self.model.width)), 1,
+                                              max(1, self.model.width * self.model.layers)) if accelerated else 1
+        if self.pending_blocks >= interval or time.monotonic() - self.last_sync >= self.target():
             compute_sync(self.model.torch, self.device)
-        elapsed = elapsed_seconds(began)
+            elapsed = elapsed_seconds(self.last_sync)
+            self.model.policy.observe(self.section, "seconds_per_frame", elapsed / self.pending_frames)
+            self.model.policy.observe(self.section, "atomic_seconds", elapsed / self.pending_blocks)
+            self.model.policy.observe(self.section, "over_budget", float(elapsed > self.target() * self.pending_blocks))
+            self.pending_frames = self.pending_blocks = 0
+            self.last_sync = time.monotonic()
         check(cancel)
-        self.model.policy.observe(self.section, "seconds_per_frame", elapsed / max(1, frames))
-        self.model.policy.observe(self.section, "atomic_seconds", elapsed)
-        self.model.policy.observe(self.section, "over_budget", float(elapsed > self.target()))
         return gradient_checkpoint(result, cancel)
 
 class CancellableOutput:
@@ -7221,7 +7373,9 @@ def compute_devices(torch, state, emit):
             devices.append((torch.device("mps"), "Apple Metal"))
     if not devices:
         hardware = read_json(Path(state) / "hardware.json")
-        if expected not in ("", "cpu", "native") or hardware.get("adapters"):
+        visible = [item for item in hardware.get("adapters", [])
+                   if not accelerator_visibility_masked(str(item.get("vendor", "")).casefold())]
+        if expected not in ("", "cpu", "native") or visible:
             raise YuanFault("正在修复显卡运行链路，未切换为 CPU / Repairing the accelerator pipeline without switching to CPU", category="compatibility", code="compute_backend_failed", backend=expected, hardware=hardware)
         devices = [(torch.device("cpu"), "CPU")]
     emit("accelerators", devices=[{"device": str(device), "name": name} for device, name in devices], backend=expected)
@@ -7487,8 +7641,9 @@ class NativeAudio:
             return 0
         certificate = read_json(self.state / "compute-verified.json")
         expected_backend = os.environ.get("YUAN_COMPUTE_BACKEND", "")
-        if certificate.get("backend") == expected_backend and certificate.get("devices"):
-            verified = {item["device"]: item.get("identity_sha256") for item in certificate["devices"]} if certificate.get("build_sha256") == build_digest() else {}
+        if (certificate.get("backend") == expected_backend and certificate.get("devices")
+                and certificate.get("build_sha256") == build_digest()):
+            verified = {item["device"]: item.get("identity_sha256") for item in certificate["devices"]}
             devices = [item for item in devices if verified.get(str(item[0])) == compute_device_identity(self.torch, item[0], item[1])]
             if not devices:
                 raise YuanFault("设备拓扑已变化，将重新验证 / Device topology changed; verification will restart", category="compatibility", code="compute_backend_failed")
@@ -8272,6 +8427,14 @@ class NativeAudio:
                 or Path(manifest["file"]).name != manifest["file"] or not manifest["file"].endswith(".pt")
                 or any(type(manifest.get(key)) is not int or manifest[key] < 0 for key in ("steps", "accepted"))):
             raise YuanError("模型检查点记录无效 / Invalid model checkpoint record")
+        provenance = manifest.get("training_provenance", {})
+        if (not isinstance(provenance, dict) or provenance.get("owner") != APP_NAME
+                or provenance.get("origin") != "yuan-native-network" or provenance.get("external_model") is not False
+                or provenance.get("text_to_speech") is not False or not is_digest(provenance.get("build_sha256"))
+                or not is_digest(provenance.get("lineage_sha256"))
+                or ("model_identity" in provenance and provenance["model_identity"] != self.identity())
+                or ("checkpoint_protocol" in provenance and provenance["checkpoint_protocol"] != "yuan-native-checkpoint-v2")):
+            raise YuanError("模型来源或结构协议不可信，原文件已保留 / Checkpoint provenance or model contract is invalid; originals retained")
         curriculum = manifest.get("curriculum", {})
         if (not isinstance(curriculum, dict) or curriculum.get("phase", "representation") not in ("representation", "acoustic", "conditional_dialogue", "multi_turn")
                 or not isinstance(curriculum.get("validated", {}), dict)):
@@ -8318,11 +8481,8 @@ class NativeAudio:
             try:
                 manifest = self._training_manifest(checked_json(path))
                 if path.name not in ("active.json", "previous.json"):
-                    provenance = manifest.get("training_provenance", {})
-                    if (not isinstance(provenance, dict) or provenance.get("owner") != APP_NAME
-                            or provenance.get("external_model") is not False or provenance.get("text_to_speech") is not False
-                            or provenance.get("build_sha256") != build_digest() or path.with_suffix(".pt").name != manifest["file"]):
-                        raise YuanError("备用检查点缺少当前版本来源证明 / Fallback checkpoint lacks current-build provenance")
+                    if path.with_suffix(".pt").name != manifest["file"]:
+                        raise YuanError("备用检查点文件名与原始权重不一致 / Fallback checkpoint filename does not match its weights")
                     metrics = manifest.get("metrics", {})
                     validation_store = AudioStore(self.state, recover=False)
                     try:
@@ -8330,8 +8490,6 @@ class NativeAudio:
                             raise YuanError("备用检查点依赖的数据已经修订 / Fallback checkpoint depends on revised data")
                     finally:
                         validation_store.close()
-                if manifest.get("training_provenance", {}).get("build_sha256") != build_digest():
-                    raise YuanError("不加载其他版本产生的模型 / Models from other code versions are not loaded")
                 network = self._load_network(manifest, self.cancel)
             except Cancelled:
                 raise
@@ -8407,6 +8565,7 @@ class NativeAudio:
                                                    "external_model": False, "text_to_speech": False,
                                                    "origin": "yuan-native-network", "parent_model": prior.get("sha256") if isinstance(prior, dict) else None,
                                                    "build_sha256": build_digest(), "data_revision": metrics.get("data_revision"),
+                                                   "checkpoint_protocol": "yuan-native-checkpoint-v2", "model_identity": self.identity(),
                                                    "lineage_sha256": payload_digest([prior_provenance.get("lineage_sha256"), checksum, self.steps, metrics])}
                 atomic_json(sidecar, manifest, cancel)
                 if store is not None:
@@ -10983,7 +11142,8 @@ class DatasetImporter:
 class WorkspaceAudio:
     def __init__(self, state, store, model, emit):
         self.state, self.store, self.model, self.emit = Path(state).resolve(), store, model, emit
-        self.root = self.state.parent
+        self.root = safe_path(self.state, "imports")
+        self.root.mkdir(parents=True, exist_ok=True)
         self.pending = self.iterator = None
         self.phase = "manifest"
         self.next_scan = 0.0
@@ -14695,7 +14855,7 @@ class CaptureSession:
         self.last_echo = {}
         self.failure = None
         self.inference = UtteranceQueue(self.model.capacity() * self.model.np.dtype(self.model.np.float32).itemsize,
-                                         max(1, math.isqrt(self.model.capacity() // self.model.hop)))
+                                         max(1, self.model.capacity() // self.model.hop))
         self.thread = threading.Thread(target=self.run, daemon=True, name="YuanCapture")
         self.devices.capture = self
 
@@ -14814,7 +14974,9 @@ class CaptureSession:
         resampler = AudioPreprocessor(devices.input_rate, model.rate)
         gate = SpeechGate(model.rate, policy.frame_size, model.chunk_seconds, policy.segment_seconds, policy.pause_seconds, policy.onset_seconds, policy.policy)
         echo = EchoSuppressor(model.rate, policy)
-        pending = np.empty(0, dtype=np.float32)
+        pending = np.empty(policy.frame_size, dtype=np.float32)
+        pending_count = 0
+        raw_block = np.empty(max(1, math.ceil(policy.frame_size * devices.input_rate / model.rate)), dtype=np.float32)
         origin = None
         position = 0
         prior_output_faults = devices.output_faults
@@ -14850,11 +15012,19 @@ class CaptureSession:
             segment_quality = []
             segment_start = None
         def consume(converted, final=False, interrupted=False):
-            nonlocal pending, position, overlap_until, segment_overlap, segment_gap, segment_start, last_levels, segment_quality
-            pending = np.concatenate((pending, converted))
-            while len(pending) >= policy.frame_size or final and len(pending):
-                take = min(len(pending), policy.frame_size)
-                frame, pending = pending[:take], pending[take:]
+            nonlocal pending_count, position, overlap_until, segment_overlap, segment_gap, segment_start, last_levels, segment_quality
+            offset = 0
+            while offset < len(converted) or final and pending_count:
+                if offset < len(converted):
+                    count = min(policy.frame_size - pending_count, len(converted) - offset)
+                    pending[pending_count:pending_count + count] = converted[offset:offset + count]
+                    pending_count += count
+                    offset += count
+                if pending_count < policy.frame_size and not (final and offset == len(converted)):
+                    break
+                take = pending_count
+                frame = pending[:take]
+                pending_count = 0
                 timestamp = origin + position / model.rate
                 position += take
                 if not np.isfinite(frame).all():
@@ -14914,7 +15084,7 @@ class CaptureSession:
                               input_faults=devices.input_faults + devices.ring.overflows, output_faults=devices.output_faults, recorded=sum(len(value) for value in gate.frames) / model.rate, continuous=True, speech_active=gate.active, trusted_speech_active=self.trusted_speaking,
                               pending=self.inference.pending(), pending_storage=self.writer.queue.pending(), dropped_samples=devices.ring.dropped, echo_correlation=echo.correlation, echo_reduction=echo.reduction, echo_state=echo.reference_state, double_talk=echo.double_talk, echo_paths=len(echo.paths), nearend_candidate=echo.nearend_candidate, nearend_seconds=echo.nearend_seconds, playback_overlap=overlap)
         def ingest(raw, timestamp, gap):
-            nonlocal resampler, gate, echo, pending, origin, position, segment_gap, segment_overlap, segment_start, overlap_until, quality_frames, segment_quality
+            nonlocal resampler, gate, echo, pending_count, origin, position, segment_gap, segment_overlap, segment_start, overlap_until, quality_frames, segment_quality
             if gap:
                 segment_gap = True
                 if origin is not None:
@@ -14925,7 +15095,7 @@ class CaptureSession:
                 echo = EchoSuppressor(model.rate, policy)
                 quality_frames = deque(maxlen=gate.preroll.maxlen)
                 segment_quality = []
-                pending = np.empty(0, dtype=np.float32)
+                pending_count = 0
                 origin = None
                 position = 0
                 segment_gap = True
@@ -14946,9 +15116,9 @@ class CaptureSession:
                 if devices.output_faults != prior_output_faults:
                     prior_output_faults = devices.output_faults
                     self.emit("notice", key="playback_gap", id=self.session_id, output_faults=prior_output_faults)
-                raw, timestamp, gap = devices.ring.read_block(max(1, math.ceil(policy.frame_size * devices.input_rate / model.rate)))
-                if raw.size:
-                    ingest(raw, timestamp, gap)
+                taken, timestamp, gap = devices.ring.read_into(raw_block)
+                if taken:
+                    ingest(raw_block[:taken], timestamp, gap)
                 else:
                     if not devices.active():
                         raise YuanError("收音流已中断 / Capture stream was interrupted")
@@ -14958,9 +15128,9 @@ class CaptureSession:
             if devices.driver.failure is not None:
                 raise devices.driver.failure
             while devices.ring.count:
-                raw, timestamp, gap = devices.ring.read_block(max(1, math.ceil(policy.frame_size * devices.input_rate / model.rate)))
-                if raw.size:
-                    ingest(raw, timestamp, gap)
+                taken, timestamp, gap = devices.ring.read_into(raw_block)
+                if taken:
+                    ingest(raw_block[:taken], timestamp, gap)
             if origin is not None:
                 consume(resampler.process(np.empty(0, dtype=np.float32), final=True), final=True, interrupted=True)
                 save(gate.flush(), segment_start if segment_start is not None else origin + position / model.rate, final=True)
@@ -15322,7 +15492,7 @@ class LearningProcess:
                         if self.model.owned_root is not None:
                             env["YUAN_TRAINING_OWNED_ROOT"] = str(self.model.owned_root)
                         process = spawn([sys.executable, "-B", str(Path(__file__).resolve()), "--learn", str(self.state)], env,
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=True, encoding="utf-8", errors="replace", bufsize=1)
                         self.process = process
                         self.phase = "starting"
@@ -15331,6 +15501,10 @@ class LearningProcess:
                         self.operations.clear()
                         self.idle.clear()
                         self.reader = threading.Thread(target=self.receive, args=(process,), daemon=True, name="YuanLearningEvents")
+                        self.stderr_reader = threading.Thread(target=collect_child_diagnostics,
+                            args=(process, self.state, "learning-stderr", self.model.policy.integer("diagnostics", "stderr_bytes",
+                                  512 * 1024, 64 * 1024, 8 * 1024 * 1024)), daemon=True, name="YuanLearningDiagnostics")
+                        self.stderr_reader.start()
                         self.reader.start()
                     if process is not None:
                         if closing and self.phase != "closing":
@@ -15363,7 +15537,10 @@ class LearningProcess:
                     code = process.poll()
                     if code is not None:
                         self.reader.join(timeout=self.grace)
-                        for stream in (process.stdin, process.stdout):
+                        self.stderr_reader.join(timeout=self.grace)
+                        for stream in (process.stdin, process.stdout, process.stderr):
+                            if stream is process.stderr and self.stderr_reader.is_alive():
+                                continue
                             try:
                                 stream.close()
                             except (OSError, ValueError):
@@ -15416,6 +15593,89 @@ class LearningSession:
         self.request_id = None
         self.resume_values = {}
         self.persistence_interrupt = threading.Event()
+        self.resource_pressure_count = 0
+        self.yield_device = None
+        self.gpu_processes = 0
+        self.gpu_sample_at = -math.inf
+
+    def external_gpu_processes(self, model, device):
+        if device.type != "cuda":
+            return 0
+        now = time.monotonic()
+        period = model.policy.number("learning", "gpu_competition_probe_seconds",
+                                     max(math.sqrt(tick()), math.sqrt(model.chunk_seconds)), math.sqrt(tick()),
+                                     max(1.0, model.capacity_seconds))
+        if now - self.gpu_sample_at < period:
+            return self.gpu_processes
+        self.gpu_sample_at = now
+        executable = shutil.which("nvidia-smi")
+        if executable is None:
+            self.gpu_processes = 0
+            return 0
+        try:
+            uuid_value = getattr(model.torch.cuda.get_device_properties(device), "uuid", None)
+            timeout = model.policy.number("learning", "gpu_probe_timeout_seconds", min(1.0, period),
+                                          math.sqrt(tick()), max(1.0, period))
+            result = subprocess.run([executable, "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader,nounits"],
+                                    capture_output=True, text=True, errors="replace", timeout=timeout,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if result.returncode != 0:
+                self.gpu_processes = 0
+                return 0
+            candidates = set()
+            for row in result.stdout.splitlines():
+                pid, separator, identifier = row.partition(",")
+                pid = pid.strip()
+                if not separator or not pid.isdecimal():
+                    continue
+                if uuid_value and identifier.strip().casefold() not in (str(uuid_value).casefold(), "n/a", "not supported"):
+                    continue
+                value = int(pid)
+                if value != os.getpid():
+                    candidates.add(value)
+            self.gpu_processes = len(candidates)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+            self.gpu_processes = 0
+        return self.gpu_processes
+
+    def resource_pressure(self, model, psutil):
+        cpus = max(1, available_resources(psutil)["cpus"])
+        try:
+            own = max(0.0, psutil.Process().cpu_percent(interval=None) / (cpus * 100.0))
+            external = max(0.0, psutil.cpu_percent(interval=None) / 100.0 - own)
+            try:
+                external = max(external, max(0.0, os.getloadavg()[0] / cpus - own))
+            except (AttributeError, OSError, NotImplementedError):
+                pass
+        except (OSError, NotImplementedError, psutil.Error):
+            external = 0.0
+        cpu_threshold = model.policy.number("learning", "external_cpu_yield_fraction", 0.85, 0.5, 0.99)
+        gpu_pressure = 0.0
+        gpu_utilization = None
+        target = self.yield_device if self.yield_device is not None else model.device
+        if target.type in ("cuda", "xpu"):
+            module = getattr(model.torch, target.type, None)
+            try:
+                free, total = module.mem_get_info(target)
+                reserved = module.memory_reserved(target) if hasattr(module, "memory_reserved") else 0
+                gpu_pressure = max(0.0, min(1.0, (total - free - reserved) / max(1, total)))
+            except (AttributeError, OSError, RuntimeError, TypeError):
+                gpu_pressure = 0.0
+            try:
+                if hasattr(module, "utilization"):
+                    gpu_utilization = max(0.0, min(1.0, float(module.utilization(target)) / 100.0))
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                pass
+        external_processes = self.external_gpu_processes(model, target)
+        gpu_activity = gpu_utilization if external_processes and gpu_utilization is not None else 0.0
+        gpu_threshold = model.policy.number("learning", "external_gpu_yield_fraction", 0.5, 0.1, 0.95)
+        busy = external > cpu_threshold or gpu_pressure > gpu_threshold or gpu_activity > gpu_threshold
+        self.resource_pressure_count = self.resource_pressure_count + 1 if busy else 0
+        observations = model.policy.integer("learning", "resource_pressure_observations", max(1, math.isqrt(cpus)), 1, max(1, cpus))
+        return {"yield": self.resource_pressure_count >= observations, "external_cpu_load": external,
+                "external_gpu_memory_fraction": gpu_pressure, "external_gpu_processes": external_processes,
+                "gpu_utilization_fraction": gpu_utilization, "external_gpu_activity_fraction": gpu_activity,
+                "cpu_threshold": cpu_threshold, "gpu_threshold": gpu_threshold, "consecutive": self.resource_pressure_count}
 
     def control(self):
         try:
@@ -15543,6 +15803,26 @@ class LearningSession:
                 began = time.monotonic()
                 try:
                     with model.interruptible(work_cancel):
+                        pressure = self.resource_pressure(model, deps["psutil"])
+                        if pressure["yield"]:
+                            sources.pause()
+                            if (self.yield_device is None and model.device.type in ("cuda", "xpu")
+                                    and max(pressure["external_gpu_memory_fraction"], pressure["external_gpu_activity_fraction"]) > pressure["gpu_threshold"]):
+                                target = model.device
+                                model.training_placement(model.torch.device("cpu"), learner)
+                                self.yield_device = target
+                            learner.checkpoint(work_cancel)
+                            model.verifier.checkpoint(work_cancel)
+                            model.policy.save()
+                            self.emit("learning_snapshot", training_active=False, training_state="cooperative_yield",
+                                      process_isolated=True, resource_pressure=pressure, **training_checkpoint_status(model, learner, verify=False))
+                            duration = model.policy.number("learning", "resource_yield_seconds", max(model.chunk_seconds, math.sqrt(model.capacity_seconds)),
+                                                           model.hop / model.rate, model.capacity_seconds)
+                            work_cancel.wait(duration)
+                            continue
+                        if self.yield_device is not None:
+                            model.training_placement(self.yield_device, learner)
+                            self.yield_device = None
                         sources.ensure_running()
                         learner._resume_activation(work_cancel)
                         required = model.capacity() * model.np.dtype(model.np.float32).itemsize * 2
@@ -17467,7 +17747,11 @@ class Launcher:
         details = fault.get("details", {}) if isinstance(fault, dict) else {}
         request = {key: details[key] for key in ("resource_kind", "device", "device_identity", "configuration", "required_bytes") if key in details}
         process = spawn([str(executable), "-B", str(Path(__file__).resolve()), "--probe-resources", str(state), json.dumps(request, allow_nan=False)],
-                        workspace_environment(self.workspace), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                        workspace_environment(self.workspace), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        diagnostics = threading.Thread(target=collect_child_diagnostics, args=(process, state, "resource-probe-stderr",
+            self.gate.policy.integer("diagnostics", "stderr_bytes", 512 * 1024, 64 * 1024, 8 * 1024 * 1024)),
+            daemon=True, name="YuanResourceDiagnostics")
+        diagnostics.start()
         deadline = time.monotonic() + self.gate.probe_seconds
         try:
             while process.poll() is None:
@@ -17487,6 +17771,9 @@ class Launcher:
             if process.poll() is None:
                 end_process(process)
             process.stdout.close()
+            diagnostics.join(timeout=max(tick(), min(self.gate.probe_seconds, 1.0)))
+            if not diagnostics.is_alive():
+                process.stderr.close()
 
     def wait_recovery(self, fault, installer=None):
         self.blocked.set()
