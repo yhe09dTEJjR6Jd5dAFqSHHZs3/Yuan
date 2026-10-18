@@ -12850,6 +12850,7 @@ class AudioDevices:
         self.output_recovery = None
         self.output_recovery_at = 0.0
         self.output_recovery_failures = 0
+        self.audio_open_attempts = []
 
     def timeout(self, key, default=None):
         default = max(5.0, self.model.chunk_seconds * 2) if default is None else default
@@ -12909,7 +12910,7 @@ class AudioDevices:
             for index in options:
                 device = dict(all_devices[index])
                 maximum = int(device["max_" + direction + "_channels"])
-                for channels in dict.fromkeys((1, min(2, maximum))):
+                for channels in dict.fromkeys((1, min(2, maximum)) if direction == "input" else (min(2, maximum), 1)):
                     for rate in dict.fromkeys((int(round(device["default_samplerate"])), self.model.rate)):
                         try:
                             getattr(self.sd, "check_" + direction + "_settings")(device=index, channels=channels, dtype="float32", samplerate=rate)
@@ -13099,6 +13100,87 @@ class AudioDevices:
             raise YuanError("输出回调持续失败，正在恢复音频流 / Persistent output callback failure; audio stream recovery required")
         return self.active()
 
+    def _device_variants(self, direction, selected_index, selected_device):
+        devices = self.sd.query_devices()
+        selected_name = str(devices[selected_index].get("name", "")).casefold()
+        selected_api = devices[selected_index].get("hostapi")
+        options = [index for index, device in enumerate(devices)
+                   if index != selected_index and int(device.get("max_" + direction + "_channels", 0)) > 0]
+        options.sort(key=lambda index: (str(devices[index].get("name", "")).casefold() != selected_name,
+                                        devices[index].get("hostapi") != selected_api, index))
+        observed_rates = tuple(dict.fromkeys(int(round(float(row.get("default_samplerate", 0)))) for row in devices
+                                         if float(row.get("default_samplerate", 0)) > 0))
+        for index in (selected_index, *options):
+            device = devices[index]
+            maximum = int(device.get("max_" + direction + "_channels", 0))
+            if maximum < 1:
+                continue
+            native_rate = int(round(float(device.get("default_samplerate", 0))))
+            rates = dict.fromkeys((int(selected_device["default_samplerate"]) if index == selected_index else native_rate,
+                                   native_rate, self.model.rate, *observed_rates))
+            channels = dict.fromkeys((1, min(2, maximum)) if direction == "input" else (min(2, maximum), 1))
+            for rate in rates:
+                if rate <= 0:
+                    continue
+                for count in channels:
+                    try:
+                        getattr(self.sd, "check_" + direction + "_settings")(
+                            device=index, channels=count, samplerate=rate, dtype="float32")
+                    except (OSError, RuntimeError, ValueError, TypeError):
+                        continue
+                    for latency in dict.fromkeys((self.policy.latency, "high")):
+                        yield index, rate, count, latency, str(device["name"])
+
+    def _start_output(self, selected_index, selected_device, cancel, deadline, preferred=None):
+        attempted = set()
+        errors = []
+        def variants():
+            if preferred is not None:
+                try:
+                    name = str(self.sd.query_devices(preferred[0])["name"])
+                except (OSError, RuntimeError, ValueError, IndexError):
+                    name = str(preferred[0])
+                yield (*preferred, name)
+            yield from self._device_variants("output", selected_index, selected_device)
+        for index, rate, channels, latency, name in variants():
+            check(cancel)
+            if time.monotonic() >= deadline:
+                break
+            specification = (index, rate, channels, latency)
+            if specification in attempted:
+                continue
+            attempted.add(specification)
+            stream = None
+            try:
+                stream = self.sd.OutputStream(device=index, samplerate=rate, channels=channels,
+                                              dtype="float32", blocksize=0, latency=latency,
+                                              callback=self.guarded_output_callback)
+                stream.start()
+                with self.stream_lock:
+                    if "input" not in self.streams:
+                        raise Cancelled()
+                    self.streams["output"] = stream
+                self.output_rate = rate
+                self.output_latency = float(stream.latency)
+                self.output_spec = specification
+                self.callback_failed["output"] = False
+                self.output_failed_since = None
+                self.last_output_callback = time.monotonic()
+                self.audio_open_attempts = errors.copy()
+                return name
+            except Cancelled:
+                if stream is not None:
+                    stream.close(ignore_errors=True)
+                raise
+            except Exception as exc:
+                errors.append(f"{name} · {rate}Hz/{channels}ch · {latency}: {concise_error(exc)}")
+                if stream is not None:
+                    stream.close(ignore_errors=True)
+        self.audio_open_attempts = errors.copy()
+        raise YuanError("无法打开音频输出流 / Could not open an audio output stream; "
+                        + str(len(attempted)) + " configurations tested; "
+                        + "; ".join(dict.fromkeys(errors[-6:])))
+
     def _restore_output(self):
         with self.stream_lock:
             if "input" not in self.streams or self.output_spec is None:
@@ -13107,28 +13189,26 @@ class AudioDevices:
         if stream is not None:
             stream.abort(ignore_errors=True)
             stream.close(ignore_errors=True)
-        index, rate, channels = self.output_spec
-        restored = self.sd.OutputStream(device=index, samplerate=rate, channels=channels, dtype="float32",
-                                        blocksize=0, latency=self.policy.latency, callback=self.guarded_output_callback)
+        preferred = self.output_spec
+        index = preferred[0]
         try:
-            with self.stream_lock:
-                if "input" not in self.streams:
-                    restored.close(ignore_errors=True)
-                    return False
-                self.streams["output"] = restored
-            restored.start()
-        except BaseException:
-            with self.stream_lock:
-                if self.streams.get("output") is restored:
-                    self.streams.pop("output", None)
-            restored.close(ignore_errors=True)
-            raise
-        self.output_latency = float(restored.latency)
-        self.last_output_callback = time.monotonic()
-        self.callback_failed["output"] = False
-        self.output_failed_since = None
+            device = dict(self.sd.query_devices(index))
+            if int(device.get("max_output_channels", 0)) < 1:
+                raise ValueError("Output device disconnected")
+        except (OSError, RuntimeError, ValueError, IndexError):
+            devices = self.sd.query_devices()
+            index = next((number for number, row in enumerate(devices)
+                          if int(row.get("max_output_channels", 0)) > 0), None)
+            if index is None:
+                raise YuanError("等待可用扬声器 / Waiting for an available speaker")
+            device = dict(devices[index])
+            preferred = None
+        if preferred is not None:
+            device.update(default_samplerate=preferred[1], selected_channels=preferred[2])
+        name = self._start_output(index, device, None, time.monotonic() + self.timeout("output_recover"), preferred)
         self.output_recovery_failures = 0
-        self.emit("devices", output_rate=rate, output_latency=self.output_latency, transport="separate-output-recovered", continuous=True)
+        self.emit("devices", output=name, output_rate=self.output_rate, output_latency=self.output_latency,
+                  output_channels=self.output_spec[2], transport="separate-output-recovered", continuous=True)
         return True
 
     def recover_output_async(self):
@@ -13148,7 +13228,8 @@ class AudioDevices:
         self.output_recovery = threading.Thread(target=recover, daemon=True, name="YuanOutputRecovery")
         self.output_recovery.start()
 
-    def _open_streams(self, cancel):
+    def _open_streams(self, cancel, deadline=None):
+        deadline = time.monotonic() + self.timeout("open") if deadline is None else deadline
         indices, devices = self._probe()
         self.clock_offsets = {}
         self.clock_states = {}
@@ -13161,59 +13242,91 @@ class AudioDevices:
         self.output_recovery_failures = 0
         self.playback = self.reference = None
         self.last_input_callback = self.last_output_callback = time.monotonic()
+        self.audio_open_attempts = []
         reasons = []
-        common_rates = dict.fromkeys((int(devices[0]["default_samplerate"]), int(devices[1]["default_samplerate"]), self.model.rate))
+        common_rates = dict.fromkeys((int(devices[0]["default_samplerate"]),
+                                      int(devices[1]["default_samplerate"]), self.model.rate))
         for rate in common_rates:
+            for latency in dict.fromkeys((self.policy.latency, "high")):
+                check(cancel)
+                if time.monotonic() >= deadline:
+                    break
+                stream = None
+                try:
+                    self.input_rate = self.output_rate = rate
+                    self.clock_offsets = {}
+                    self.clock_states = {}
+                    self.ring = SampleRing(math.ceil(rate * self.policy.buffer_seconds), rate)
+                    self.mono_buffer = self.model.np.empty(len(self.ring.buffer), dtype=self.model.np.float32)
+                    stream = self.sd.Stream(device=tuple(indices), samplerate=rate,
+                                            channels=tuple(device["selected_channels"] for device in devices),
+                                            dtype="float32", blocksize=0, latency=latency,
+                                            callback=self.duplex_callback, never_drop_input=True)
+                    reported = stream.latency
+                    self.input_latency, self.output_latency = reported if isinstance(reported, (tuple, list)) else (reported, reported)
+                    with self.stream_lock:
+                        check(cancel)
+                        self.streams["duplex"] = stream
+                    stream.start()
+                    self.emit("devices", input_rate=rate, output_rate=rate, input_latency=self.input_latency,
+                              output_latency=self.output_latency, input_channels=devices[0]["selected_channels"],
+                              output_channels=devices[1]["selected_channels"], transport="duplex", continuous=True)
+                    return
+                except Cancelled:
+                    if stream is not None:
+                        stream.close(ignore_errors=True)
+                    self._close_streams()
+                    raise
+                except Exception as exc:
+                    reasons.append(f"duplex {rate}Hz · {latency}: {concise_error(exc)}")
+                    self._close_streams()
+                    if stream is not None:
+                        stream.close(ignore_errors=True)
+        input_name = None
+        for index, rate, channels, latency, name in self._device_variants("input", indices[0], devices[0]):
             check(cancel)
+            if time.monotonic() >= deadline:
+                break
             stream = None
             try:
-                self.input_rate = self.output_rate = rate
-                self.clock_offsets = {}
-                self.clock_states = {}
+                self.input_rate = rate
                 self.ring = SampleRing(math.ceil(rate * self.policy.buffer_seconds), rate)
                 self.mono_buffer = self.model.np.empty(len(self.ring.buffer), dtype=self.model.np.float32)
-                stream = self.sd.Stream(device=tuple(indices), samplerate=rate, channels=tuple(device["selected_channels"] for device in devices), dtype="float32",
-                                        blocksize=0, latency=self.policy.latency, callback=self.duplex_callback, never_drop_input=True)
-                reported = stream.latency
-                self.input_latency, self.output_latency = reported if isinstance(reported, (tuple, list)) else (reported, reported)
+                stream = self.sd.InputStream(device=index, samplerate=rate, channels=channels,
+                                             dtype="float32", blocksize=0, latency=latency,
+                                             callback=self.guarded_input_callback)
                 with self.stream_lock:
                     check(cancel)
-                    self.streams["duplex"] = stream
+                    self.streams["input"] = stream
                 stream.start()
-                self.emit("devices", input_rate=rate, output_rate=rate, input_latency=self.input_latency, output_latency=self.output_latency, transport="duplex", continuous=True)
-                return
+                self.input_latency = float(stream.latency)
+                input_name = name
+                break
             except Cancelled:
                 if stream is not None:
                     stream.close(ignore_errors=True)
-                self.close_streams()
+                self._close_streams()
                 raise
             except Exception as exc:
-                reasons.append(concise_error(exc))
+                reasons.append(f"input {name} · {rate}Hz/{channels}ch · {latency}: {concise_error(exc)}")
+                self._close_streams()
                 if stream is not None:
                     stream.close(ignore_errors=True)
-                with self.stream_lock:
-                    self.streams.clear()
-        self.input_rate = int(devices[0]["default_samplerate"])
-        self.output_rate = int(devices[1]["default_samplerate"])
-        self.output_spec = (indices[1], self.output_rate, devices[1]["selected_channels"])
-        self.ring = SampleRing(math.ceil(self.input_rate * self.policy.buffer_seconds), self.input_rate)
-        self.mono_buffer = self.model.np.empty(len(self.ring.buffer), dtype=self.model.np.float32)
+        if input_name is None:
+            raise YuanError("无法打开音频输入流 / Could not open an audio input stream; "
+                            + "; ".join(dict.fromkeys(reasons[-6:])))
         try:
-            for direction, index, device in zip(("input", "output"), indices, devices):
-                check(cancel)
-                constructor = self.sd.InputStream if direction == "input" else self.sd.OutputStream
-                stream = constructor(device=index, samplerate=int(device["default_samplerate"]), channels=device["selected_channels"], dtype="float32",
-                                     blocksize=0, latency=self.policy.latency, callback=self.guarded_input_callback if direction == "input" else self.guarded_output_callback)
-                setattr(self, direction + "_latency", float(stream.latency))
-                with self.stream_lock:
-                    self.streams[direction] = stream
-                    check(cancel)
-                stream.start()
-            self.emit("devices", input_rate=self.input_rate, output_rate=self.output_rate, input_latency=self.input_latency, output_latency=self.output_latency, transport="separate-continuous", continuous=True)
+            output_name = self._start_output(indices[1], devices[1], cancel, deadline)
         except BaseException:
-            self.close_streams()
+            self._close_streams()
             raise
-        self.emit("notice", key="full_duplex", component="separate_streams", reasons=reasons)
+        self.emit("devices", input=input_name, output=output_name,
+                  input_rate=self.input_rate, output_rate=self.output_rate,
+                  input_latency=self.input_latency, output_latency=self.output_latency,
+                  output_channels=self.output_spec[2], transport="separate-continuous", continuous=True)
+        if reasons or self.audio_open_attempts:
+            self.emit("notice", key="full_duplex", component="separate_streams",
+                      reasons=reasons[-6:], output_attempts=self.audio_open_attempts[-6:])
 
     def _integrity_test(self, cancel):
         import numpy as np
@@ -13255,7 +13368,7 @@ class AudioDevices:
         self._close_streams()
         initial_input, initial_output = self.input_callbacks, self.output_callbacks
         try:
-            self._open_streams(cancel)
+            self._open_streams(cancel, deadline - min(math.sqrt(tick()), max(tick(), deadline - time.monotonic()) / 4))
             while time.monotonic() < deadline:
                 check(cancel)
                 if not self.active():
@@ -16034,6 +16147,7 @@ class LearningSession:
         self.yield_device = None
         self.gpu_processes = None
         self.gpu_sample_at = -math.inf
+        self.gpu_utilization_supported = True
 
     def external_gpu_processes(self, model, device):
         if device.type != "cuda":
@@ -16046,6 +16160,10 @@ class LearningSession:
             return self.gpu_processes
         self.gpu_sample_at = now
         executable = shutil.which("nvidia-smi")
+        if executable is None and os.name == "nt":
+            candidates = (Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/nvidia-smi.exe",
+                          Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "NVIDIA Corporation/NVSMI/nvidia-smi.exe")
+            executable = next((str(path) for path in candidates if path.is_file()), None)
         if executable is None:
             self.gpu_processes = None
             return None
@@ -16111,10 +16229,12 @@ class LearningSession:
                 gpu_pressure = max(0.0, min(1.0, (total - free - own_reserved) / total))
             module = getattr(model.torch, target.type, None)
             try:
-                if module is not None and hasattr(module, "utilization"):
+                if self.gpu_utilization_supported and module is not None and hasattr(module, "utilization"):
                     utilization = float(module.utilization(target)) / 100.0
                     if math.isfinite(utilization):
                         gpu_utilization = max(0.0, min(1.0, utilization))
+            except ImportError:
+                self.gpu_utilization_supported = False
             except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                 pass
         external_processes = self.external_gpu_processes(model, target)
