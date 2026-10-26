@@ -27,6 +27,8 @@ import stat
 import unicodedata
 import base64
 import io
+import socket
+import ssl
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -37,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 
 APP_NAME = "Yuan"
-MODEL_COMPATIBILITY_PROTOCOL = "yuan-model-compatibility-v1"
+MODEL_COMPATIBILITY_PROTOCOL = "yuan-model-compatibility-v2"
 STATE_NAME = ".yuan-native"
 EMBEDDED_RELEASE = {}
 PYTHON_REQUIREMENT = ">=3.10,<3.14"
@@ -326,6 +328,7 @@ TEXT = {
     "promoted": ("留出指标改善 · 学习权重已保存，对话版本不变", "Held-out metrics improved · learning weights saved, conversation release unchanged"),
     "kept": ("未通过全部验证 · 候选继续学习", "Validation not passed · candidate keeps learning"),
     "waiting_data": ("等待独立音频样本", "Waiting for independent audio samples"),
+    "waiting_evidence": ("暂停无验证训练 · 等待独立训练/验证数据", "Unvalidated training paused · waiting for independent training and validation data"),
     "network": ("空闲联网获取公开音频", "Fetching public audio while idle"),
     "offline": ("公开音频源暂不可达 · 本地学习继续", "Public audio source unreachable · local learning continues"),
     "paused": ("学习暂缓 · 对话不受影响", "Learning paused · conversation remains available"),
@@ -353,7 +356,8 @@ TEXT = {
     "no_prompt": ("已自动填入默认提示词", "Default instructions filled in automatically"),
     "limited": ("资源长度边界已到 · 本轮已安全结束", "Resource length limit reached · turn ended safely"),
     "metrics_note": ("仅运行自有模型，不使用 TTS；候选指标改善与已验收服务版本分别展示。", "Own models only, without TTS; candidate metric improvements and accepted serving versions are shown separately."),
-    "mic_missing": ("等待可用麦克风与扬声器", "Waiting for a microphone and speaker"),
+    "mic_missing": ("等待可用麦克风", "Waiting for a microphone"),
+    "speaker_missing": ("麦克风已可用，正在等待扬声器恢复", "Microphone is available; waiting for speaker recovery"),
     "history_full": ("存储空间不足 · 暂停保存新增历史", "Storage low · new history recording paused"),
     "input": ("输入", "Input"), "output": ("输出", "Output"),
     "seconds": ("秒", "seconds"), "turns": ("轮", "turns"),
@@ -550,9 +554,48 @@ def release_source(state):
                 or not isinstance(EMBEDDED_RELEASE.get("descriptor"), dict) or not isinstance(EMBEDDED_RELEASE.get("trust"), dict)):
             raise YuanError("内置自有模型发布数据无效 / Invalid embedded owned-model release")
         return Path(__file__).resolve(), copy.deepcopy(EMBEDDED_RELEASE["descriptor"]), True
-    paths = (Path(state).parent / "Yuan.release.json", Path(__file__).resolve().with_name("Yuan.release.json"))
-    path = next((path for path in paths if path.is_file() and not path.is_symlink()), None)
-    return (path, checked_json(path), False) if path is not None else (None, None, False)
+    workspace = Path(state).resolve().parent
+    package = Path(__file__).resolve().parent
+    roots = (workspace, workspace / "models", workspace / "releases", Path(state),
+             Path(state) / "models", Path(state) / "releases", package)
+    paths = [root / "Yuan.release.json" for root in roots]
+    for parent in (workspace / "models", workspace / "releases", Path(state) / "models", Path(state) / "releases"):
+        if not parent.is_dir() or parent.is_symlink():
+            continue
+        try:
+            paths.extend(entry / "Yuan.release.json" for entry in sorted(parent.iterdir(), key=lambda entry: entry.name)[:128]
+                         if entry.is_dir() and not entry.is_symlink())
+        except OSError:
+            continue
+    available = []
+    invalid = []
+    for path in dict.fromkeys(paths):
+        if not path.is_file() or path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != parent.parent):
+            continue
+        try:
+            value = checked_json(path)
+            source = value.get("source")
+            if (value.get("format") != "yuan-owned-release-source-v2" or value.get("owner") != APP_NAME
+                    or not is_digest(value.get("sha256")) or not isinstance(source, str) or not source.strip()
+                    or not release_code_compatible(value)):
+                raise YuanError("自有模型来源或协议无效 / Invalid release source or model protocol")
+            parsed = urllib.parse.urlparse(source)
+            if parsed.scheme:
+                if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                    raise YuanError("模型来源必须是可信 HTTPS / Release source must use HTTPS")
+                priority = 1
+            else:
+                artifact = safe_path(path.parent, source)
+                priority = 2 if artifact.is_file() and not artifact.is_symlink() else 0
+            available.append((priority, -len(available), path, value))
+        except (OSError, ValueError, TypeError, YuanError) as exc:
+            invalid.append((path, concise_error(exc)))
+    if available:
+        _, _, path, value = max(available)
+        return path, value, False
+    if invalid:
+        raise YuanError("已发现模型来源文件但均无效 / Found release descriptors, but none is valid: " + "; ".join(str(path.name) + ": " + reason for path, reason in invalid[:4]))
+    return None, None, False
 
 def embedded_source_text(payload):
     source = Path(__file__).read_text(encoding="utf-8")
@@ -564,29 +607,56 @@ def embedded_source_text(payload):
         raise YuanError("嵌入发布数据改变了执行代码 / Embedding release data changed executable code")
     return updated
 
+def compatibility_nodes(source=None, scope="model"):
+    text = Path(__file__).read_text(encoding="utf-8") if source is None else source
+    classes = {"NetworkConfig", "ModelResources", "NativeAudio", "AudioLearner", "SpeechVerifier",
+               "CapabilityEvidence", "FinalAcceptance", "AcceptancePolicy", "AudioPolicy",
+               "AudioPreprocessor", "AudioSequence", "AudioEncoding"}
+    functions = {"network_digest", "portable_recurrent"}
+    if scope == "capture":
+        classes, functions = {"SpeechGate", "EchoSuppressor", "CaptureSession"}, set()
+    elif scope == "evaluation":
+        classes, functions = {"SpeechGate", "EchoSuppressor"}, set()
+    elif scope == "legacy":
+        classes |= {"SpeechGate", "EchoSuppressor", "CaptureSession"}
+    elif scope != "model":
+        raise YuanError("模型契约类型无效 / Invalid model contract scope")
+    tree = ast.parse(text)
+    nodes = [(item.name, ast.dump(item, include_attributes=False)) for item in tree.body
+             if isinstance(item, ast.ClassDef) and item.name in classes
+             or isinstance(item, ast.FunctionDef) and item.name in functions]
+    if {name for name, _ in nodes} != classes | functions:
+        raise YuanError("模型兼容性协议定义不完整 / Model compatibility contract is incomplete")
+    return nodes
+
+
 def model_compatibility_digest(source=None):
-    identity = None
     if source is None:
         info = Path(__file__).stat()
         identity = (info.st_mtime_ns, info.st_ctime_ns, info.st_size, info.st_dev, info.st_ino)
         cached = getattr(model_compatibility_digest, "cached", None)
         if cached is not None and cached[0] == identity:
             return cached[1]
-        source = Path(__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    classes = {"NetworkConfig", "ModelResources", "NativeAudio", "AudioLearner", "SpeechVerifier",
-               "CapabilityEvidence", "FinalAcceptance", "AcceptancePolicy", "AudioPolicy",
-               "AudioPreprocessor", "AudioSequence", "AudioEncoding", "SpeechGate", "EchoSuppressor", "CaptureSession"}
-    functions = {"network_digest", "portable_recurrent"}
-    nodes = [(item.name, ast.dump(item, include_attributes=False)) for item in tree.body
-             if (isinstance(item, ast.ClassDef) and item.name in classes)
-             or (isinstance(item, ast.FunctionDef) and item.name in functions)]
-    if {name for name, _ in nodes} != classes | functions:
-        raise YuanError("模型兼容性协议定义不完整 / Model compatibility contract is incomplete")
-    result = payload_digest([MODEL_COMPATIBILITY_PROTOCOL, nodes])
-    if identity is not None:
+    result = payload_digest([MODEL_COMPATIBILITY_PROTOCOL, compatibility_nodes(source, "model")])
+    if source is None:
         model_compatibility_digest.cached = identity, result
     return result
+
+
+def evaluation_compatibility_digest(source=None):
+    return payload_digest(["yuan-evaluation-compatibility-v2", model_compatibility_digest(source), compatibility_nodes(source, "evaluation")])
+
+
+def capture_compatibility_digest(source=None):
+    return payload_digest(["yuan-capture-compatibility-v1", compatibility_nodes(source, "capture")])
+
+
+def legacy_model_compatibility_digest(source=None):
+    return payload_digest(["yuan-model-compatibility-v1", compatibility_nodes(source, "legacy")])
+
+
+def evaluator_digests():
+    return {evaluation_compatibility_digest(), legacy_model_compatibility_digest()}
 
 
 def compute_compatibility_digest(source=None):
@@ -625,12 +695,13 @@ def compute_certificate_valid(certificate):
 def release_code_compatible(record):
     protocol = record.get("model_compatibility_sha256")
     if protocol is not None:
-        return is_digest(protocol) and protocol == model_compatibility_digest() and is_digest(record.get("build_sha256"))
+        return (is_digest(protocol) and protocol in (model_compatibility_digest(), legacy_model_compatibility_digest())
+                and is_digest(record.get("build_sha256")))
     return record.get("build_sha256") == build_digest()
 
 
 def behavior_digest():
-    return model_compatibility_digest()
+    return evaluation_compatibility_digest()
 
 
 def payload_digest(value):
@@ -653,13 +724,15 @@ def can_converse(values):
     return all(values.get(key) is True for key in ("runtime_ready", "pipeline_ready", "audio_ready", "model_ready"))
 
 def readiness_view(values, closing=False):
-    ready = bool(not closing and can_converse(values) and values.get("storage_ready") is True and values.get("conversation_ready") is True)
+    ready = bool(not closing and can_converse(values) and values.get("output_ready") is True and values.get("storage_ready") is True and values.get("conversation_ready") is True)
     if ready:
         return True, "ready"
     if values.get("runtime_ready") is not True:
         return False, None
     if values.get("audio_ready") is not True:
         return False, "mic_missing"
+    if values.get("output_ready") is not True:
+        return False, "speaker_missing"
     if values.get("storage_ready") is not True:
         return False, "history_full"
     return False, values.get("model_blocker") or "preparing_model"
@@ -1782,15 +1855,40 @@ def workspace_environment(workspace):
 def accelerator_visibility_masked(vendor, environment=None):
     source = os.environ if environment is None else environment
     if vendor == "nvidia":
-        keys = ("CUDA_VISIBLE_DEVICES",)
+        keys = ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")
     elif vendor == "amd":
         keys = ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
     elif vendor == "intel":
         keys = ("ZE_AFFINITY_MASK",)
     else:
         return False
-    return any(key in source and str(source[key]).strip().casefold() in ("", "-1", "none") for key in keys)
+    return any(key in source and str(source[key]).strip().casefold() in ("", "-1", "none", "void") for key in keys)
 
+
+def runtime_recovery_identity(hardware, environment):
+    watched = ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+               "ZE_AFFINITY_MASK", "ONEAPI_DEVICE_SELECTOR", "HSA_OVERRIDE_GFX_VERSION", "PYTORCH_ENABLE_MPS_FALLBACK")
+    tools = ("nvidia-smi", "rocminfo", "clinfo", "sycl-ls")
+    binary = []
+    for name in tools:
+        path = shutil.which(name, path=environment.get("PATH"))
+        if not path:
+            binary.append((name, None))
+            continue
+        try:
+            info = Path(path).stat()
+            binary.append((name, str(Path(path).resolve()), info.st_size, info.st_mtime_ns))
+        except OSError:
+            binary.append((name, str(path), None))
+    nodes = []
+    if platform.system() == "Linux":
+        for path in ("/dev/kfd", "/dev/nvidiactl", "/dev/dri/renderD128", "/dev/dri/renderD129"):
+            try:
+                info = Path(path).stat()
+                nodes.append((path, info.st_mode, info.st_rdev, info.st_mtime_ns))
+            except OSError:
+                nodes.append((path, None))
+    return payload_digest([hardware, [(key, environment.get(key)) for key in watched], binary, nodes])
 
 def host_python():
     path = Path(sys.executable)
@@ -2228,6 +2326,7 @@ class RuntimeInstaller:
         self.cached_value = None
         self.verified_entry = None
         self.hardware = self.detect_hardware()
+        self.recovery_identity = runtime_recovery_identity(self.hardware, self.env)
         self.compute_backend = None
         self.policy.save()
         self.emit("runtime_network", key="runtime_network", **self.network_config.summary())
@@ -2342,7 +2441,7 @@ class RuntimeInstaller:
 
     def detect_hardware(self):
         hardware = {"system": platform.system(), "machine": platform.machine(), "cuda": None,
-                    "visibility": os.environ.get("CUDA_VISIBLE_DEVICES"), "driver": None, "adapters": []}
+                    "visibility": self.env.get("CUDA_VISIBLE_DEVICES"), "driver": None, "adapters": []}
         timeout = self.policy.number("runtime", "hardware_probe_seconds", 10.0, 1.0, 60.0)
         def execute(arguments):
             result = subprocess.run(arguments, capture_output=True, timeout=timeout, env=self.env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -2354,13 +2453,28 @@ class RuntimeInstaller:
                 text = execute([powershell, "-NoProfile", "-NonInteractive", "-Command", "[Console]::OutputEncoding=[Text.UTF8Encoding]::new();Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID,DriverVersion,ConfigManagerErrorCode | ConvertTo-Json -Compress"])
                 rows = json.loads(text) if text else []
                 rows = [rows] if isinstance(rows, dict) else rows
-                for row in rows:
+                for row in rows if isinstance(rows, list) else []:
+                    if not isinstance(row, dict):
+                        continue
                     name, identifier = str(row.get("Name", "")), str(row.get("PNPDeviceID", "")).upper()
                     vendor = "nvidia" if "VEN_10DE" in identifier else "amd" if "VEN_1002" in identifier else "intel" if "VEN_8086" in identifier else None
                     if vendor:
                         hardware["adapters"].append({"name": name, "vendor": vendor, "driver": str(row.get("DriverVersion", "")), "status": row.get("ConfigManagerErrorCode")})
             except (OSError, ValueError, subprocess.TimeoutExpired, TypeError):
                 pass
+            if not hardware["adapters"]:
+                try:
+                    fallback = execute([powershell, "-NoProfile", "-NonInteractive", "-Command", "Get-PnpDevice -Class Display -PresentOnly | Select-Object FriendlyName,InstanceId,Status | ConvertTo-Json -Compress"])
+                    rows = json.loads(fallback) if fallback else []
+                    for row in ([rows] if isinstance(rows, dict) else rows if isinstance(rows, list) else []):
+                        if not isinstance(row, dict):
+                            continue
+                        identifier = str(row.get("InstanceId", "")).upper()
+                        vendor = "nvidia" if "VEN_10DE" in identifier else "amd" if "VEN_1002" in identifier else "intel" if "VEN_8086" in identifier else None
+                        if vendor:
+                            hardware["adapters"].append({"name": str(row.get("FriendlyName") or vendor), "vendor": vendor, "status": row.get("Status")})
+                except (OSError, ValueError, subprocess.TimeoutExpired, TypeError):
+                    pass
         elif hardware["system"] == "Linux":
             for directory in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
                 if not re.fullmatch(r"card[0-9]+", directory.name):
@@ -2372,6 +2486,16 @@ class RuntimeInstaller:
                         hardware["adapters"].append({"name": directory.name, "vendor": vendor})
                 except OSError:
                     pass
+            if not hardware["adapters"]:
+                for directory in sorted(Path("/sys/bus/pci/devices").glob("*")):
+                    try:
+                        vendor_id = (directory / "vendor").read_text().strip().lower()
+                        device_class = (directory / "class").read_text().strip().lower()
+                        vendor = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}.get(vendor_id)
+                        if vendor and device_class.startswith(("0x03", "0x12")):
+                            hardware["adapters"].append({"name": directory.name, "vendor": vendor, "pci_class": device_class})
+                    except OSError:
+                        continue
         elif hardware["system"] == "Darwin" and hardware["machine"].casefold() in ("arm64", "aarch64"):
             hardware["adapters"].append({"name": "Apple Silicon", "vendor": "apple"})
         executable = shutil.which("nvidia-smi")
@@ -2399,6 +2523,16 @@ class RuntimeInstaller:
                 hardware["compute_capabilities"] = [value.strip() for value in capabilities.splitlines() if re.fullmatch(r"\s*[0-9]+\.[0-9]+\s*", value)]
             except (OSError, ValueError, subprocess.TimeoutExpired, ElementTree.ParseError):
                 pass
+        seen = set()
+        adapters = []
+        for row in hardware["adapters"]:
+            identity = (row.get("vendor"), row.get("name"))
+            if identity not in seen:
+                adapters.append(row)
+                seen.add(identity)
+        hardware["adapters"] = adapters
+        hardware["visibility_masks"] = {vendor: accelerator_visibility_masked(vendor, self.env)
+                                        for vendor in ("nvidia", "amd", "intel")}
         atomic_json(self.state / "hardware.json", hardware, self.cancel)
         self.emit("hardware", hardware=hardware)
         return hardware
@@ -2422,9 +2556,9 @@ class RuntimeInstaller:
                 capabilities = [float(value) for value in self.hardware.get("compute_capabilities", [])
                                 if re.fullmatch(r"[0-9]+\.[0-9]+", str(value))]
                 for capability in sorted(set(capabilities), reverse=True) or [None]:
-                    preferred = (["cu128", "cu130"] if capability is not None and capability >= 10 else
-                                 ["cu126", "cu118"] if capability is not None and capability < 7.5 else
-                                 ["cu126", "cu128", "cu130", "cu118"])
+                    preferred = (["cu128", "cu130", "cu126", "cu124", "cu121", "cu118"] if capability is not None and capability >= 10 else
+                                 ["cu118", "cu121", "cu124", "cu126"] if capability is not None and capability < 7.5 else
+                                 ["cu126", "cu128", "cu124", "cu121", "cu118", "cu130"])
                     choices.extend(channel for channel in preferred if channel not in choices and
                                    (driver_version is None or (int(channel[2:-1]), int(channel[-1])) <= driver_version))
             if system == "Windows":
@@ -2433,8 +2567,8 @@ class RuntimeInstaller:
                 if devices:
                     choices.append("directml")
             elif system == "Linux":
-                if "amd" in vendors and Path("/dev/kfd").exists():
-                    choices.append("rocm7.1")
+                if "amd" in vendors and (Path("/dev/kfd").exists() or bool(self.env.get("HIP_VISIBLE_DEVICES"))):
+                    choices.extend(("rocm7.1", "rocm6.4", "rocm6.3"))
                 if "intel" in vendors:
                     choices.append("xpu")
         choices.append("cpu")
@@ -2442,7 +2576,10 @@ class RuntimeInstaller:
 
     @staticmethod
     def torch_version(backend):
-        return {"directml": "2.4.1", "cu118": "2.7.1"}.get(backend, "2.10.0")
+        return {"directml": "2.4.1", "cu118": "2.7.1", "cu121": "2.5.1",
+                "cu124": "2.6.0", "cu126": "2.10.0", "cu128": "2.10.0", "cu130": "2.10.0",
+                "rocm6.3": "2.6.0", "rocm6.4": "2.9.1", "rocm7.1": "2.10.0",
+                "xpu": "2.10.0", "native": "2.10.0", "cpu": "2.10.0"}.get(backend, "2.10.0")
 
 
     def required_packages(self):
@@ -2948,13 +3085,32 @@ class RuntimeInstaller:
 
     def _ensure_candidate(self, request):
         failures = []
-        for backend in self.backend_candidates():
+        candidates = self.backend_candidates()
+        gpu_candidates = [backend for backend in candidates if backend != "cpu"] if self.hardware.get("adapters") else [
+            backend for backend in candidates if backend not in ("cpu", "native")]
+        for backend in candidates:
             check(self.cancel)
+            if backend == "cpu" and gpu_candidates and failures:
+                self.emit("notice", key="accelerator_recovery", backend="cpu", failures=failures,
+                          recoverable=True, degraded=True, gpu_detected=True)
+                atomic_json(self.state / "accelerator-selection.json",
+                            {"gpu_detected": True, "gpu_backends_attempted": gpu_candidates,
+                             "gpu_attempt_failures": failures, "selected": "cpu", "degraded": True,
+                             "reason": "compatible_gpu_backend_not_verified"}, self.cancel)
+                if self.env.get("YUAN_REQUIRE_ACCELERATOR", "0").strip() == "1":
+                    raise YuanFault("检测到显卡但未通过计算验证 / GPU detected but no accelerator backend passed verification",
+                                    category="compatibility", code="accelerator_required", candidates=failures)
             self.compute_backend = backend
             self.env["YUAN_COMPUTE_BACKEND"] = backend
             self.emit("runtime_profile", compute_backend=backend, hardware=self.hardware)
             try:
-                return self._ensure_backend(request)
+                python = self._ensure_backend(request)
+                atomic_json(self.state / "accelerator-selection.json",
+                            {"gpu_detected": bool(gpu_candidates), "gpu_backends_attempted": gpu_candidates,
+                             "gpu_attempt_failures": failures, "selected": backend,
+                             "degraded": backend == "cpu" and bool(gpu_candidates),
+                             "reason": "compatible_gpu_backend_not_verified" if backend == "cpu" and gpu_candidates else None}, self.cancel)
+                return python
             except Cancelled:
                 raise
             except Exception as exc:
@@ -3059,7 +3215,7 @@ class RuntimeInstaller:
         self._probe(python, entry)
         digest = payload_digest(entry)
         marker = {"base_signature": signature, "lock": digest, "platform": platform_key,
-                  "compute_backend": self.compute_backend, "hardware": payload_digest(self.hardware), "verified_at": time.time()}
+                  "compute_backend": self.compute_backend, "hardware": payload_digest(self.hardware), "recovery_identity": self.recovery_identity, "verified_at": time.time()}
         atomic_json(runtime / "ready.json", marker, self.cancel)
         selected = {**marker, "directory": runtime.relative_to(self.state).as_posix()}
         if pointer:
@@ -3216,12 +3372,13 @@ class RuntimeInstaller:
         if not current or current.get("hardware") != payload_digest(self.hardware):
             return None
         backend = current.get("compute_backend")
-        interval = self.policy.number("runtime", "backend_recheck_seconds", 3600.0, 60.0, 30 * 86400.0)
+        interval = self.policy.number("runtime", "backend_recheck_seconds", 300.0, 30.0, 30 * 86400.0)
         verified = current.get("verified_at", 0)
+        recovery_changed = current.get("recovery_identity") != self.recovery_identity
         now = time.time()
         adapters = [item for item in self.hardware.get("adapters", [])
                     if not accelerator_visibility_masked(str(item.get("vendor", "")).casefold(), self.env)]
-        if backend == "cpu" and (adapters or self.hardware.get("cuda")) and (self.force_recheck or not isinstance(verified, (int, float)) or not math.isfinite(verified) or verified > now + interval or verified + interval <= now):
+        if backend == "cpu" and (adapters or self.hardware.get("cuda")) and (self.force_recheck or recovery_changed or not isinstance(verified, (int, float)) or not math.isfinite(verified) or verified > now + interval or verified + interval <= now):
             return None
         if backend not in ("native", "cpu", "xpu", "directml") and (not isinstance(backend, str) or not re.fullmatch(r"(?:cu\d{2,4}|rocm\d+\.\d+(?:\.\d+)?)", backend)):
             return None
@@ -3251,15 +3408,18 @@ class RuntimeInstaller:
         if not isinstance(records, dict):
             records = {}
         interval = self.policy.number("runtime", "compatibility_recheck_seconds", 86400.0, 1.0, 30 * 86400.0)
+        accelerator_interval = self.policy.number("runtime", "accelerator_recheck_seconds", 300.0, 30.0, 86400.0)
         attempted = []
         for request in self.interpreter_candidates():
             check(self.cancel)
             key = payload_digest([request, sys.executable if request == "host" else None, sys.version if request == "host" else None,
-                                  PACKAGES, [[backend, self.torch_version(backend)] for backend in self.backend_candidates()], self.hardware, "yuan-runtime-pinned-v7", self.network_config.index_urls])
+                                  PACKAGES, [[backend, self.torch_version(backend)] for backend in self.backend_candidates()], self.hardware,
+                                  self.recovery_identity, "yuan-runtime-pinned-v7", self.network_config.index_urls])
             record = records.get(key, {})
-            if not self.force_recheck and record.get("failed_at", 0) + interval > time.time():
+            delay = accelerator_interval if record.get("gpu_detected") else interval
+            if not self.force_recheck and record.get("failed_at", 0) + delay > time.time():
                 attempted.append({"interpreter": request, "cached_failure": True, "reason": record.get("reason")})
-                self.emit("notice", key="runtime_candidate_skipped", interpreter=request, reason=record.get("reason"), recheck_at=record["failed_at"] + interval)
+                self.emit("notice", key="runtime_candidate_skipped", interpreter=request, reason=record.get("reason"), recheck_at=record["failed_at"] + delay)
                 continue
             try:
                 python = self._ensure_candidate(request)
@@ -3275,7 +3435,8 @@ class RuntimeInstaller:
                 self.emit("runtime_failure", interpreter=request, classification=kind, stage=self.phase, reason=reason, fault=fault_event(exc, self.phase))
                 if kind != "compatibility":
                     raise
-                record = {"interpreter": request, "failed_at": time.time(), "reason": reason, "stage": self.phase}
+                record = {"interpreter": request, "failed_at": time.time(), "reason": reason, "stage": self.phase,
+                          "gpu_detected": bool(self.hardware.get("adapters") or self.hardware.get("cuda"))}
                 records[key] = record
                 attempted.append(record)
                 atomic_json(history_path, {"candidates": records}, self.cancel)
@@ -3338,6 +3499,8 @@ class Network:
         self.latency = self.cold_timeout / self.connect_margin
         self.host_budgets = {}
         self.host_lock = threading.Lock()
+        self.network_diagnostics = {"connect_attempts": 0, "connect_failures": 0, "connection_deadlines": 0,
+                                    "http_errors": {}, "last_error": "", "last_origin": ""}
         if policy:
             policy.save()
         group = str(policy.state.resolve()) if policy is not None else "process"
@@ -3392,6 +3555,34 @@ class Network:
         with self.origin_backoff_lock:
             self.origin_backoff.pop(key, None)
 
+    def diagnose(self, url, error):
+        host = urllib.parse.urlsplit(url).hostname or ""
+        diagnostics = self.network_diagnostics
+        diagnostics["connect_failures"] += 1
+        diagnostics["last_origin"] = host
+        if isinstance(error, urllib.error.HTTPError):
+            kind = "http_" + str(error.code)
+            diagnostics["http_errors"][str(error.code)] = diagnostics["http_errors"].get(str(error.code), 0) + 1
+        elif isinstance(error, (TimeoutError, socket.timeout)) or "timed out" in str(error).lower():
+            kind = "timeout"
+            diagnostics["connection_deadlines"] += 1
+        elif isinstance(error, ssl.SSLCertVerificationError):
+            kind = "tls_certificate"
+        elif isinstance(error, socket.gaierror):
+            kind = "dns"
+        elif isinstance(error, ConnectionResetError):
+            kind = "connection_reset"
+        elif isinstance(error, YuanFault):
+            kind = error.code
+            if kind == "network_connect_deadline":
+                diagnostics["connection_deadlines"] += 1
+        else:
+            kind = "connection_error"
+        diagnostics["last_error"] = kind
+        if self.policy is not None:
+            self.policy.observe("network_errors", host, diagnostics["connect_failures"])
+        return kind
+
     def request(self, url, headers=None, method=None, deadline=None):
         if urllib.parse.urlparse(url).scheme != "https":
             raise YuanError("仅允许加密网络连接 / Only HTTPS connections are permitted")
@@ -3404,6 +3595,7 @@ class Network:
         request_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, parts.query, parts.fragment))
         request = urllib.request.Request(request_url, headers={"User-Agent": "Yuan-Audio/1.0 (local audio learning)", **(headers or {})}, method=method)
         before = time.monotonic()
+        self.network_diagnostics["connect_attempts"] += 1
         done = threading.Event()
         abandoned = threading.Event()
         result_box = []
@@ -3412,7 +3604,9 @@ class Network:
         while not self.connection_gate.acquire(timeout=min(math.sqrt(tick()), max(tick(), deadline - time.monotonic()))):
             check(self.cancel)
             if time.monotonic() >= deadline:
-                raise YuanFault("先前网络连接仍未退出 / Earlier network connections have not returned", category="network", code="network_connections_pending", url=url)
+                fault = YuanFault("先前网络连接仍未退出 / Earlier network connections have not returned", category="network", code="network_connections_pending", url=url)
+                self.diagnose(url, fault)
+                raise fault
         def connect():
             result = None
             try:
@@ -3456,6 +3650,8 @@ class Network:
                 raise YuanFault("网络连接期限已到 / Network connection deadline reached", category="network", code="network_connect_deadline", url=url, connect_seconds=connect_budget)
         except BaseException as exc:
             abandoned.set()
+            if not isinstance(exc, Cancelled):
+                self.diagnose(url, exc)
             if not isinstance(exc, Cancelled) and (not isinstance(exc, YuanFault) or exc.category == "network"):
                 self.defer_origin(url)
             if result_box and hasattr(result_box[0], "close"):
@@ -3465,13 +3661,21 @@ class Network:
                     pass
             raise
         if not result_box:
+            self.diagnose(url, YuanFault("empty", category="network", code="network_empty_result"))
             self.defer_origin(url)
             raise YuanFault("网络连接没有返回结果 / Network connection returned no result", category="network", code="network_empty_result", url=url)
         result = result_box[0]
         if isinstance(result, BaseException):
+            self.diagnose(url, result)
             if isinstance(result, urllib.error.HTTPError):
-                if result.code == 429 or result.code >= 500:
+                if result.code in (408, 429) or result.code >= 500:
                     self.defer_origin(url)
+                    retry_after = result.headers.get("Retry-After") if result.headers else None
+                    if isinstance(retry_after, str) and re.fullmatch(r"[0-9]+", retry_after.strip()):
+                        key = (self.connection_group, self.origin_key(url))
+                        with self.origin_backoff_lock:
+                            due, attempts = self.origin_backoff.get(key, (0.0, 0))
+                            self.origin_backoff[key] = (max(due, time.monotonic() + min(3600, int(retry_after))), attempts)
                 result.close()
                 raise result
             self.defer_origin(url)
@@ -4296,15 +4500,16 @@ class StorageBudget:
 class AudioStore:
     file_lock = threading.RLock()
     file_leases = {}
-    training_pair_filter = "(p.verified=1 OR (p.source='published_dialogue_turns' AND json_extract(p.evidence,'$.method')='published_stereo_dialogue_v1' AND json_extract(p.evidence,'$.training_only')=1))"
+    training_pair_filter = "(p.verified=1 OR (p.source='published_dialogue_turns' AND json_extract(p.evidence,'$.method')='published_stereo_dialogue_v1' AND json_extract(p.evidence,'$.training_only')=1) OR (p.source='annotated_training_turns' AND json_extract(p.evidence,'$.method')='published_recorded_dialogue_v1' AND json_extract(p.evidence,'$.training_only')=1))"
 
     @staticmethod
     def trainable_pair(pair):
         if pair["verified"]:
             return True
         evidence = json.loads(pair["evidence"])
-        return (pair["source"] == "published_dialogue_turns" and evidence.get("method") == "published_stereo_dialogue_v1"
-                and evidence.get("training_only") is True)
+        return (evidence.get("training_only") is True and
+                ((pair["source"] == "published_dialogue_turns" and evidence.get("method") == "published_stereo_dialogue_v1") or
+                 (pair["source"] == "annotated_training_turns" and evidence.get("method") == "published_recorded_dialogue_v1")))
     memory_selection = "FROM samples s JOIN groups g ON g.id=s.group_id JOIN sessions x ON x.id=s.group_id WHERE g.origin='local' AND s.group_id<>? AND x.ended IS NOT NULL AND s.audio_status='ready' AND s.memory_eligible=1 AND s.count>1"
 
     @staticmethod
@@ -4763,13 +4968,47 @@ class AudioStore:
                 or {left.get("channel"), right.get("channel")} != {0, 1}
                 or any(item.get("channel_separation_verified") is not True for item in (left, right))
                 or left.get("turn_index", -1) + 1 != right.get("turn_index")
-                or left.get("source_end") != right.get("source_start")):
+                or type(left.get("source_end")) is not int or type(right.get("source_start")) is not int
+                or type(left.get("source_rate")) is not int or left["source_rate"] <= 0
+                or left["source_end"] > right["source_start"]
+                or right["source_start"] - left["source_end"] > left["source_rate"] * 4):
             raise IneligibleSample("公开对话缺少录音、声道或轮次证据 / Public dialogue lacks recording, channel or turn evidence")
         evidence = {key: left[key] for key in keys}
         evidence.update(method="published_stereo_dialogue_v1", training_only=True, language="English", prompt=prompt,
                         user_sha256=user["digest"], assistant_sha256=assistant["digest"], scenarios=[], contrasts={},
                         user_speaker=str(left["channel"]), assistant_speaker=str(right["channel"]), relation="next_speaker_turn")
         return self.add_pair(group_id, user_sample, assistant_sample, "published_dialogue_turns", verified=False, evidence=evidence)
+
+    def add_annotated_training_pair(self, group_id, user_sample, assistant_sample, prompt):
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise IneligibleSample("训练音频缺少提示词 / Training audio has no prompt")
+        group = self.db.execute("SELECT split,source_key FROM groups WHERE id=?", (group_id,)).fetchone()
+        user, assistant = self.sample(user_sample), self.sample(assistant_sample)
+        if (group is None or group["split"] != "train" or user is None or assistant is None
+                or user["group_id"] != group_id or assistant["group_id"] != group_id
+                or user["role"] != "user" or assistant["role"] != "assistant"
+                or user["generated"] or assistant["generated"] or not user["dialogue_eligible"] or not assistant["dialogue_eligible"]):
+            raise IneligibleSample("非训练来源不能建立未经验证的对话配对 / Unverified dialogue pairs require a training-only source")
+        left, right = json.loads(user["metadata"]), json.loads(assistant["metadata"])
+        fields = ("recording_id", "corpus", "revision", "source_annotation_sha256", "license")
+        if (any(not left.get(key) or left.get(key) != right.get(key) for key in fields)
+                or group["source_key"] != left["recording_id"]
+                or not is_digest(left["source_annotation_sha256"])
+                or not all(is_digest(item.get("source_file_sha256")) for item in (left, right))
+                or not re.fullmatch(r"[a-f0-9]{40}", str(left["revision"]))
+                or left.get("speaker") == right.get("speaker")
+                or type(left.get("turn_index")) is not int or right.get("turn_index") != left["turn_index"] + 1
+                or any(item.get("published_recording") is not True for item in (left, right))
+                or left.get("source_start") is None or right.get("source_start") is None
+                or not (0 <= left["source_start"] < right["source_start"])):
+            raise IneligibleSample("公开训练对话缺少原始录音与轮次证据 / Published training turns lack sufficient provenance")
+        evidence = {key: left[key] for key in fields}
+        evidence.update(method="published_recorded_dialogue_v1", training_only=True,
+                        language=left.get("language"), prompt=prompt,
+                        user_speaker=left["speaker"], assistant_speaker=right["speaker"],
+                        user_sha256=user["digest"], assistant_sha256=assistant["digest"],
+                        relation="adjacent_recorded_turn", scenarios=[], contrasts={})
+        return self.add_pair(group_id, user_sample, assistant_sample, "annotated_training_turns", verified=False, evidence=evidence)
 
     def training_pairs(self, split, limit, hop, model, cancel=None):
         if split not in ("validation", "guard"):
@@ -5516,7 +5755,8 @@ class ReleaseTrust:
                           sort_keys=True, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
     def keys(self):
-        locations = (Path(__file__).resolve().with_name("Yuan.trust.json"), self.state.parent / "Yuan.trust.json")
+        locations = (self.state.parent / "Yuan.trust.json", self.state / "publisher/trust.json",
+                     Path(__file__).resolve().with_name("Yuan.trust.json"))
         path = next((path for path in locations if path.is_file() and not path.is_symlink()), None)
         if EMBEDDED_RELEASE:
             data = EMBEDDED_RELEASE.get("trust", {})
@@ -5609,7 +5849,7 @@ class OwnedReleaseInstaller:
         provenance = manifest.get("provenance", {})
         if (manifest.get("format") != "yuan-owned-release-v3" or provenance.get("owner") != APP_NAME
                 or provenance.get("self_trained") is not True or provenance.get("external_model") is not False
-                or provenance.get("text_to_speech") is not False or manifest.get("evaluator_sha256") != behavior_digest()):
+                or provenance.get("text_to_speech") is not False or manifest.get("evaluator_sha256") not in evaluator_digests()):
             raise YuanError("自有模型来源声明或验收程序不匹配 / Owned model provenance declaration or evaluator mismatch")
         if not release_code_compatible(manifest):
             raise YuanError("自有模型架构或验收协议不匹配 / Owned model architecture or acceptance contract mismatch")
@@ -7591,23 +7831,20 @@ def compute_device_identity(torch, device, name=None):
     return payload_digest(identity)
 
 def compute_devices(torch, state, emit):
-    expected = os.environ.get("YUAN_COMPUTE_BACKEND") or read_json(Path(state) / "runtime-current.json").get("compute_backend", "")
+    expected = str(os.environ.get("YUAN_COMPUTE_BACKEND") or read_json(Path(state) / "runtime-current.json").get("compute_backend") or "")
     candidates = []
     failures = []
-    if expected == "directml" or os.name == "nt":
-        try:
-            import torch_directml
-            for index in range(torch_directml.device_count()):
-                candidates.append((torch_directml.device(index), torch_directml.device_name(index)))
-        except (ImportError, OSError, RuntimeError, ValueError) as exc:
-            if expected == "directml":
-                failures.append({"backend": "directml", "reason": concise_error(exc)})
+    directml_requested = expected == "directml"
     for kind in ("cuda", "xpu", "mps"):
         module = getattr(torch, kind, None) if kind != "mps" else getattr(getattr(torch, "backends", None), "mps", None)
         if module is None:
+            if (expected.startswith(("cu", "rocm")) and kind == "cuda") or (expected == "xpu" and kind == "xpu"):
+                failures.append({"backend": kind, "reason": "计算运行组件未提供对应接口 / Compute runtime has no matching interface"})
             continue
         try:
             if not module.is_available():
+                if (expected.startswith(("cu", "rocm")) and kind == "cuda") or expected == kind:
+                    failures.append({"backend": kind, "reason": "运行后端未通过设备可用性检测 / Runtime backend did not pass device availability detection"})
                 continue
             indices = range(module.device_count()) if kind != "mps" else (None,)
             for index in indices:
@@ -7615,19 +7852,33 @@ def compute_devices(torch, state, emit):
                 name = module.get_device_name(index) if index is not None else "Apple Metal"
                 if all(str(existing) != str(target) for existing, _ in candidates):
                     candidates.append((target, name))
-        except (OSError, RuntimeError, ValueError, AttributeError) as exc:
+        except (OSError, RuntimeError, ValueError, AttributeError, AssertionError, ImportError, NotImplementedError) as exc:
             failures.append({"backend": kind, "reason": concise_error(exc)})
+    if directml_requested or (platform.system() == "Windows" and not candidates):
+        try:
+            import torch_directml
+            count = int(torch_directml.device_count())
+            if count <= 0 and directml_requested:
+                failures.append({"backend": "directml", "reason": "没有可用的 DirectML 计算设备 / No accessible DirectML compute device"})
+            directml = [(torch_directml.device(index), torch_directml.device_name(index)) for index in range(max(0, count))]
+            candidates = directml + candidates if directml_requested else candidates + directml
+        except (ImportError, OSError, RuntimeError, ValueError, AttributeError, NotImplementedError) as exc:
+            if directml_requested:
+                failures.append({"backend": "directml", "reason": concise_error(exc)})
     devices = []
     for device, name in candidates:
         try:
-            with torch.no_grad():
-                sample = torch.tensor((0.25, 0.5), dtype=torch.float32, device=device)
+            with torch.enable_grad():
+                sample = torch.tensor((0.25, 0.5), dtype=torch.float32, device=device, requires_grad=True)
                 value = (sample.square() + 1).sum()
+                value.backward()
                 compute_sync(torch, torch.device(device))
-                if not math.isfinite(float(value.item())):
-                    raise ValueError("非有限计算结果 / Nonfinite compute result")
+                if (not math.isfinite(float(value.item())) or sample.grad is None
+                        or not bool(torch.isfinite(sample.grad).all().item())
+                        or not bool((sample.grad.abs().sum() > 0).item())):
+                    raise ValueError("加速设备前向或反向检查失败 / Accelerator forward or backward check failed")
             devices.append((device, name))
-        except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, AssertionError, NotImplementedError) as exc:
             failures.append({"device": str(device), "reason": concise_error(exc)})
     if not devices:
         if candidates or failures or expected not in ("", "cpu", "native"):
@@ -7643,8 +7894,18 @@ def compute_devices(torch, state, emit):
             failures.append({"device": "cpu", "reason": concise_error(exc)})
     if not devices:
         raise YuanFault("没有通过验证的计算设备 / No verified compute device", category="compatibility", code="compute_probe_failed", failures=failures)
-    emit("accelerators", devices=[{"device": str(device), "name": name} for device, name in devices], backend=expected,
-         degraded=not candidates and expected not in ("", "cpu", "native") or bool(failures and devices[0][0].type == "cpu"))
+    hardware = read_json(Path(state) / "hardware.json")
+    detected = [{"name": str(row.get("name", "")), "vendor": str(row.get("vendor", ""))}
+                for row in hardware.get("adapters", []) if isinstance(row, dict)]
+    gpu_verified = any(device.type != "cpu" for device, _ in devices)
+    gpu_detected = bool(detected) or bool(candidates)
+    degraded = bool(gpu_detected and not gpu_verified)
+    emit("accelerators", devices=[{"device": str(device), "name": name, "basic_forward_backward_verified": True}
+                                  for device, name in devices], backend=expected,
+         detected_adapters=detected, basic_autograd_verified=True, gpu_detected=gpu_detected,
+         gpu_verified=gpu_verified, probe_failures=failures, degraded=degraded,
+         actual_gpu_devices=[str(device) for device, _ in devices if device.type != "cpu"],
+         cpu_fallback_reason=failures if degraded else [])
     return devices
 
 
@@ -7969,11 +8230,15 @@ class NativeAudio:
             return (int(feasible), int(gpu), int(bool(row)), min(4.0, headroom) * throughput, score(item))
         devices.sort(key=measured_score, reverse=True)
         selected = devices[0][0]
-        if selected.type == "cpu" and expected_backend not in ("", "cpu", "native"):
-            self.emit("compute_placement", device="cpu", degraded=True, recovery="accelerator_recheck")
+        gpu_present = bool(read_json(self.state / "hardware.json").get("adapters"))
+        gpu_degraded = selected.type == "cpu" and gpu_present
+        if gpu_degraded or selected.type == "cpu" and expected_backend not in ("", "cpu", "native"):
+            self.emit("compute_placement", device="cpu", degraded=True, gpu_detected=gpu_present,
+                      recovery="accelerator_recheck")
         self.emit("compute_placement", device=str(selected), available_bytes=snapshots.get(str(selected), {}).get("available_bytes"),
                   required_bytes=requirement, performance_checked=bool(verified.get(str(selected))),
-                  fallback_required=selected.type == "cpu" and any(device.type != "cpu" for device, _ in devices))
+                  gpu_detected=gpu_present, degraded=gpu_degraded,
+                  fallback_required=gpu_degraded or selected.type == "cpu" and any(device.type != "cpu" for device, _ in devices))
         self.accelerators = [{"device": str(device), "name": name, "verified": bool(verified.get(str(device))),
                               "reverification_required": device.type != "cpu" and str(device) not in verified,
                               "audio_seconds_per_frame": verified.get(str(device), {}).get("audio_seconds_per_frame"),
@@ -9663,7 +9928,8 @@ class NativeAudio:
         previous = network.begin
         total_frames = max(1, math.ceil(count / self.hop))
         emitted = frames_done = 0
-        compute_seconds = energy = 0.0
+        compute_seconds = energy = transfer_seconds = 0.0
+        first_audio_seconds = None
         energy_samples = 0
         natural = False
         try:
@@ -9673,7 +9939,9 @@ class NativeAudio:
                 with self.interruptible(cancel), torch.inference_mode():
                     seconds_per_frame = self.policy.measured(getattr(self, "performance_section", "performance"), "stream_seconds_per_frame", self.hop / self.rate)
                     target = CooperativeCompute(self, "streaming").target()
-                    frames = max(1, min(block_frames, total_frames - frames_done, int(target / max(timing_floor(), seconds_per_frame))))
+                    realtime = self.policy.estimate(getattr(self, "performance_section", "performance"), "generation_realtime_factor", 1.0)
+                    responsiveness = max(1, int((self.rate / self.hop) * min(0.25, max(0.04, target)) / max(1.0, realtime)))
+                    frames = max(1, min(block_frames, responsiveness, total_frames - frames_done, int(target / max(timing_floor(), seconds_per_frame))))
                     if not emitted:
                         frames = 1
                     for _ in range(frames):
@@ -9682,8 +9950,12 @@ class NativeAudio:
                         pieces.append(predicted)
                         endings.append(ending)
                         previous = predicted
-                    packed = torch.cat((torch.cat(pieces, dim=1), torch.stack(endings, dim=1)), dim=-1).reshape(frames, self.hop + 1)
-                    host = packed.detach().float().cpu().numpy()
+                    audio_frames = torch.stack(pieces, dim=1).reshape(frames, self.hop)
+                    stop_frames = torch.stack(endings, dim=1).reshape(frames, -1)[:, :1]
+                    packed = torch.cat((audio_frames, stop_frames), dim=1)
+                    copy_started = time.monotonic()
+                    host = packed.detach().to(device="cpu", dtype=torch.float32).numpy()
+                    transfer_seconds += max(0.0, time.monotonic() - copy_started)
                     stops = np.flatnonzero(host[:, -1] > 0)
                     keep = int(stops[0]) + 1 if len(stops) else frames
                     if not np.isfinite(host[:keep]).all():
@@ -9693,15 +9965,19 @@ class NativeAudio:
                     values = host[:keep, :self.hop].reshape(-1)[:count - emitted].copy()
                 elapsed = elapsed_seconds(began)
                 self.policy.observe(getattr(self, "performance_section", "performance"), "stream_seconds_per_frame", elapsed / frames)
+                self.policy.observe(getattr(self, "performance_section", "performance"), "generation_chunk_wait_seconds", elapsed)
+                self.policy.observe(getattr(self, "performance_section", "performance"), "audio_device_transfer_seconds", transfer_seconds / max(1, frames_done))
                 compute_seconds += elapsed
                 energy += float(np.dot(values.astype(np.float64), values.astype(np.float64)))
                 energy_samples += len(values)
                 emitted += len(values)
+                if first_audio_seconds is None:
+                    first_audio_seconds = max(0.0, time.monotonic() - started)
                 check(cancel)
                 self.emit("phase", key="generating", current=frames_done, total=total_frames, unit="frames", streaming=True)
                 if evaluation is not None:
                     if evaluation["first_audio_seconds"] is None:
-                        evaluation["first_audio_seconds"] = max(0.0, time.monotonic() - started)
+                        evaluation["first_audio_seconds"] = first_audio_seconds
                     evaluation["samples"] = emitted
                 yield np.ascontiguousarray(values, dtype=np.float32)
             check(cancel)
@@ -9709,7 +9985,9 @@ class NativeAudio:
                 raise YuanError("模型输出为静音 / Model output is silent")
             if evaluation is not None:
                 evaluation.update(complete=True, natural=natural, limited=not natural, frames=frames_done, samples=emitted,
-                                  elapsed_seconds=max(0.0, time.monotonic() - started), compute_seconds=compute_seconds)
+                                  elapsed_seconds=max(0.0, time.monotonic() - started), compute_seconds=compute_seconds,
+                                  device_transfer_seconds=transfer_seconds,
+                                  realtime_factor=compute_seconds * self.rate / max(1, emitted))
             self.emit("generation_end", key="natural_end" if natural else "limited", natural=natural, limited=not natural, frames=frames_done, samples=emitted, streaming=True)
             if not natural:
                 self.emit("notice", key="limited", component="generation")
@@ -9719,6 +9997,7 @@ class NativeAudio:
                 self.policy.observe(section, "generation_realtime_factor", compute_seconds * self.rate / emitted)
                 self.policy.observe(section, "workload_samples", emitted)
                 self.emit("generation_measurement", compute_seconds=compute_seconds, samples=emitted, realtime_factor=compute_seconds * self.rate / emitted,
+                          device_transfer_seconds=transfer_seconds, first_audio_seconds=first_audio_seconds,
                           device=str(self.device), cancelled=bool(cancel and cancel.is_set()))
 
     def adapt_execution(self):
@@ -10109,6 +10388,8 @@ class AudioLearner:
         self.validation_seconds = None
         self.checkpoint_seconds = None
         self.generation_dimensions = {}
+        self.evidence_wait = False
+        self.unvalidated_acoustic_budget = self.model.policy.integer("learning", "unvalidated_acoustic_step_budget", max(128, self.model.width * self.model.layers * 8), 32, 4096)
         self.model.policy.save()
 
     def _language_counts(self):
@@ -10889,7 +11170,13 @@ class AudioLearner:
         return result
 
     def _select(self):
+        self.evidence_wait = False
         sample = self.store.next_sample("train", self.model.hop * 2)
+        if sample is not None and self.steps >= self.unvalidated_acoustic_budget:
+            has_pairs = self.store.next_pair("train", self.model.hop, self.model.hop) is not None
+            if not has_pairs and not all(self._held_out("acoustic", split) for split in ("validation", "guard")):
+                sample = None
+                self.evidence_wait = True
         if self.model.training_phase() in ("representation", "acoustic"):
             return ("acoustic", sample) if sample is not None else (None, None)
         pair = None
@@ -11043,7 +11330,7 @@ class AudioLearner:
         torch = self.model.torch
         task, row = self._select()
         if row is None:
-            self.emit("learning", key="waiting_data", **self._state())
+            self.emit("learning", key="waiting_evidence" if self.evidence_wait else "waiting_data", **self._state())
             return False
         with operation(self.emit, "training_data", "learning"):
             usable = self._usable(row, task, cancel)
@@ -11077,7 +11364,7 @@ class AudioLearner:
                 horizon = max(1, min(frames, int(horizon / math.sqrt(1 + failures))))
                 weight = self.model.policy.ratio(section, "loss_weight", math.sqrt(horizon / frames))
                 self.rollout_training = {"frames": horizon, "weight": weight}
-                mixed = self.model.device.type == "cuda" and self.model.mixed_precision_verified
+                mixed = self.model.device.type == "cuda" and self.model.mixed_precision_verified and bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
                 precision = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if mixed else nullcontext()
                 with precision:
                     loss = self.model.loss(self.candidate, **features, rollout=True, rollout_frames=horizon, rollout_weight=weight)
@@ -11111,6 +11398,7 @@ class AudioLearner:
             if allocated is not None:
                 peak = max(0, torch.cuda.max_memory_allocated(self.model.device) - allocated)
                 self.model.policy.observe(self.model.performance_section, "training_bytes_per_frame", peak / measured_frames)
+                self.model.policy.observe(self.model.performance_section, "training_peak_bytes", torch.cuda.max_memory_allocated(self.model.device))
                 self.emit("learning_memory", device=str(self.model.device), peak_increment_bytes=peak, frames=measured_frames)
             self.model.training_retry_at = 0.0
             self.model.training_oom_window = None
@@ -11145,6 +11433,8 @@ class AudioLearner:
         progress = (baseline - validation) / max(abs(baseline), math.sqrt(self.model.torch.finfo(self.model.dtype).eps))
         self.model.policy.observe("learning", task + "_error", max(0.0, validation))
         self.model.policy.observe("learning", task + "_gain", max(0.0, progress))
+        self.store.set_setting("training_validation_trend", {"objective": task, "gain": progress,
+                               "validation_error": validation, "steps": self.steps, "checked_at": time.time()})
         self.model.policy.observe("learning", task + "_seconds", self.training_seconds or tick())
         rollout = getattr(self, "rollout_training", {})
         if passed and rollout:
@@ -11711,7 +12001,13 @@ class PublicDialogue:
         pin_key = "dialogue_pin_" + payload_digest(self.repository)
         pin = self.store.setting(pin_key, {})
         suffix = "/revision/" + pin["revision"] if re.fullmatch(r"[a-f0-9]{40}", str(pin.get("revision", ""))) else ""
-        data = self.network.json("https://huggingface.co/api/datasets/" + self.repository + suffix + "?blobs=true")
+        try:
+            data = self.network.json("https://huggingface.co/api/datasets/" + self.repository + suffix + "?blobs=true")
+        except (InvalidDownload, OSError, ValueError, YuanError):
+            if not suffix:
+                raise
+            data = self.network.json("https://huggingface.co/api/datasets/" + self.repository + "?blobs=true")
+            pin = {}
         revision = data.get("sha")
         licenses = (data.get("cardData") or {}).get("license")
         licenses = [licenses] if isinstance(licenses, str) else licenses
@@ -11719,6 +12015,17 @@ class PublicDialogue:
                 or not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{40}", revision)
                 or data.get("gated") or data.get("disabled") or pin and pin.get("revision") != revision):
             raise InvalidDownload("公开对话授权或版本信息不完整 / Public dialogue license or revision information is incomplete")
+        annotations = {}
+        for row in data.get("siblings", []):
+            name = row.get("rfilename", "") if isinstance(row, dict) else ""
+            if re.fullmatch(r"data_stereo/[0-9]+\.json", name):
+                lfs = row.get("lfs") or {}
+                sha = lfs.get("sha256", lfs.get("oid"))
+                git = row.get("blobId")
+                size = lfs.get("size", row.get("size"))
+                if type(size) is int and 0 < size <= 1024 * 1024 and (is_digest(sha) or isinstance(git, str) and re.fullmatch(r"[a-f0-9]{40}", git)):
+                    annotations[name] = {"file": name, "size": size, "sha256": sha if is_digest(sha) else None,
+                                         "git": git if isinstance(git, str) and re.fullmatch(r"[a-f0-9]{40}", git) else None}
         files = []
         for row in data.get("siblings", []):
             check(cancel)
@@ -11728,12 +12035,18 @@ class PublicDialogue:
             size = lfs.get("size", row.get("size"))
             if (re.fullmatch(r"data_stereo/[0-9]+\.wav", name) and is_digest(checksum)
                     and isinstance(size, int) and not isinstance(size, bool) and size > 0):
-                files.append({"file": name, "sha256": checksum, "size": size})
+                files.append({"file": name, "sha256": checksum, "size": size,
+                              "annotation": annotations.get(name[:-4] + ".json")})
         if not files:
             raise InvalidDownload("公开对话目录缺少可核验音频 / Public dialogue catalog has no verifiable audio")
         files.sort(key=lambda item: payload_digest(item["file"]))
+        previous_revision = self.catalog.get("revision") if isinstance(self.catalog, dict) else None
+        manifest = payload_digest(files)
+        if previous_revision and previous_revision != revision:
+            self.emit("notice", key="source_unavailable", component="source_revision_migrated", repository=self.repository,
+                      previous_revision=previous_revision, revision=revision, manifest_sha256=manifest)
         self.catalog = {"repository": self.repository, "revision": revision, "license": "CC-BY-SA-4.0", "files": files, "created": time.time()}
-        self.store.set_setting(pin_key, {"revision": revision, "license": "cc-by-sa-4.0", "manifest_sha256": payload_digest(files)})
+        self.store.set_setting(pin_key, {"revision": revision, "license": "cc-by-sa-4.0", "manifest_sha256": manifest})
         atomic_json(self.root / "catalog.json", self.catalog, cancel)
 
     def validate_catalog(self):
@@ -11747,6 +12060,79 @@ class PublicDialogue:
                     or item["file"] in names or not is_digest(item.get("sha256")) or type(item.get("size")) is not int or item["size"] <= 0):
                 raise InvalidDownload("公开对话目录文件信息无效 / Invalid public dialogue catalog file metadata")
             names.add(item["file"])
+            annotation = item.get("annotation")
+            if annotation is not None and (not isinstance(annotation, dict) or annotation.get("file") != item["file"][:-4] + ".json"
+                    or type(annotation.get("size")) is not int or not 0 < annotation["size"] <= 1024 * 1024
+                    or (not is_digest(annotation.get("sha256")) and not re.fullmatch(r"[a-f0-9]{40}", str(annotation.get("git", ""))))):
+                raise InvalidDownload("公开对话标注身份无效 / Invalid public dialogue annotation identity")
+
+    @staticmethod
+    def annotated_turns(values, rate, annotation):
+        import numpy as np
+        base = PublicDialogue.channel_turns(values, rate)
+        rows = annotation.get("alignments") if isinstance(annotation, dict) else None
+        if not isinstance(rows, list) or not rows or len(rows) > 100000:
+            return base, False, None
+        stamps = []
+        duration = len(values) / rate
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3 or not isinstance(row[0], str) or row[2] != "SPEAKER_MAIN":
+                return base, False, None
+            span = row[1]
+            if (not isinstance(span, (list, tuple)) or len(span) != 2 or
+                    any(type(x) not in (int, float) or not math.isfinite(x) for x in span)):
+                return base, False, None
+            first, last = span
+            if not 0 <= first < last <= duration + 0.02 or stamps and first < stamps[-1][0]:
+                return base, False, None
+            stamps.append((first, last))
+        if not stamps:
+            return base, False, None
+        powers = np.zeros(2, dtype=np.float64)
+        for first, last in stamps:
+            left, right = max(0, int(first * rate)), min(len(values), int(math.ceil(last * rate)))
+            if right > left:
+                powers += np.sum(values[left:right].astype(np.float64) ** 2, axis=0)
+        main = int(np.argmax(powers))
+        if powers[main] < max(powers[1 - main] * 1.3, np.finfo(np.float64).eps * len(values)):
+            return base, False, None
+        intervals = []
+        first, last = stamps[0]
+        for begin, end in stamps[1:]:
+            if begin - last > 0.55:
+                intervals.append((first, last))
+                first = begin
+            last = max(last, end)
+        intervals.append((first, last))
+        aligned = []
+        for begin, end in intervals:
+            left = max(0, int((begin - 0.04) * rate))
+            right = min(len(values), int((end + 0.08) * rate))
+            if right - left < max(16, int(rate * 0.08)):
+                continue
+            segment = values[left:right].astype(np.float64)
+            energy = np.sum(segment * segment, axis=0)
+            if energy[main] > max(energy[1 - main] * 1.25, 1e-10):
+                aligned.append((left, right, main, False))
+        if not aligned:
+            return base, False, None
+        others = []
+        for first, last, channel, uncertain in base:
+            if channel == main:
+                continue
+            collision = any(max(0, min(last, right) - max(first, left)) > (last - first) // 5
+                            for left, right, _, _ in aligned)
+            if not collision:
+                others.append((first, last, channel, uncertain))
+        turns = sorted(aligned + others, key=lambda row: (row[0], row[1]))
+        cleaned = []
+        for row in turns:
+            if cleaned and row[0] < cleaned[-1][1]:
+                continue
+            cleaned.append(row)
+        if len(cleaned) < 2 or len({row[2] for row in cleaned}) < 2:
+            return base, False, None
+        return cleaned, True, main
 
     @staticmethod
     def channel_turns(values, rate=16000):
@@ -11805,7 +12191,7 @@ class PublicDialogue:
             raise IneligibleSample("公开对话没有足够的可信轮次 / Public dialogue has insufficient reliable turns")
         return turns
 
-    def import_recording(self, asset, path, cancel):
+    def import_recording(self, asset, path, cancel, annotation=None):
         import soundfile as sf
         import psutil
         info = sf.info(str(path))
@@ -11816,7 +12202,7 @@ class PublicDialogue:
         values, rate = sf.read(str(path), dtype="float32", always_2d=True)
         if digest_file(path, cancel) != asset["sha256"]:
             raise InvalidDownload("公开对话音频摘要不匹配 / Public dialogue audio checksum mismatch")
-        turns = self.channel_turns(values, rate)
+        turns, aligned, main_channel = self.annotated_turns(values, rate, annotation) if annotation is not None else (self.channel_turns(values, rate), False, None)
         first_channel = turns[0][2]
         recording = "dailytalk:" + Path(asset["file"]).stem
         group = "corpus-" + payload_digest(recording)
@@ -11834,7 +12220,8 @@ class PublicDialogue:
                             "attribution": "DailyTalk: Keon Lee, Kyumin Park, Daeyoung Kim; stereo arrangement: Kyutai",
                             "source_url": "https://huggingface.co/datasets/" + self.repository + "/resolve/" + self.catalog["revision"] + "/" + asset["file"],
                             "source_start": start, "source_end": end, "source_rate": rate, "channel": channel,
-                            "turn_index": index, "channel_separation_verified": True, "utterance_final": not uncertain,
+                            "turn_index": index, "channel_separation_verified": True,
+                            "alignment_verified": bool(aligned and channel == main_channel), "utterance_final": not uncertain,
                             "preceding_overlap": uncertain, "language": "English", "training_only": True}
                 staged.append((index, start, "user" if channel == first_channel else "assistant", metadata, prepared))
             if len(staged) < 2 or len({item[2] for item in staged}) < 2:
@@ -11890,8 +12277,31 @@ class PublicDialogue:
                     url = "https://huggingface.co/datasets/" + self.repository + "/resolve/" + self.catalog["revision"] + "/" + asset["file"]
                     self.emit("network", key="public_dialogue_download", corpus=self.repository, current=index, total=len(files))
                     self.network.download(url, path, expected_size=asset["size"], expected_hash=asset["sha256"], max_bytes=asset["size"])
+                    annotation = None
+                    annotated = asset.get("annotation")
+                    if annotated:
+                        try:
+                            annotation_path = safe_path(self.root, payload_digest([self.repository, annotated["file"]]) + ".json")
+                            annotation_url = "https://huggingface.co/datasets/" + self.repository + "/resolve/" + self.catalog["revision"] + "/" + annotated["file"]
+                            self.network.download(annotation_url, annotation_path, expected_size=annotated["size"],
+                                                  expected_hash=annotated["sha256"], max_bytes=annotated["size"])
+                            if annotated.get("git") and annotated["sha256"] is None:
+                                hash_object = hashlib.sha1(("blob " + str(annotated["size"]) + "\0").encode())
+                                with annotation_path.open("rb") as reader:
+                                    for block in iter(lambda: reader.read(1024 * 1024), b""):
+                                        check(cancel)
+                                        hash_object.update(block)
+                                if hash_object.hexdigest() != annotated["git"]:
+                                    annotation_path.unlink(missing_ok=True)
+                                    raise InvalidDownload("公开对话时间标注校验失败 / Public dialogue alignment integrity failed")
+                            annotation = checked_json(annotation_path)
+                        except Cancelled:
+                            raise
+                        except (OSError, YuanError, ValueError, TypeError, KeyError) as exc:
+                            self.emit("notice", key="dataset_rejected", corpus=self.repository,
+                                      file=annotated["file"], reason=concise_error(exc))
                     try:
-                        result = self.import_recording(asset, path, cancel)
+                        result = self.import_recording(asset, path, cancel, annotation=annotation)
                     except (IneligibleSample, InvalidAudio) as exc:
                         result = False
                         self.emit("notice", key="dataset_rejected", corpus=self.repository, file=asset["file"], reason=concise_error(exc))
@@ -12061,6 +12471,13 @@ class PublicAudio:
         return self.store.db.execute("SELECT * FROM sources WHERE finished=0 AND status IN ('pending','ready','retry') AND retry_at<=? AND " + ("path IS NOT NULL" if downloaded else "path IS NULL") + " ORDER BY retry_at,created,id LIMIT 1", (time.time(),)).fetchone()
 
     def _source_failure(self, row, exc, permanent=False):
+        if isinstance(exc, YuanFault) and exc.code == "network_origin_backoff" and not permanent:
+            remaining = exc.details.get("retry_seconds")
+            if isinstance(remaining, (int, float)) and math.isfinite(remaining):
+                self.store.db.execute("UPDATE sources SET status='retry',retry_at=?,last_error=? WHERE id=?",
+                                      (time.time() + max(1.0, remaining), concise_error(exc), row["id"]))
+                self.store.commit()
+                return
         failures = int(row["failures"]) + 1
         delay = self.store.retry_delay(failures)
         retry_at = 0.0 if permanent else time.time() + delay
@@ -12102,8 +12519,9 @@ class PublicAudio:
                 except Cancelled:
                     raise
                 except Exception as exc:
-                    self.failures += 1
-                    self.emit("network", key="offline", component="catalog", reason=concise_error(exc))
+                    if not (isinstance(exc, YuanFault) and exc.code == "network_origin_backoff"):
+                        self.failures += 1
+                        self.emit("network", key="offline", component="catalog", reason=concise_error(exc))
             if missing is not None:
                 try:
                     metadata = json.loads(missing["metadata"])
@@ -12464,7 +12882,9 @@ class SpeechGate:
         self.noise_frames = 0 if spectral_voice else self.noise_frames + 1
         energetic = level > threshold if math.isfinite(threshold) else level > floor
         structural_voice = energetic and spectral_voice
-        voiced = structural_voice or energetic and self.active and self.noise_frames < self.start_needed
+        sustaining = bool(self.active and spectral_voice and math.isfinite(threshold) and
+                          level > max(floor, threshold * 0.65) and self.noise_frames < self.start_needed)
+        voiced = structural_voice or sustaining or energetic and self.active and self.noise_frames < self.start_needed
         energy_confidence = max(0.0, min(1.0, (level - threshold) / max(floor, abs(threshold)))) if math.isfinite(threshold) else 1.0
         self.confidence = min(energy_confidence, spectral_confidence) if structural_voice else 0.0
         self.noise_state = "speech" if structural_voice else "elevated_noise" if energetic else "tracking"
@@ -12540,7 +12960,7 @@ class ReplyCancel:
 
     def is_set(self):
         return (self.parent.is_set() or self.capture.stop_event.is_set()
-                or (not self.preserve_input and self.capture.reply_epoch != self.epoch)
+                or self.capture.reply_epoch != self.epoch
                 or (self.capture.trusted_speaking and not self.allow_speaking) or not self.capture.connected)
 
     def wait(self, timeout):
@@ -13115,6 +13535,7 @@ class AudioDevices:
         self.stream_lock = threading.RLock()
         self.faults = 0
         self.input_faults = 0
+        self.input_frames = self.input_lost_frames = self.input_overflow_callbacks = 0
         self.input_callbacks = self.output_callbacks = 0
         self.last_input_callback = self.last_output_callback = time.monotonic()
         self.audio_integrity = {}
@@ -13142,6 +13563,8 @@ class AudioDevices:
         self.output_recovery_at = 0.0
         self.output_recovery_failures = 0
         self.audio_open_attempts = []
+        self.input_ready = False
+        self.output_ready = False
 
     def timeout(self, key, default=None):
         default = max(5.0, self.model.chunk_seconds * 2) if default is None else default
@@ -13176,7 +13599,7 @@ class AudioDevices:
         deadline = time.monotonic() + timeout
         return self.driver.call("audio_preflight", lambda: self._preflight(cancel, deadline), timeout, cancel)
 
-    def defaults(self):
+    def defaults(self, capture_only=False):
         devices = self.sd.query_devices()
         defaults = self.sd.default.device
         selected = []
@@ -13185,16 +13608,23 @@ class AudioDevices:
             if index is None or index < 0 or index >= len(devices) or devices[index]["max_" + direction + "_channels"] < 1:
                 options = [number for number, device in enumerate(devices) if device["max_" + direction + "_channels"] > 0]
                 if not options:
+                    if capture_only and direction == "output":
+                        selected.append(None)
+                        continue
                     raise YuanError("等待可用麦克风与扬声器 / Waiting for a microphone and speaker")
                 index = options[0]
             selected.append(int(index))
-        return selected, [devices[index] for index in selected]
+        return selected, [devices[index] if index is not None else {} for index in selected]
 
-    def _probe(self):
-        defaults, _ = self.defaults()
+    def _probe(self, capture_only=False):
+        defaults, _ = self.defaults(capture_only=capture_only)
         all_devices = self.sd.query_devices()
         indices, devices = [], []
         for default, direction in zip(defaults, ("input", "output")):
+            if default is None:
+                indices.append(None)
+                devices.append({})
+                continue
             options = [default, *[index for index, device in enumerate(all_devices) if index != default and device["max_" + direction + "_channels"] > 0]]
             selected = None
             reasons = []
@@ -13215,11 +13645,18 @@ class AudioDevices:
                 if selected:
                     break
             if selected is None:
+                if capture_only and direction == "output":
+                    indices.append(None)
+                    devices.append({})
+                    continue
                 raise YuanError("没有可用的音频设备配置 / No usable audio device configuration: " + "; ".join(dict.fromkeys(reasons)))
             indices.append(selected[0])
             devices.append(selected[1])
-        self.emit("devices", input=devices[0]["name"], output=devices[1]["name"], input_rate=int(devices[0]["default_samplerate"]), output_rate=int(devices[1]["default_samplerate"]),
-                  input_channels=devices[0]["selected_channels"], output_channels=devices[1]["selected_channels"], continuous=False)
+        self.emit("devices", input=devices[0]["name"], output=devices[1].get("name"),
+                  input_rate=int(devices[0]["default_samplerate"]),
+                  output_rate=int(devices[1]["default_samplerate"]) if devices[1] else None,
+                  input_channels=devices[0]["selected_channels"],
+                  output_channels=devices[1].get("selected_channels"), continuous=False)
         return indices, devices
 
     def _abort(self):
@@ -13281,16 +13718,20 @@ class AudioDevices:
     def input_callback(self, indata, frames, timing, status):
         self.last_input_callback = time.monotonic()
         self.input_callbacks += 1
+        self.input_frames += frames
         input_fault = self.input_gap_pending or bool(status and (status.input_overflow or status.input_underflow))
+        if input_fault:
+            self.input_overflow_callbacks += 1
         self.input_gap_pending = False
         if input_fault:
             self.input_faults += 1
             self.faults += 1
         timestamp = self.timestamp(timing, "inputBufferAdcTime", -max(self.input_latency, frames / self.input_rate), frames, self.input_rate, input_fault)
         if self.ring.channels == 1:
-            self.ring.write(indata[:, 0], timestamp, discontinuity=input_fault)
+            taken = self.ring.write(indata[:, 0], timestamp, discontinuity=input_fault)
         else:
-            self.ring.write(indata, timestamp, discontinuity=input_fault)
+            taken = self.ring.write(indata, timestamp, discontinuity=input_fault)
+        self.input_lost_frames += max(0, frames - taken)
 
     def output_callback(self, outdata, frames, timing, status):
         self.last_output_callback = time.monotonic()
@@ -13364,6 +13805,13 @@ class AudioDevices:
         self.guarded_output_callback(outdata, frames, timing, status)
 
     def callback_health(self):
+        with self.stream_lock:
+            input_open = "input" in self.streams or "duplex" in self.streams
+        if input_open and time.monotonic() - self.last_input_callback > self.callback_timeout:
+            self.input_gap_pending = True
+            self.emit("notice", key="capture_gap", component="input_watchdog",
+                      silence_seconds=time.monotonic() - self.last_input_callback, reconnect_required=True)
+            raise YuanError("麦克风音频回调超时，正在重新打开输入流 / Microphone callback stalled; reopening input stream")
         for direction in ("input", "output"):
             count = self.callback_errors[direction]
             if count != self.callback_notices[direction]:
@@ -13469,15 +13917,23 @@ class AudioDevices:
 
     def _restore_output(self):
         with self.stream_lock:
-            if "input" not in self.streams or self.output_spec is None:
+            if "input" not in self.streams:
                 return False
             stream = self.streams.pop("output", None)
         if stream is not None:
-            stream.abort(ignore_errors=True)
-            stream.close(ignore_errors=True)
+            try:
+                stream.abort(ignore_errors=True)
+            except Exception as exc:
+                self.emit("notice", key="playback_gap", component="output_abort", reason=concise_error(exc))
+            try:
+                stream.close(ignore_errors=True)
+            except Exception as exc:
+                self.emit("notice", key="playback_gap", component="output_close", reason=concise_error(exc))
         preferred = self.output_spec
-        index = preferred[0]
+        index = preferred[0] if preferred is not None else None
         try:
+            if index is None:
+                raise ValueError("Output device not present")
             device = dict(self.sd.query_devices(index))
             if int(device.get("max_output_channels", 0)) < 1:
                 raise ValueError("Output device disconnected")
@@ -13494,7 +13950,8 @@ class AudioDevices:
         name = self._start_output(index, device, None, time.monotonic() + self.timeout("output_recover"), preferred)
         self.output_recovery_failures = 0
         self.emit("devices", output=name, output_rate=self.output_rate, output_latency=self.output_latency,
-                  output_channels=self.output_spec[2], transport="separate-output-recovered", continuous=True)
+                  output_channels=self.output_spec[2], transport="separate-output-recovered",
+                  playback_available=True, continuous=True)
         return True
 
     def recover_output_async(self):
@@ -13514,7 +13971,7 @@ class AudioDevices:
         self.output_recovery = threading.Thread(target=recover, daemon=True, name="YuanOutputRecovery")
         self.output_recovery.start()
 
-    def _open_separate_streams(self, indices, devices, cancel, deadline, reasons):
+    def _open_separate_streams(self, indices, devices, cancel, deadline, reasons, capture_only=False):
         input_name = None
         for index, rate, channels, latency, name in self._device_variants("input", indices[0], devices[0]):
             check(cancel)
@@ -13546,6 +14003,20 @@ class AudioDevices:
                     stream.close(ignore_errors=True)
         if input_name is None:
             return False
+        if indices[1] is None:
+            if not (capture_only or self.capture is not None) or not self.active(require_output=False):
+                self._close_streams()
+                return False
+            self.output_spec = None
+            self.emit("notice", key="playback_gap", component="output_missing",
+                      reason="等待扬声器重新连接 / Waiting for the speaker to reconnect",
+                      capture_preserved=True)
+            self.emit("devices", input=input_name, output=None, input_rate=self.input_rate,
+                      input_latency=self.input_latency, transport="capture-output-missing",
+                      playback_available=False, continuous=True)
+            if self.capture is not None:
+                self.recover_output_async()
+            return True
         try:
             output_name = self._start_output(indices[1], devices[1], cancel, deadline)
         except Cancelled:
@@ -13553,8 +14024,20 @@ class AudioDevices:
             raise
         except Exception as exc:
             reasons.append("output: " + concise_error(exc))
-            self._close_streams()
-            return False
+            if not (capture_only or self.capture is not None) or not self.active(require_output=False):
+                self._close_streams()
+                return False
+            self.output_spec = (indices[1], int(devices[1]["default_samplerate"]),
+                                int(devices[1]["selected_channels"]), self.policy.latency)
+            self.output_failed_since = time.monotonic()
+            self.emit("notice", key="playback_gap", component="output_open", reason=concise_error(exc),
+                      capture_preserved=True)
+            self.emit("devices", input=input_name, output=None, input_rate=self.input_rate,
+                      input_latency=self.input_latency, transport="capture-output-recovering",
+                      playback_available=False, continuous=True)
+            if self.capture is not None:
+                self.recover_output_async()
+            return True
         self.emit("devices", input=input_name, output=output_name,
                   input_rate=self.input_rate, output_rate=self.output_rate,
                   input_latency=self.input_latency, output_latency=self.output_latency,
@@ -13601,9 +14084,9 @@ class AudioDevices:
                         stream.close(ignore_errors=True)
         return False
 
-    def _open_streams(self, cancel, deadline=None):
+    def _open_streams(self, cancel, deadline=None, capture_only=False):
         deadline = time.monotonic() + self.timeout("open") if deadline is None else deadline
-        indices, devices = self._probe()
+        indices, devices = self._probe(capture_only=capture_only or self.capture is not None)
         self.clock_offsets = {}
         self.clock_states = {}
         self.policy = AudioPolicy(self.model, devices, self.emit)
@@ -13619,12 +14102,17 @@ class AudioDevices:
         reasons = []
         remaining = max(0.0, deadline - time.monotonic())
         split_deadline = time.monotonic() + remaining * 0.65
-        if self._open_separate_streams(indices, devices, cancel, split_deadline, reasons):
+        if self._open_separate_streams(indices, devices, cancel, split_deadline, reasons, capture_only=capture_only):
+            self.input_ready = self.active(require_output=False)
+            self.output_ready = self.active(require_output=True)
             return
+        if indices[1] is None:
+            raise YuanError("音频输入无法打开，扬声器也尚未连接 / Capture could not open and speaker is disconnected")
         self.callback_failed = {"input": False, "output": False}
         self.output_failed_since = None
         self.input_gap_pending = False
         if self._open_duplex_streams(indices, devices, cancel, deadline, reasons):
+            self.input_ready = self.output_ready = self.active(require_output=True)
             self.emit("notice", key="full_duplex", component="duplex_fallback", reasons=reasons[-6:])
             return
         raise YuanError("无法打开连续收音与播放 / Could not open continuous capture and playback; "
@@ -13684,30 +14172,50 @@ class AudioDevices:
         skipped = {**template, "metadata": {**template["metadata"], "chunk_index": 2}}
         if inference.put(skipped)[0] or (inference.get(0) or {}).get("event") != "utterance_cancelled":
             raise YuanError("缺失的推理音频未被取消 / Missing inference audio was not cancelled")
+        congested = UtteranceQueue(overrun_size * np.dtype(np.float32).itemsize * 2, 2)
+        for index in range(3):
+            sample = {**template, "group_id": identifier, "metadata": {**template["metadata"],
+                      "utterance_id": str(index), "utterance_final": True}}
+            accepted, removed = congested.put(sample, replace_oldest=True)
+            if not accepted or (index == 2 and len(removed) != 1):
+                raise YuanError("推理队列拥堵恢复失败 / Inference queue congestion recovery failed")
+        observed = [congested.get(0) for _ in range(3)]
+        if ([item.get("event") for item in observed] != ["utterance_cancelled", None, None]
+                or [item["metadata"]["utterance_id"] for item in observed] != ["0", "1", "2"]
+                or congested.pending() != 0 or congested.bytes or congested.audio_items):
+            raise YuanError("拥堵推理队列的取消通知阻塞了新音频 / Queue cancellation blocked new audio")
         resampler = AudioPreprocessor(rate, rate)
         converted = np.concatenate((resampler.process(probe[:period // 2]), resampler.process(probe[period // 2:], final=True)))
         if converted.shape != probe.shape or not np.array_equal(converted, probe):
             raise YuanError("连续音频处理自检失败 / Continuous audio processing self-test failed")
         self.audio_integrity = {"ring": True, "multichannel_capture": True, "discontinuity_detection": True,
                                 "overflow_protection": True, "utterance_integrity": True,
-                                "continuous_preprocess": True, "checked_at": time.time(), "samples": period}
+                                "congestion_recovery": True, "continuous_preprocess": True, "checked_at": time.time(), "samples": period}
         self.emit("audio_integrity", **self.audio_integrity)
 
     def _preflight(self, cancel, deadline):
         self._integrity_test(cancel)
         self._close_streams()
         initial_input, initial_output = self.input_callbacks, self.output_callbacks
+        self.input_ready = self.output_ready = False
         try:
-            self._open_streams(cancel, deadline - min(math.sqrt(tick()), max(tick(), deadline - time.monotonic()) / 4))
+            self._open_streams(cancel, deadline - min(math.sqrt(tick()), max(tick(), deadline - time.monotonic()) / 4), capture_only=True)
             while time.monotonic() < deadline:
                 check(cancel)
-                if not self.active():
-                    raise YuanError("音频流未保持运行 / Audio streams did not remain active")
-                if self.input_callbacks > initial_input and self.output_callbacks > initial_output and not any(self.callback_failed.values()):
-                    self.emit("devices", probed=True, continuous=False)
+                input_ok = self.active(require_output=False) and self.input_callbacks > initial_input and not self.callback_failed["input"]
+                output_ok = self.active(require_output=True) and self.output_callbacks > initial_output and not self.callback_failed["output"]
+                with self.stream_lock:
+                    output_open = "output" in self.streams or "duplex" in self.streams
+                if input_ok and (output_ok or not output_open):
+                    self.input_ready, self.output_ready = True, bool(output_ok)
+                    self.emit("devices", probed=True, continuous=False, capture_available=True, playback_available=bool(output_ok))
                     return True
+                self.input_ready = self.input_ready or bool(input_ok)
                 cancel.wait(min(math.sqrt(tick()), max(0.0, deadline - time.monotonic())))
-            raise YuanError("音频设备未在期限内提供输入输出回调 / Audio devices did not provide input and output callbacks in time")
+            if self.input_ready:
+                self.emit("devices", probed=True, continuous=False, capture_available=True, playback_available=False)
+                return True
+            raise YuanError("麦克风未在期限内提供有效回调 / Microphone did not provide a valid callback in time")
         finally:
             self._close_streams()
             self.ring = None
@@ -13967,6 +14475,9 @@ class UtteranceQueue(AudioPacketQueue):
         self.next_index = 0
         self.ended = True
         self.active = None
+        self.audio_items = 0
+        self.control_limit = max(32, self.item_limit * 4)
+        self.control_discarded = 0
 
     @staticmethod
     def identity(packet):
@@ -13977,6 +14488,21 @@ class UtteranceQueue(AudioPacketQueue):
         return {"event": "utterance_cancelled", "group_id": packet["group_id"],
                 "metadata": {**packet["metadata"], "utterance_final": None,
                              "input_incomplete": True, "reason": reason}}
+
+    def _bound_controls(self, protected=None):
+        control_count = len(self.items) - self.audio_items
+        if control_count <= self.control_limit:
+            return
+        active = self.identity(self.active) if self.active is not None else protected
+        retained = deque()
+        for packet in self.items:
+            if (control_count > self.control_limit and packet.get("event") == "utterance_cancelled"
+                    and self.identity(packet) != active):
+                control_count -= 1
+                self.control_discarded += 1
+            else:
+                retained.append(packet)
+        self.items = retained
 
     def _cancel_utterance(self, identifier, reason):
         retained = deque()
@@ -13990,6 +14516,7 @@ class UtteranceQueue(AudioPacketQueue):
                 if packet.get("event") != "utterance_cancelled":
                     dropped.append(packet)
                     self.bytes -= int(packet["waveform"].nbytes)
+                    self.audio_items -= 1
                     evidence = evidence or packet
             else:
                 retained.append(packet)
@@ -14003,6 +14530,7 @@ class UtteranceQueue(AudioPacketQueue):
         if self.identifier == identifier:
             self.rejected_utterance = identifier
             self.ended = True
+        self._bound_controls(identifier)
         self.condition.notify_all()
         return dropped
 
@@ -14020,6 +14548,8 @@ class UtteranceQueue(AudioPacketQueue):
                 dropped.append(packet)
         self.items = deque(self.cancellation(packet, reason) for packet in evidence.values())
         self.bytes = 0
+        self.audio_items = 0
+        self._bound_controls()
         self.active = None
         if self.identifier is not None:
             self.rejected_utterance = self.identifier
@@ -14060,9 +14590,11 @@ class UtteranceQueue(AudioPacketQueue):
             if not valid:
                 dropped.extend(self._cancel_utterance(identifier, "input_incomplete"))
                 return False, dropped
-            while replace_oldest and (self.bytes + size > self.byte_limit or len(self.items) >= self.item_limit):
+            while replace_oldest and (self.bytes + size > self.byte_limit or self.audio_items >= self.item_limit):
                 candidates = []
                 for item in self.items:
+                    if item.get("event") == "utterance_cancelled":
+                        continue
                     key = self.identity(item)
                     if key != identifier and key not in candidates and key != self.identity(self.active or {}):
                         candidates.append(key)
@@ -14071,13 +14603,12 @@ class UtteranceQueue(AudioPacketQueue):
                 if obsolete is None:
                     break
                 dropped.extend(self._cancel_utterance(obsolete, "inference_superseded"))
-                if len(self.items) >= self.item_limit and all(item.get("event") == "utterance_cancelled" for item in self.items):
-                    break
-            if self.bytes + size > self.byte_limit or len(self.items) >= self.item_limit:
+            if self.bytes + size > self.byte_limit or self.audio_items >= self.item_limit:
                 dropped.extend(self._cancel_utterance(identifier, "input_incomplete"))
                 return False, dropped
             self.items.append(packet)
             self.bytes += size
+            self.audio_items += 1
             self.next_index += 1
             self.ended = metadata["utterance_final"]
             self.condition.notify_all()
@@ -14094,6 +14625,7 @@ class UtteranceQueue(AudioPacketQueue):
                     self.active = None
             else:
                 self.bytes -= int(packet["waveform"].nbytes)
+                self.audio_items -= 1
                 self.active = None if packet["metadata"]["utterance_final"] else packet
             self.condition.notify_all()
             return packet
@@ -14588,7 +15120,7 @@ class RecordedDialogueAdapter:
             with pq.ParquetFile(str(path), memory_map=True, pre_buffer=False, thrift_string_size_limit=memory,
                                 thrift_container_size_limit=max(1, memory // 64), page_checksum_verification=True) as reader:
                 names = set(reader.schema_arrow.names)
-                if not ("messages" in names or {"format", "turns"}.issubset(names)):
+                if not ("messages" in names or "turns" in names):
                     raise InvalidDownload("标注分片缺少录音对话字段 / Annotation shard lacks recorded-dialogue fields")
                 for group in range(reader.num_row_groups):
                     check(cancel)
@@ -14613,7 +15145,7 @@ class RecordedDialogueAdapter:
             raise InvalidDownload("不支持的录音标注文件格式 / Unsupported recorded-annotation file format")
         with path.open("r", encoding="utf-8-sig") as stream:
             data = json.load(stream, parse_constant=reject_constant)
-        values = data if isinstance(data, list) else data.get("conversations", [data]) if isinstance(data, dict) else ()
+        values = data if isinstance(data, list) else data.get("conversations", data.get("records", data.get("dialogues", [data]))) if isinstance(data, dict) else ()
         if not isinstance(values, list):
             raise InvalidDownload("对话导出格式无效 / Invalid conversation export format")
         for value in values:
@@ -14621,16 +15153,16 @@ class RecordedDialogueAdapter:
             yield value
 
     @staticmethod
-    def convert(raw):
+    def convert(raw, training_only=False):
         if not isinstance(raw, dict):
             raise IneligibleSample("对话记录不是对象 / Conversation record is not an object")
         if raw.get("format") == "yuan-paired-audio-v1":
             return copy.deepcopy(raw)
-        messages = raw.get("messages")
+        messages = raw.get("messages", raw.get("turns"))
         annotation = raw.get("annotation", {})
         if not isinstance(messages, list) or not messages or not isinstance(annotation, dict):
             raise IneligibleSample("没有带录音标注的对话轮次 / No annotated recorded conversation turns")
-        recording = raw.get("recording_id", raw.get("conversation_id"))
+        recording = raw.get("recording_id", raw.get("conversation_id", raw.get("dialogue_id")))
         data = {"format": "yuan-paired-audio-v1", "recording_id": recording,
                 "dataset_id": raw.get("dataset_id", recording), "origin": raw.get("origin"),
                 "language": {"zh": "中文", "zh-CN": "中文", "en": "English"}.get(raw.get("language"), raw.get("language")),
@@ -14641,20 +15173,21 @@ class RecordedDialogueAdapter:
             if not isinstance(message, dict) or not isinstance(message.get("annotations", {}), dict):
                 raise IneligibleSample("轮次缺少有效人工标注 / Turn lacks valid human annotations")
             labels = message.get("annotations", {})
-            audio = message.get("audio")
+            audio = message.get("audio", message.get("audio_path"))
             item = {"id": message.get("id"), "role": message.get("role"),
                     "speaker": message.get("speaker", message.get("speaker_id")),
-                    "start_seconds": message.get("start_seconds", message.get("timestamp")),
+                    "start_seconds": message.get("start_seconds", message.get("timestamp", message.get("start"))),
                     "audio": audio.get("path") if isinstance(audio, dict) else audio,
-                    "sha256": audio.get("sha256") if isinstance(audio, dict) else message.get("sha256")}
+                    "sha256": audio.get("sha256", message.get("sha256")) if isinstance(audio, dict) else message.get("sha256")}
             for key in ("reply_to", "response_verified", "utterance_final", "transcript_verified", "scenarios", "contrasts", "reference_checks", "semantic", "retrieval", "dialogue"):
                 if key in message or key in labels:
                     item[key] = copy.deepcopy(message[key] if key in message else labels[key])
             if "transcript" in message or "text" in message:
                 item["transcript"] = message.get("transcript", message.get("text"))
             data["turns"].append(item)
-        DatasetImporter.validate_annotations(data)
-        DatasetImporter.validate_semantic(data)
+        if not training_only:
+            DatasetImporter.validate_annotations(data)
+            DatasetImporter.validate_semantic(data)
         return data
 
 class SourceRegistry:
@@ -15029,8 +15562,9 @@ class AnnotatedAcquisition:
         entry = entries.get(identifier, {})
         entry = entry if isinstance(entry, dict) else {}
         limit = self.model.policy.integer("network", "annotation_catalog_entries", max(1, available_resources(__import__("psutil"))["cpus"] * 4), 1, 256)
-        language = {"中文": "Chinese", "English": "English"}.get(task.get("language"), "")
-        queries = [{"search": " ".join(value for value in (language, "annotated audio dialogue") if value)},
+        language = {"中文": "Chinese Mandarin", "English": "English"}.get(task.get("language"), "")
+        queries = [{"search": " ".join(value for value in (language, "paired conversational audio with speaker turns") if value)},
+                   {"search": " ".join(value for value in (language, "annotated audio dialogue") if value)},
                    {"search": " ".join(value for value in (language, "recorded conversation") if value)},
                    {"search": "Mandarin Chinese multi-speaker recorded dialogue with verified annotations"} if task.get("language") == "中文" else {"search": "English annotated spoken dialogue with human reference responses"},
                    {"search": "Chinese Mandarin conversation audio transcription annotations"} if task.get("language") == "中文" else {"search": "English human multi-turn dialogue audio annotation"},
@@ -15160,6 +15694,108 @@ class AnnotatedAcquisition:
             self.store.set_setting(key, {"revision": revision, "licenses": licenses, "created": pin.get("created", time.time()), "checked_at": time.time()})
         return revision, catalog
 
+    def import_training_export(self, manifest, repository, revision, item, catalog, root, cancel, index):
+        import soundfile as sf
+        import psutil
+        if manifest.get("origin") != "human_recording" or manifest.get("language") not in ("中文", "English"):
+            raise IneligibleSample("训练素材缺少真人录音来源 / Training data lacks human-recording provenance")
+        if manifest.get("split") not in (None, "train") or not isinstance(manifest.get("recording_id"), str) or not manifest["recording_id"].strip():
+            raise IneligibleSample("训练素材缺少独立录音标识 / Training data lacks recording identity")
+        if str(manifest.get("license", "")).casefold() not in self.licenses:
+            raise IneligibleSample("训练来源缺少授权 / Training source is not licensed")
+        turns = manifest.get("turns")
+        if not isinstance(turns, list) or not 2 <= len(turns) <= 4096:
+            raise IneligibleSample("训练轮次数量无效 / Invalid number of training turns")
+        if not any(isinstance(first, dict) and isinstance(second, dict)
+                   and first.get("role") == "user" and second.get("role") == "assistant"
+                   and isinstance(first.get("speaker"), str) and isinstance(second.get("speaker"), str)
+                   and first["speaker"].strip() and second["speaker"].strip()
+                   and first["speaker"] != second["speaker"]
+                   for first, second in zip(turns, turns[1:])):
+            raise IneligibleSample("训练文件不包含不同说话人的有效问答配对 / No valid cross-speaker dialogue pair")
+        recording = manifest["recording_id"]
+        if self.store.db.execute("SELECT 1 FROM groups WHERE source_key=? AND split<>'train' LIMIT 1", (recording,)).fetchone():
+            raise IneligibleSample("录音来源已被用于留出验收 / Recording source is reserved for held-out evaluation")
+        signature = payload_digest([repository, revision, item["name"], index, manifest])
+        key = "training_export_" + signature
+        if self.store.setting(key):
+            return False
+        prepared = []
+        previous_time = -1.0
+        speakers = set()
+        for position, turn in enumerate(turns):
+            check(cancel)
+            if (not isinstance(turn, dict) or turn.get("role") not in ("user", "assistant")
+                    or not isinstance(turn.get("speaker"), str) or not turn["speaker"].strip()
+                    or not isinstance(turn.get("audio"), str)):
+                raise IneligibleSample("训练素材没有显式说话人和音频字段 / Training turns require explicit speakers and audio")
+            start = turn.get("start_seconds")
+            if type(start) not in (int, float) or not math.isfinite(start) or start <= previous_time or start < 0:
+                raise IneligibleSample("训练素材缺少递增时间戳 / Training turns require increasing timestamps")
+            previous_time = start
+            speakers.add(turn["speaker"])
+            audio_path = safe_path(root, turn["audio"])
+            relative = audio_path.relative_to(root).as_posix()
+            source = catalog.get(relative)
+            if source is None:
+                raise InvalidDownload("来源音频未在已校验目录中 / Training audio is absent from the verified repository catalog")
+            if source["size"] > max(1, available_resources(psutil)["memory"] // max(3, self.model.layers + 2)):
+                raise MemoryError("训练音频超过内存预算 / Training audio exceeds memory budget")
+            self.fetch(repository, revision, source, root, cancel)
+            checksum = digest_file(audio_path, cancel)
+            if turn.get("sha256") is not None and checksum != turn["sha256"]:
+                raise InvalidDownload("训练音频与清单摘要不一致 / Training audio checksum differs from annotation")
+            info = sf.info(str(audio_path))
+            if info.frames < self.model.hop or info.channels < 1 or info.samplerate <= 0 or info.frames > info.samplerate * 90:
+                raise IneligibleSample("训练音频长度或格式不符合要求 / Training audio length or format is unsuitable")
+            prepared.append((position, turn, audio_path, checksum, float(start)))
+        if len(speakers) != 2 or not any(a[1]["role"] == "user" and b[1]["role"] == "assistant" and a[1]["speaker"] != b[1]["speaker"]
+                                              for a, b in zip(prepared, prepared[1:])):
+            raise IneligibleSample("训练素材没有可靠的双人相邻轮次 / Training data lacks adjacent two-speaker turns")
+        group = "annotated-train-" + payload_digest(recording)
+        attribution = {"corpus": repository, "recording_id": recording, "revision": revision,
+                       "source_annotation_sha256": signature, "license": manifest["license"]}
+        prompt = manifest.get("prompt") if isinstance(manifest.get("prompt"), str) and manifest["prompt"].strip() else "Respond naturally to the other speaker's audio."
+        staged = []
+        with self.store.audio_stage(cancel) as staging:
+            for position, turn, audio_path, checksum, start in prepared:
+                check(cancel)
+                audio, rate = sf.read(str(audio_path), dtype="float32", always_2d=True)
+                normalized = self.model.normalize(audio, rate)
+                if len(normalized) < self.model.hop:
+                    raise IneligibleSample("训练语音片段过短 / Training turn is too short")
+                ready = self.store.prepare_audio(normalized, self.model.rate, staging, cancel)
+                metadata = {**attribution, "source_file_sha256": checksum, "source_start": start,
+                            "speaker": turn["speaker"], "turn_index": position, "published_recording": True,
+                            "language": manifest["language"], "training_only": True,
+                            "utterance_final": turn.get("utterance_final") is True}
+                staged.append((position, turn, start, ready, metadata))
+            with self.store.audio_files(cancel):
+                for position, turn, start, ready, metadata in staged:
+                    self.store.publish_audio(ready, cancel)
+                with self.store.transaction():
+                    self.store.group(group, "dataset", forced="train", source_key=recording,
+                                     retention="training_cache", provenance=attribution)
+                    base_time = self.store.db.execute("SELECT created FROM groups WHERE id=?", (group,)).fetchone()[0]
+                    previous = None
+                    for position, turn, start, ready, metadata in staged:
+                        check(cancel)
+                        sample = self.store.add(group, turn["role"], None, self.model.rate, "dataset", cancel,
+                                                created=base_time + start, metadata=metadata, prepared=ready,
+                                                sample_id=payload_digest([recording, signature, position]))
+                        if previous is not None and previous[0] == "user" and turn["role"] == "assistant" and previous[1] != turn["speaker"]:
+                            self.store.add_annotated_training_pair(group, previous[2], sample, prompt)
+                        previous = (turn["role"], turn["speaker"], sample)
+                    self.store.assert_independent([group])
+                    self.store.set_setting(key, True)
+        pair_count = sum(first[1]["role"] == "user" and second[1]["role"] == "assistant"
+                         and first[1]["speaker"] != second[1]["speaker"]
+                         for first, second in zip(staged, staged[1:]))
+        self.emit("dataset_import", key="dataset_import", repository=repository, language=manifest["language"],
+                  training_only=True, semantic_acceptance=False, independent_evaluation=False,
+                  turns=len(staged), trainable_pairs=pair_count)
+        return True
+
     def import_export(self, repository, revision, item, catalog, root, cancel, task=None):
         path = self.fetch(repository, revision, item, root, cancel)
         cursor_key = "annotation_cursor_" + payload_digest([repository, revision, item, self.task_identity(task) if task else None])
@@ -15169,9 +15805,22 @@ class AnnotatedAcquisition:
                 continue
             check(cancel)
             try:
-                manifest = RecordedDialogueAdapter.convert(raw)
+                training_only = task is not None and task.get("split") == "train" and task.get("gap_kind") == "paired_dialogue"
+                manifest = RecordedDialogueAdapter.convert(raw, training_only=training_only)
+                if str(manifest.get("license", "")).casefold() not in self.licenses and not manifest.get("license"):
+                    pin = self.store.setting("annotation_pin_" + payload_digest(repository), {})
+                    licensed = set(pin.get("licenses", [])) & self.licenses if isinstance(pin, dict) and isinstance(pin.get("licenses"), list) and pin.get("revision") == revision else set()
+                    if licensed:
+                        manifest["license"] = sorted(licensed)[0]
                 if str(manifest.get("license", "")).casefold() not in self.licenses:
                     raise IneligibleSample("标注清单授权不符合要求 / Annotation manifest license is unsuitable")
+                if training_only:
+                    self.store.set_setting(cursor_key, index)
+                    worked = self.import_training_export(manifest, repository, revision, item, catalog, root, cancel, index)
+                    self.store.set_setting(cursor_key, index + 1)
+                    if worked:
+                        return True
+                    continue
                 DatasetImporter.validate_annotations(manifest)
                 DatasetImporter.validate_semantic(manifest)
                 if task is not None:
@@ -15340,6 +15989,9 @@ class AnnotatedAcquisition:
         current = self.store.db.execute("SELECT status FROM acquisition_tasks WHERE id=?", (row["id"],)).fetchone()
         state = current["status"] if current is not None else state
         status = self.store.setting("source_coverage_state", {})
+        self.store.set_setting("source_acquisition_diagnostics", {"state": state, "reason": reason,
+                               "task": task, "blockers": dict(result.get("blockers", {})), "retry_at": time.time() + delay,
+                               "coverage_gained": dict(result.get("gained", {})), "checked_at": time.time()})
         self.emit("data_acquisition", key="data_sources_exhausted" if status.get("blocked") else "data_plan", task=task, state=state,
                   worked=worked, imported=result["imported"], gained=result["gained"], blockers=result.get("blockers", {}), reason=reason)
         return worked
@@ -15376,8 +16028,14 @@ class PublishedSpeech:
         pin_key = "native_pin_" + payload_digest(self.repository)
         pin = self.store.setting(pin_key, {})
         root = "https://huggingface.co/api/datasets/" + self.repository
-        license_ref = "/revision/" + pin["license_revision"] if pin.get("license_revision") else ""
-        metadata = self.network.json(root + license_ref + "?blobs=true")
+        license_ref = "/revision/" + pin["license_revision"] if re.fullmatch(r"[a-f0-9]{40}", str(pin.get("license_revision", ""))) else ""
+        try:
+            metadata = self.network.json(root + license_ref + "?blobs=true")
+        except (InvalidDownload, OSError, ValueError, YuanError):
+            if not license_ref:
+                raise
+            metadata = self.network.json(root + "?blobs=true")
+            pin = {}
         licenses = (metadata.get("cardData") or {}).get("license", [])
         licenses = [licenses] if isinstance(licenses, str) else licenses
         license_revision = metadata.get("sha", "")
@@ -15386,7 +16044,14 @@ class PublishedSpeech:
                 or pin and license_revision != pin.get("license_revision")):
             raise InvalidDownload("原生语料版本或授权不可核验 / Native corpus revision or license cannot be verified")
         ref = pin.get("revision", self.specification.get("revision_ref"))
-        data = self.network.json(root + "/revision/" + urllib.parse.quote(ref, safe="") + "?blobs=true") if ref else metadata
+        try:
+            data = self.network.json(root + "/revision/" + urllib.parse.quote(ref, safe="") + "?blobs=true") if ref else metadata
+        except (InvalidDownload, OSError, ValueError, YuanError):
+            if not pin.get("revision"):
+                raise
+            pin = {}
+            ref = self.specification.get("revision_ref")
+            data = self.network.json(root + "/revision/" + urllib.parse.quote(ref, safe="") + "?blobs=true") if ref else metadata
         revision = data.get("sha", "")
         if (not re.fullmatch(r"[a-f0-9]{40}", str(revision)) or pin and revision != pin.get("revision")
                 or data.get("gated") or data.get("disabled")):
@@ -15404,6 +16069,10 @@ class PublishedSpeech:
                 identifier = payload_digest([self.repository, revision, item])
                 self.store.db.execute("INSERT OR IGNORE INTO native_sources(id,repository,revision,item,upstream) VALUES(?,?,?,?,?)", (identifier, self.repository, revision, json.dumps(item, sort_keys=True), upstream))
             self.store.set_setting(pin_key, {"revision": revision, "license_revision": license_revision, "license": self.specification["license"]})
+        previous_revision = self.catalog.get("revision") if isinstance(self.catalog, dict) else None
+        if previous_revision and previous_revision != revision:
+            self.emit("notice", key="source_unavailable", component="native_revision_migrated", repository=self.repository,
+                      previous_revision=previous_revision, revision=revision)
         self.catalog = {"repository": self.repository, "revision": revision, "license_revision": license_revision,
                         "license": self.specification["license"], "created": time.time(), "pinned": True}
         atomic_json(self.root / "catalog.json", self.catalog, cancel)
@@ -15608,11 +16277,23 @@ class SourceScheduler:
         except sqlite3.Error:
             raise
         except Exception as exc:
+            if isinstance(exc, YuanFault) and exc.code == "network_origin_backoff":
+                remaining = exc.details.get("retry_seconds")
+                if isinstance(remaining, (int, float)) and math.isfinite(remaining):
+                    self.store.set_setting(key, {"attempts": status.get("attempts", 0), "retry_at": time.time() + max(1.0, remaining),
+                                                 "reason": concise_error(exc), "category": "network"})
+                    return False
             previous = status.get("attempts", 0)
             attempts = (previous if type(previous) is int and previous >= 0 else 0) + 1
             retryable = failure_category(exc) == "network" or isinstance(exc, (TimeoutError, ConnectionError, urllib.error.URLError))
+            if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403, 404, 410):
+                retryable = False
             base = self.store.retry_delay(attempts, not retryable)
             delay = max(5.0, base) if retryable else base
+            if isinstance(exc, urllib.error.HTTPError) and exc.code in (408, 429, 500, 502, 503, 504):
+                retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+                if isinstance(retry_after, str) and re.fullmatch(r"[0-9]+", retry_after.strip()):
+                    delay = max(delay, min(3600.0, float(retry_after)))
             jitter = 0.85 + 0.3 * int(payload_digest([name, attempts])[:8], 16) / 0xffffffff
             delay = min(86400.0, delay * jitter)
             self.store.set_setting(key, {"attempts": attempts, "retry_at": time.time() + delay,
@@ -15659,7 +16340,7 @@ class PublicAudioWorker:
                 raise EngineFault("联网任务未按时让出资源 / Network worker did not yield its resources in time")
 
     def run(self):
-        store = sources = importer = owned_importer = history = dialogues = acquisition = scheduler = None
+        store = sources = importer = owned_importer = workspace_importer = history = dialogues = acquisition = scheduler = None
         native_sources = []
         plan_signature = None
         source_turn = 0
@@ -15688,6 +16369,9 @@ class PublicAudioWorker:
                         sources = PublicAudio(self.state, store, self.model, self.emit)
                         dialogues = PublicDialogue(self.state, store, self.model, self.emit)
                         importer = DatasetImporter(self.state, store, self.model, self.emit)
+                        workspace_datasets = self.state.parent / "datasets"
+                        if workspace_datasets.is_dir() and not workspace_datasets.is_symlink():
+                            workspace_importer = DatasetImporter(self.state.parent, store, self.model, self.emit, namespace="selected-workspace")
                         history = WorkspaceAudio(self.state, store, self.model, self.emit)
                         acquisition = AnnotatedAcquisition(self.state, store, self.model, self.emit)
                         native_sources = [PublishedSpeech(self.state, store, self.model, self.emit, item) for item in PublishedSpeech.specifications]
@@ -15698,6 +16382,12 @@ class PublicAudioWorker:
                     budget = StorageBudget(self.state).reclaim(store, cancel, self.model.capacity() * self.model.np.dtype(self.model.np.float32).itemsize * 2)
                     if budget["ready"]:
                         worked = owned_importer.step(cancel) if owned_importer is not None else False
+                        if not worked and workspace_importer is None:
+                            workspace_datasets = self.state.parent / "datasets"
+                            if workspace_datasets.is_dir() and not workspace_datasets.is_symlink():
+                                workspace_importer = DatasetImporter(self.state.parent, store, self.model, self.emit, namespace="selected-workspace")
+                        if not worked and workspace_importer is not None:
+                            worked = workspace_importer.step(cancel)
                         if not worked:
                             worked = importer.step(cancel)
                         check(cancel)
@@ -15748,7 +16438,7 @@ class PublicAudioWorker:
                     for job in native_sources:
                         job.close()
                     native_sources = []
-                    store = sources = importer = owned_importer = history = dialogues = acquisition = scheduler = None
+                    store = sources = importer = owned_importer = workspace_importer = history = dialogues = acquisition = scheduler = None
                 finally:
                     self.idle.set()
                 measured = elapsed_seconds(began)
@@ -15804,6 +16494,9 @@ class CaptureSession:
         self.failure = None
         self.reconnect_attempts = 0
         self.capture_gaps = 0
+        self.capture_started_at = time.monotonic()
+        self.capture_open_seconds = 0.0
+        self.capture_last_connected = None
         import psutil
         sample_bytes = self.model.np.dtype(self.model.np.float32).itemsize
         try:
@@ -15811,8 +16504,8 @@ class CaptureSession:
         except (OSError, RuntimeError, ValueError, psutil.Error):
             available = self.model.capacity() * sample_bytes * 16
         segment = self.devices.policy.segment_seconds if self.devices.policy is not None else self.model.capacity_seconds
-        desired = max(self.model.capacity(), math.ceil(segment * self.model.rate * 2)) * sample_bytes
-        reserve = self.model.policy.number("audio", "inference_memory_fraction", 0.025, 0.001, 0.1)
+        desired = max(self.model.capacity() * 2, math.ceil(segment * self.model.rate * 3)) * sample_bytes
+        reserve = self.model.policy.number("audio", "inference_memory_fraction", 0.05, 0.001, 0.1)
         budget = max(self.model.hop * sample_bytes, int(available * reserve))
         capacity = max(self.model.hop * sample_bytes, min(desired, budget))
         self.inference = UtteranceQueue(capacity, max(1, math.ceil(capacity / max(1, self.model.hop * sample_bytes))))
@@ -15854,7 +16547,7 @@ class CaptureSession:
         self.staged_untrusted = False
 
     def queue_inference(self, packet):
-        accepted, dropped = self.inference.put(packet, replace_oldest=False, preserve_utterance=True)
+        accepted, dropped = self.inference.put(packet, replace_oldest=True, preserve_utterance=True)
         self.inference_dropped += len(dropped) + int(not accepted)
         if dropped or not accepted:
             self.emit("notice", key="input_incomplete", id=self.session_id,
@@ -15955,6 +16648,7 @@ class CaptureSession:
                     self.devices.open_streams(self)
                     self.connected = True
                     connected_at = time.monotonic()
+                    self.capture_last_connected = connected_at
                     if failures:
                         self.emit("notice", key="recovered", component="capture", id=self.session_id, attempts=self.reconnect_attempts)
                     self.emit("status", key="listening", id=self.session_id)
@@ -15980,6 +16674,9 @@ class CaptureSession:
                         self.emit("notice", key="capture_recover", id=self.session_id, reason=reason, attempts=self.reconnect_attempts)
                     last_reason = reason
                 finally:
+                    if self.capture_last_connected is not None:
+                        self.capture_open_seconds += max(0.0, time.monotonic() - self.capture_last_connected)
+                        self.capture_last_connected = None
                     connected_at = None
                     self.connected = self.speaking = self.trusted_speaking = self.utterance_confirmed = False
                     self.reply_active = False
@@ -16139,6 +16836,11 @@ class CaptureSession:
                               pending=self.inference.pending(), pending_unconfirmed=len(self.staged_packets),
                               inference_dropped=self.inference_dropped, storage_rejections=self.storage_rejections,
                               capture_gaps=self.capture_gaps, reconnect_attempts=self.reconnect_attempts,
+                              input_frames=devices.input_frames, lost_input_frames=devices.input_lost_frames,
+                              input_lost_seconds=devices.input_lost_frames / max(1, devices.input_rate),
+                              capture_uptime_fraction=min(1.0, (self.capture_open_seconds +
+                                  (max(0.0, time.monotonic() - self.capture_last_connected) if self.capture_last_connected is not None else 0.0)) /
+                                  max(timing_floor(), time.monotonic() - self.capture_started_at)),
                               pending_storage=self.writer.queue.pending() + self.writer.stage_pending, dropped_samples=devices.ring.dropped,
                               echo_processing_seconds=echo_cost, echo_adaptive=economical, audio_backlog_seconds=input_backlog, echo_correlation=echo.correlation, echo_reduction=echo.reduction, echo_state=echo.reference_state, double_talk=echo.double_talk, echo_paths=len(echo.paths), nearend_candidate=echo.nearend_candidate, nearend_seconds=echo.nearend_seconds, playback_overlap=overlap)
         def ingest(raw, timestamp, gap):
@@ -16851,7 +17553,7 @@ class LearningSession:
             reasons.append("external_gpu_activity")
         if memory_known and memory_fraction < system_memory_threshold:
             reasons.append("system_memory")
-        self.resource_pressure_count = self.resource_pressure_count + 1 if reasons else 0
+        self.resource_pressure_count = min(1000000, self.resource_pressure_count + 1) if reasons else max(0, self.resource_pressure_count - 2)
         self.foreground_pressure = max(0.0, min(1.0, float(external or 0.0)))
         observations = model.policy.integer("learning", "resource_pressure_observations", max(1, math.ceil(math.sqrt(cpus) / 2)), 1, max(1, cpus))
         urgent = ("thermal_pressure" in reasons or "battery_reserve" in reasons or "system_memory" in reasons
@@ -17059,6 +17761,8 @@ class LearningSession:
             if not self.paused.is_set():
                 sources.resume()
             failures = 0
+            idle_streak = 0
+            idle_signature = None
             while not self.cancel.is_set():
                 if self.paused.is_set():
                     self.hold(model, learner, sources)
@@ -17154,7 +17858,9 @@ class LearningSession:
                                             objective_steps[objective["task"]] += learner.steps - before_step
                                             store.set_setting("training_objective_steps", dict(objective_steps))
                                     else:
-                                        state = "bootstrap_blocked"
+                                        state = "waiting_evidence" if learner.evidence_wait else "bootstrap_blocked"
+                                        if learner.evidence_wait:
+                                            self.emit("learning", key="waiting_evidence", **learner._state())
                                     model.calibrate(work_cancel)
                                 worked = model.prepare_review(store, work_cancel) or worked
                                 worked = model.automatic_review(store, work_cancel) or worked
@@ -17168,12 +17874,29 @@ class LearningSession:
                         model.policy.save()
                         self.emit("learning_snapshot", steps=learner.steps, accepted=model.accepted, acoustic_ready=model.acoustic_ready,
                                   dialogue_trained=model.dialogue_trained, objective_steps=dict(objective_steps),
-                                  active_digest=model.active_digest, curriculum=(model.training_manifest or {}).get("curriculum", {}),
+                                  active_digest=model.active_digest, serving_digest=model.serving_digest,
+                                  candidate_is_serving=bool(model.active_digest and model.active_digest == model.serving_digest),
+                                  accepted_serving=bool(model.service_ready()),
+                                  curriculum=(model.training_manifest or {}).get("curriculum", {}),
                                   automatic_release=getattr(model, "automatic_release_state", None), training_active=False, training_state=state,
                                   process_isolated=True, iteration_seconds=time.monotonic() - began, **training_checkpoint_status(model, learner))
                         failures = 0
                         idle = model.policy.number("learning", "idle_recheck_seconds", max(model.chunk_seconds, math.sqrt(model.capacity_seconds)),
                                                    model.hop / model.rate, max(model.capacity_seconds * 4, model.chunk_seconds))
+                        revision = store.revisions()
+                        signature = (learner.steps, revision.get("training_revision"), revision.get("evaluation_revision"), state)
+                        if worked or idle_signature != signature:
+                            idle_streak = 0
+                        else:
+                            idle_streak = min(idle_streak + 1, 20)
+                        idle_signature = signature
+                        if not worked:
+                            ceiling = model.policy.number("learning", "idle_backoff_ceiling_seconds", max(idle * 8, model.capacity_seconds * 4),
+                                                          idle, 86400.0)
+                            idle = min(ceiling, idle * math.pow(1.35, idle_streak))
+                            if idle_streak in (3, 6, 12, 20):
+                                self.emit("learning_snapshot", training_active=False, training_state=state,
+                                          idle_rechecks=idle_streak, next_recheck_seconds=idle, autonomous=True)
                         if worked:
                             elapsed = max(timing_floor(), time.monotonic() - began)
                             cpus = max(1, available_resources(deps["psutil"])["cpus"])
@@ -17331,8 +18054,28 @@ class Engine:
             ram_used, process_ram, cpu = psutil.virtual_memory().used, psutil.Process().memory_info().rss, psutil.cpu_percent()
         except (OSError, NotImplementedError, psutil.Error):
             ram_used = process_ram = cpu = None
+        hardware = read_json(self.state / "hardware.json")
+        adapters = hardware.get("adapters", [])
+        detected = [str(row.get("name") or row.get("vendor")) for row in adapters
+                    if isinstance(row, dict) and (row.get("name") or row.get("vendor"))] if isinstance(adapters, list) else []
+        selection = read_json(self.state / "accelerator-selection.json")
+        verified = read_json(self.state / "compute-verified.json")
+        device_in_use = str(self.model.device) if self.model is not None else None
+        using_cpu = device_in_use in ("cpu", "cpu:0")
+        gpu_detected = bool(detected) or bool(verified.get("gpu_detected"))
+        accelerator_failures = selection.get("gpu_attempt_failures", [])
+        accelerated = bool(device_in_use and device_in_use.split(":", 1)[0] in ("cuda", "xpu", "mps", "privateuseone"))
+        accelerator_phase = ("verified" if accelerated and verified.get("gpu_training_verified") else
+                             "active_unverified" if accelerated else "fallback" if gpu_detected and using_cpu else
+                             "detected" if gpu_detected else "not_detected")
         values = {"cpu": cpu, "cpu_limit": limits["cpus"], "ram_used": ram_used, "ram_available": limits["memory"], "process_ram": process_ram,
                   "disk_free": disk.free, "disk_total": disk.total, "samples": self.cached_samples,
+                  "detected_accelerators": detected,
+                  "accelerator_status": {"detected": gpu_detected, "selected_backend": selection.get("selected"),
+                                         "current_device": device_in_use, "phase": accelerator_phase,
+                                         "fallback": bool(selection.get("degraded")) or bool(gpu_detected and using_cpu),
+                                         "attempt_failures": accelerator_failures,
+                                         "training_verified": bool(verified.get("gpu_training_verified"))},
                   "storage_budget": getattr(self, "storage_budget", {}),
                   "capture": {"id": None, "continuous": False, "speech_active": False, "pending": 0}}
         if self.devices and self.devices.capture:
@@ -17342,7 +18085,9 @@ class Engine:
                                  "dropped_utterances": capture.inference_dropped, "barge_in_events": capture.barge_in_events,
                                  "capture_gaps": capture.capture_gaps, "reconnect_attempts": capture.reconnect_attempts,
                                  "echo": capture.last_echo, "callback_errors": dict(self.devices.callback_errors),
-                                 "audio_integrity": self.devices.audio_integrity}
+                                 "audio_integrity": self.devices.audio_integrity,
+                                 "input_active": self.devices.active(require_output=False),
+                                 "output_active": self.devices.active(require_output=True)}
         if self.devices:
             values["audio_clocks"] = {key: {"source": "hardware" if row["hardware"] else "sample_count", "arrival": row["arrival"]}
                                       for key, row in getattr(self.devices, "clock_states", {}).copy().items()}
@@ -17596,12 +18341,13 @@ class Engine:
 
     def readiness(self, force=False):
         audio_ready = bool(self.audio_ready and self.devices is not None and self.devices.driver.failure is None)
+        output_ready = bool(audio_ready and getattr(self.devices, "output_ready", False))
         values = {"runtime_ready": self.runtime_ready, "pipeline_ready": self.pipeline_ready, "audio_ready": audio_ready,
-                  "model_ready": bool(self.model and self.model.service_ready()),
+                  "output_ready": output_ready, "model_ready": bool(self.model and self.model.service_ready()),
                   "storage_ready": bool(self.writer and self.writer.status()["healthy"])}
         values["learning_ready"] = bool(self.runtime_ready and self.pipeline_ready and self.model is not None and self.store is not None and self.learner_ready)
-        values["conversation_ready"] = can_converse(values) and values["storage_ready"]
-        values["blockers"] = [key for key in ("runtime_ready", "pipeline_ready", "audio_ready", "model_ready", "storage_ready") if not values[key]]
+        values["conversation_ready"] = can_converse(values) and values["output_ready"] and values["storage_ready"]
+        values["blockers"] = [key for key in ("runtime_ready", "pipeline_ready", "audio_ready", "output_ready", "model_ready", "storage_ready") if not values[key]]
         values["capability"] = self.model.capability() if self.model else "cold_start"
         values["capability_evidence"] = getattr(self.model, "capability_evidence", {})
         values["evidence_scope"] = getattr(self.model, "release_scope", None)
@@ -17623,6 +18369,8 @@ class Engine:
                 values["model_blocker"] = "semantic_evidence_missing"
         values["preparation_stages"] = {
             "environment": bool(values["runtime_ready"] and values["pipeline_ready"]),
+            "release_discovery": bool(self.model and self.model.owned_root),
+            "playback": bool(values["output_ready"]),
             "recording": bool(values["audio_ready"] and values["storage_ready"]),
             "model_created": self.model is not None,
             "training_data": bool(values["learning"].get("dialogue_trainable")),
@@ -17637,6 +18385,7 @@ class Engine:
                                      if self.model and self.model.acoustic_ready else "training" if measured_steps > 0
                                      else "created_untrained" if self.model else "not_created")
         values["training_progress"] = {"steps": measured_steps, "model_created": self.model is not None,
+                                       "quality_verified": bool(values["model_ready"] and values["learning"].get("candidate_quality", {}).get("candidate_accepted") is True),
                                        "acoustic_trained": bool(self.model and self.model.acoustic_ready),
                                        "dialogue_trained": bool(self.model and self.model.dialogue_trained),
                                        "serving_verified": bool(values["model_ready"]),
@@ -17649,9 +18398,13 @@ class Engine:
                                        "candidate_quality": values["learning"].get("candidate_quality", {}),
                                        "blocker": values["model_blocker"]}
         values["capture_ready"] = values["audio_ready"] and values["storage_ready"]
+        values["reply_audio_path"] = "native_audio_model_direct_waveform"
+        values["pretrained_asset_found"] = bool(self.model and self.model.owned_root)
+        values["needs_accepted_model"] = not values["model_ready"]
+        values["language_coverage"] = values["learning"].get("bootstrap", {}).get("language_coverage", {})
         values["next_action"] = ("start" if values["conversation_ready"] else "repair_environment"
                                  if not values["runtime_ready"] or not values["pipeline_ready"] else "repair_audio"
-                                 if not values["audio_ready"] else "repair_storage" if not values["storage_ready"]
+                                 if not values["audio_ready"] or not values["output_ready"] else "repair_storage" if not values["storage_ready"]
                                  else "collect_independent_evidence" if values["model_blocker"] in
                                  ("dialogue_data_missing", "reference_data_missing", "acceptance_data_missing", "dialogue_benchmark_missing", "data_sources_exhausted")
                                  else "continue_training")
@@ -17683,6 +18436,16 @@ class Engine:
         values["automatic_learning"] = bool(values["learning_ready"] and values["learning"].get("trainable_data") and self.session_id is None)
         values["training_active"] = values["learning"].get("training_active", False)
         values["automatic_release"] = values["learning"].get("automatic_release")
+        quality = values["learning"].get("candidate_quality", {})
+        quality = quality if isinstance(quality, dict) else {}
+        values["improvement_evidence"] = {
+            "learning_is_not_automatic_improvement": True,
+            "candidate_accepted": quality.get("candidate_accepted") is True,
+            "validation_passed": quality.get("validation_passed") is True,
+            "guard_passed": quality.get("guard_passed") is True,
+            "relative_gain": quality.get("validation_relative_gain"),
+            "regression_passed": quality.get("regression_passed"),
+            "serving_model_preserved": bool(self.model and self.model.serving_network is not None)}
         values["serving_model"] = self.model.serving_digest if self.model else None
         values["learning_model"] = self.model.active_digest if self.model else None
         values["recovery_plan"] = {
@@ -17783,12 +18546,12 @@ class Engine:
                 self.devices = None
             if self.devices is None:
                 self.devices = AudioDevices(self.model, self.emit)
-            indices, devices = self.devices.probe()
-            signature = [(index, device["name"], device["default_samplerate"], device["selected_channels"]) for index, device in zip(indices, devices)]
-            if force or not self.audio_ready or signature != self.audio_signature:
+            indices, devices = self.devices.driver.call("audio_capture_probe", lambda: self.devices._probe(capture_only=True), self.devices.timeout("probe"))
+            signature = [(index, device.get("name"), device.get("default_samplerate"), device.get("selected_channels")) for index, device in zip(indices, devices)]
+            if force or not self.audio_ready or signature != self.audio_signature or not self.devices.output_ready:
                 self.devices.preflight(cancel)
             self.audio_signature = signature
-            self.audio_ready = True
+            self.audio_ready = bool(self.devices.input_ready)
             self.audio_failure = None
         except Cancelled:
             raise
@@ -17921,7 +18684,7 @@ class Engine:
                     self.emit("notice", key="input_incomplete", id=session_id, utterance_id=identifier, input_samples=utterance["samples"])
                     utterance = None
                     continue
-                reply_cancel = ReplyCancel(self.interrupt, capture, capture.reply_epoch)
+                reply_cancel = ReplyCancel(self.interrupt, capture, epoch)
                 began = time.monotonic()
                 heard = None
                 output_sample = None
@@ -18011,7 +18774,10 @@ class Engine:
                     self.model.policy.observe("conversation_quality", "failed_fraction", float(mode == "failed"))
                     self.model.policy.observe("conversation_quality", "input_discontinuity_fraction", float(metadata.get("capture_gap", False)))
                     self.model.policy.observe("conversation_quality", "audible_response_fraction", float(heard is not None and len(heard) > 0))
-                    self.emit("turn", id=session_id, turns=turns, latency=latency, timings=timings, input_seconds=utterance["samples"] / self.model.rate, utterance_id=identifier, input_chunks=utterance["next"],
+                    self.emit("turn", id=session_id, turns=turns, latency=latency, timings=timings,
+                              audio_origin="native_model_waveform" if heard is not None and len(heard) else None,
+                              text_to_speech=False,
+                              input_seconds=utterance["samples"] / self.model.rate, utterance_id=identifier, input_chunks=utterance["next"],
                               output_seconds=len(heard) / self.model.output_rate if heard is not None else 0.0, elapsed=time.monotonic() - started,
                               mode=mode, input_sample=row["id"], output_sample=output_sample, model=self.model.serving_digest, playback=playback_quality,
                               pending=capture.inference.pending(), pending_storage=self.writer.queue.pending(), continuous=capture.connected)
@@ -19591,6 +20357,26 @@ class InterfaceState:
             self.status = "failure" if kind == "error" else "ended"
         return True
 
+def interface_overview(readiness, audio, metrics, session_id=None):
+    values = readiness if isinstance(readiness, dict) else {}
+    capture = audio if isinstance(audio, dict) else {}
+    status = metrics if isinstance(metrics, dict) else {}
+    accelerator = status.get("accelerator_status", {})
+    if not isinstance(accelerator, dict):
+        accelerator = {}
+    model = values.get("model_ready") is True
+    return {"microphone_ready": values.get("audio_ready") is True,
+            "speaker_ready": values.get("output_ready") is True,
+            "continuous_capture": bool(capture.get("continuous")) if session_id else False,
+            "model_accepted": model, "conversation_ready": can_converse(values) and model,
+            "compute_degraded": bool(accelerator.get("fallback")),
+            "input_dropped": capture.get("inference_dropped", 0),
+            "capture_gaps": capture.get("capture_gaps", 0),
+            "reconnect_attempts": capture.get("reconnect_attempts", 0),
+            "capture_uptime_fraction": capture.get("capture_uptime_fraction"),
+            "input_lost_seconds": capture.get("input_lost_seconds"),
+            "model_blocker": values.get("model_blocker")}
+
 class YuanApp:
     def __init__(self, root):
             import tkinter as tk
@@ -19670,7 +20456,7 @@ class YuanApp:
                 self.style.theme_use("clam")
             self.style.configure("Yuan.Horizontal.TProgressbar", troughcolor=self.palette["field"], background=self.palette["accent"], bordercolor=self.palette["field"], lightcolor=self.palette["accent"], darkcolor=self.palette["accent"], thickness=3)
             self.style.configure("Yuan.Vertical.TScrollbar", background=self.palette["border"], troughcolor=self.palette["bg"], bordercolor=self.palette["bg"], arrowcolor=self.palette["muted"], width=9)
-            self.root.grid_rowconfigure(1, weight=1)
+            self.root.grid_rowconfigure(2, weight=1)
             self.root.grid_columnconfigure(0, weight=1)
             self.runtime_strip = tk.Frame(root, bg=self.palette["panel"], padx=self.unit, pady=max(2, self.unit // 3))
             self.runtime_strip.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -19678,13 +20464,13 @@ class YuanApp:
             self.runtime_summary.pack(fill="x")
             self.runtime_strip.bind("<Configure>", lambda event: self.runtime_summary.configure(wraplength=max(self.unit, event.width-self.unit*2)))
             self.viewport = tk.Canvas(root, bg=self.palette["bg"], highlightthickness=0, bd=0)
-            self.viewport.grid(row=1, column=0, sticky="nsew")
+            self.viewport.grid(row=2, column=0, sticky="nsew")
             self.scrollbar = ttk.Scrollbar(root, orient="vertical", style="Yuan.Vertical.TScrollbar", command=self.viewport.yview)
             self.viewport.configure(yscrollcommand=self.scrollbar.set)
             self.body = tk.Frame(self.viewport, bg=self.palette["bg"], padx=self.unit*2, pady=self.unit)
             self.body_window = self.viewport.create_window(0, 0, window=self.body, anchor="nw")
             self.body.grid_columnconfigure(0, weight=1)
-            self.body.grid_rowconfigure(6, weight=1)
+            self.body.grid_rowconfigure(5, weight=1)
             self.viewport.bind("<Configure>", self.resize)
             self.body.bind("<Configure>", self.measure)
             self.root.bind_all("<MouseWheel>", self.wheel)
@@ -19746,8 +20532,8 @@ class YuanApp:
         layout(types.SimpleNamespace(width=self.root.winfo_width()))
 
     def build_controls(self):
-        panel = self.tk.Frame(self.body, bg=self.palette["panel"], padx=self.unit, pady=self.unit, highlightthickness=1, highlightbackground=self.palette["border"])
-        panel.grid(row=1, column=0, sticky="ew")
+        panel = self.tk.Frame(self.root, bg=self.palette["panel"], padx=self.unit, pady=self.unit, highlightthickness=1, highlightbackground=self.palette["border"])
+        panel.grid(row=1, column=0, columnspan=2, sticky="ew")
         panel.grid_columnconfigure(1, weight=1)
         self.label(panel, key="folder", fg=self.palette["muted"], font=self.small_font).grid(row=0, column=0, sticky="w", padx=(0, self.unit))
         self.folder_var = self.tk.StringVar(value=tr("empty_folder", self.language))
@@ -19779,7 +20565,7 @@ class YuanApp:
 
     def build_hero(self):
         self.hero = self.tk.Frame(self.body, bg=self.palette["bg"], pady=self.unit)
-        self.hero.grid(row=2, column=0, sticky="ew")
+        self.hero.grid(row=1, column=0, sticky="ew")
         self.hero.grid_columnconfigure(1, weight=1)
         self.orb = self.tk.Canvas(self.hero, width=self.unit*7, height=self.unit*7, bg=self.palette["bg"], highlightthickness=0)
         self.orb.grid(row=0, column=0, rowspan=3, sticky="w", padx=(0, self.unit))
@@ -19803,7 +20589,7 @@ class YuanApp:
                 widget.configure(wraplength=max(self.unit, event.width-self.orb.winfo_reqwidth()-self.unit if compact else available))
         self.hero.bind("<Configure>", layout)
         progress_frame = self.tk.Frame(self.body, bg=self.palette["bg"])
-        progress_frame.grid(row=3, column=0, sticky="ew", pady=(0, self.unit))
+        progress_frame.grid(row=2, column=0, sticky="ew", pady=(0, self.unit))
         progress_frame.grid_columnconfigure(0, weight=1)
         track = self.tk.Frame(progress_frame, bg=self.palette["bg"], height=max(2, self.unit//3))
         track.grid(row=0, column=0, sticky="ew")
@@ -19817,7 +20603,7 @@ class YuanApp:
 
     def build_cards(self):
         self.cards_frame = self.tk.Frame(self.body, bg=self.palette["bg"])
-        self.cards_frame.grid(row=4, column=0, sticky="nsew")
+        self.cards_frame.grid(row=3, column=0, sticky="nsew")
         self.cards = {}
         self.card_rows = {}
         self.card_columns = 0
@@ -19837,7 +20623,7 @@ class YuanApp:
 
     def build_footer(self):
         bottom = self.tk.Frame(self.body, bg=self.palette["bg"])
-        bottom.grid(row=5, column=0, sticky="ew", pady=(self.unit, 0))
+        bottom.grid(row=4, column=0, sticky="ew", pady=(self.unit, 0))
         bottom.grid_columnconfigure(0, weight=1)
         self.notice = self.label(bottom, fg=self.palette["warning"], font=self.small_font)
         self.notice.grid(row=0, column=0, sticky="ew", pady=(0, self.unit//2))
@@ -19855,7 +20641,7 @@ class YuanApp:
 
     def build_activity(self):
         panel = self.tk.Frame(self.body, bg=self.palette["panel"], padx=self.unit, pady=self.unit, highlightthickness=1, highlightbackground=self.palette["border"])
-        panel.grid(row=6, column=0, sticky="nsew", pady=(self.unit, 0))
+        panel.grid(row=5, column=0, sticky="nsew", pady=(self.unit, 0))
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(1, weight=1)
         self.label(panel, key="activity", fg=self.palette["accent"], font=self.bold_font).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -19942,8 +20728,8 @@ class YuanApp:
         self.viewport.configure(scrollregion=self.viewport.bbox("all"))
         needs_scroll = required > self.viewport.winfo_height()
         if needs_scroll:
-            self.scrollbar.grid(row=1, column=1, sticky="ns")
-            self.dock.grid(row=2, column=0, columnspan=2, sticky="ew")
+            self.scrollbar.grid(row=2, column=1, sticky="ns")
+            self.dock.grid(row=3, column=0, columnspan=2, sticky="ew")
         else:
             self.scrollbar.grid_remove()
             self.dock.grid_remove()
@@ -20376,6 +21162,11 @@ class YuanApp:
                     self.device_values["continuous_active"] = bool(event["continuous"])
                 if not self.ending:
                     self.level = max(0.0, min(1.0, float(event.get("level", 0.0))))
+            elif kind == "generation_measurement":
+                if self.session_id and not self.ending:
+                    self.audio_values.update(first_model_audio_seconds=event.get("first_audio_seconds"),
+                                             generation_realtime_factor=event.get("realtime_factor"),
+                                             device_transfer_seconds=event.get("device_transfer_seconds"))
             elif kind == "generation_end":
                 if self.session_id and not self.ending:
                     self.audio_values["generation_end"] = event.get("key")
@@ -20471,40 +21262,49 @@ class YuanApp:
         accelerators = resources.get("accelerators", [])
         primary = next((device for device in accelerators if device.get("role") == "primary"), {})
         processing = primary.get("device") or self.model_values.get("device") or "—"
+        accelerator_state = resources.get("accelerator_status", {})
+        if accelerator_state.get("detected") and accelerator_state.get("fallback"):
+            errors = accelerator_state.get("attempt_failures") or []
+            last = errors[-1] if errors and isinstance(errors[-1], dict) else {}
+            reason = local_message(last.get("reason", ""), language)[:100]
+            processing += (" · GPU detected, CPU fallback" if language == "English" else " · 检测到显卡，暂以 CPU 运行")
+            if reason:
+                processing += " · " + reason
+        elif accelerator_state.get("training_verified"):
+            processing += " · GPU verified" if language == "English" else " · GPU 实算已验证"
+        elif accelerator_state.get("phase") == "active_unverified":
+            processing += " · GPU compute active, training pending verification" if language == "English" else " · GPU 已用于计算，训练待验证"
         stage = tr(flags.get("preparation_stage", "native_bootstrap"), language)
         microphone = bool(capture.get("continuous")) if self.session_id else bool(flags.get("audio_ready"))
+        speaker = bool(resources.get("capture", {}).get("output_active")) if self.session_id else bool(flags.get("output_ready"))
         learn = flags.get("learning", {})
         if language == "English":
-            summary = (f"Microphone {'●' if microphone else '○'} · Listening {'●' if capture.get('continuous') else '○'} · "
-                       f"Model {'✓' if flags.get('model_ready') else '…'} · Compute {processing} · "
+            summary = (f"Mic {'●' if microphone else '○'} · Speaker {'●' if speaker else '○'} · Listen {'●' if capture.get('continuous') else '○'} · "
+                       f"Model {'✓' if flags.get('model_ready') else '…'} · {processing} · "
                        f"Learning {learn.get('training_state', 'idle')} · Storage {'✓' if storage.get('healthy') else '…'}")
         else:
-            summary = (f"麦克风 {'●' if microphone else '○'} · 持续收音 {'●' if capture.get('continuous') else '○'} · "
-                       f"模型 {'✓' if flags.get('model_ready') else '…'} · 计算设备 {processing} · "
+            summary = (f"麦克风 {'●' if microphone else '○'} · 扬声器 {'●' if speaker else '○'} · 监听 {'●' if capture.get('continuous') else '○'} · "
+                       f"模型 {'✓' if flags.get('model_ready') else '…'} · {processing} · "
                        f"学习 {learn.get('training_state', '待准备')} · 存储 {'✓' if storage.get('healthy') else '…'}")
         pending = capture.get("pending", self.audio_values.get("pending", 0))
-        lost = capture.get("inference_dropped", self.audio_values.get("inference_dropped", 0))
-        pending_unconfirmed = self.audio_values.get("pending_unconfirmed", 0)
-        summary += (f"\nPending {pending} · Voice candidates {pending_unconfirmed} · Rejected segments {lost} · Reconnects {capture.get('reconnect_attempts', 0)}" if language == "English"
-                    else f"\n待处理 {pending} · 语音候选 {pending_unconfirmed} · 拒绝片段 {lost} · 重连 {capture.get('reconnect_attempts', 0)}")
-        summary += "\n" + stage
-        if flags.get("model_lifecycle"):
-            lifecycle = flags["model_lifecycle"]
-            states = {"not_created": ("待创建", "Not created"), "created_untrained": ("已创建、未训练", "Created, untrained"),
-                      "training": ("持续学习中", "Training"), "acoustic_ready": ("声学已训练，对话待验证", "Acoustics ready, dialogue pending"),
-                      "trained_unaccepted": ("已训练、待验收", "Trained, awaiting acceptance"),
-                      "accepted": ("已验收", "Accepted")}
-            title = states.get(lifecycle, (lifecycle, lifecycle))[1 if language == "English" else 0]
-            progress = flags.get("training_progress", {})
-            steps = progress.get("steps", 0)
-            summary += (f"\nModel stage: {title} · Steps: {steps}" if language == "English"
-                        else f"\n模型阶段：{title} · 训练步骤：{steps}")
+        lost = capture.get("dropped_utterances", self.audio_values.get("inference_dropped", 0))
+        gaps = capture.get("capture_gaps", self.audio_values.get("capture_gaps", 0))
+        reconnects = capture.get("reconnect_attempts", self.audio_values.get("reconnect_attempts", 0))
+        if language == "English":
+            summary += f"\nQueue {pending} · Dropped {lost} · Capture gaps {gaps} · Reconnects {reconnects}"
+        else:
+            summary += f"\n待处理 {pending} · 丢弃片段 {lost} · 收音断档 {gaps} · 重连 {reconnects}"
+        progress = flags.get("training_progress", {})
+        steps = progress.get("steps", 0) if isinstance(progress, dict) else 0
+        summary += (f"\n{stage} · Steps {steps}" if language == "English" else f"\n{stage} · 训练步骤 {steps}")
         if flags.get("model_blocker") and not flags.get("model_ready"):
             summary += " · " + tr(flags["model_blocker"], language)
         if not self.session_id and "fully_confirmed" in self.audio_values:
-            complete = self.audio_values["fully_confirmed"] is True
-            summary += ("\nLast session: " + ("Confirmed" if complete else "Incomplete") if language == "English" else
-                        "\n上次会话：" + ("已完整确认" if complete else "未完整确认"))
+            summary += (" · Session confirmed" if language == "English" else " · 会话已确认") if self.audio_values["fully_confirmed"] is True else (" · Session incomplete" if language == "English" else " · 会话未完整结束")
+        overview = interface_overview(flags, self.audio_values, resources, self.session_id)
+        if overview["input_lost_seconds"] is not None:
+            summary += (f" · Lost audio {overview['input_lost_seconds']:.2f}s" if language == "English" else
+                        f" · 收音丢失 {overview['input_lost_seconds']:.2f} 秒")
         if summary != self.last_runtime_summary:
             self.runtime_summary.configure(text=summary)
             self.last_runtime_summary = summary
@@ -20602,35 +21402,50 @@ class YuanApp:
                               f"{devices.get('input_rate', '—')} Hz → {devices.get('output_rate', '—')} Hz",
                               ("● " if devices.get("continuous_active") and self.session_id else "○ ") + translate("full_duplex")])
         model = self.model_values
+        compute_device = self.resource_values.get("compute_device")
+        if isinstance(compute_device, str) and compute_device:
+            role = "GPU" if compute_device.split(":", 1)[0] in ("cuda", "xpu", "mps", "privateuseone") else "CPU" if compute_device.startswith("cpu") else "设备 / Device"
+            model_device = ("实际计算 " if language == "中文" else "Active compute ") + role + " " + compute_device
+        else:
+            model_device = ("候选设备 " if language == "中文" else "Reported devices ") + str(model.get("device", "—"))
         acoustic_state = ("✓ 声学" if language == "中文" else "✓ Acoustics") if model.get("acoustic_ready") else ("○ 声学" if language == "中文" else "○ Acoustics")
         dialogue_state = ("✓ 听测" if language == "中文" else "✓ Review") if model.get("dialogue_ready") else ("○ 听测" if language == "中文" else "○ Review")
         playback_state = ("✓ 播放" if language == "中文" else "✓ Play") if model.get("playback_ready") else ("○ 播放" if language == "中文" else "○ Play")
         pipeline_state = ("✓" if self.pipeline_verified else "○") + (" 链路" if language == "中文" else " Pipeline")
-        self.card("model", [model.get("name", "Yuan Native Audio"), f"{model.get('device', '—')} · {model.get('dtype', '—')} · {model.get('size', '—')}",
+        self.card("model", [model.get("name", "Yuan Native Audio"), f"{model_device} · {model.get('dtype', '—')} · {model.get('size', '—')}",
                             model.get("architecture", "prompt + audio → audio") + "\n" + translate("serving_model") + " · " + str(flags.get("serving_model") or "—")[:12] + " / " + translate("candidate_model") + " · " + str(flags.get("learning_model") or "—")[:12],
                             f"{pipeline_state} · {acoustic_state} · {dialogue_state} · {playback_state}"])
         audio = self.audio_values
         elapsed = time.monotonic() - self.session_started if self.session_started else audio.get("elapsed", 0.0)
         latency = audio.get("latency")
         capture_health = self.resource_values.get("capture", {})
+        first_model_audio = audio.get("first_model_audio_seconds")
+        generation_factor = audio.get("generation_realtime_factor")
+        generation_health = ((" · 首音 " if language == "中文" else " · First audio ") + f"{first_model_audio:.2f}s" if type(first_model_audio) in (int, float) and math.isfinite(first_model_audio) else "")
+        if type(generation_factor) in (int, float) and math.isfinite(generation_factor):
+            generation_health += (" · 生成/实时 " if language == "中文" else " · Generation/realtime ") + f"{generation_factor:.2f}x"
         self.card("audio", [f"{audio.get('turns', 0)} {translate('turns')} · {int(elapsed)//60:02}:{int(elapsed)%60:02}",
                             f"{translate('input')} {float(audio.get('input_seconds', audio.get('recorded', 0))):.1f}s · {translate('output')} {float(audio.get('output_seconds', 0)):.1f}s",
-                            ("响应 " if language == "中文" else "Response ") + (f"{latency:.2f}s" if latency is not None else "—") + (" · " + translate(audio["generation_end"]) if audio.get("generation_end") else ""),
+                            ("响应 " if language == "中文" else "Response ") + (f"{latency:.2f}s" if latency is not None else "—") + generation_health + (" · " + translate(audio["generation_end"]) if audio.get("generation_end") else ""),
                             f"{translate('input_faults')} {audio.get('input_faults', 0)} · {translate('output_faults')} {audio.get('output_faults', 0)} · {translate('pending')} {audio.get('pending', 0)} · " +
                             ("已拒绝片段 " if language == "中文" else "Rejected segments ") + str(audio.get("inference_dropped", 0)) + " · " +
                             ("打断 " if language == "中文" else "Interruptions ") + str(capture_health.get("barge_in_events", 0))])
         learning = self.learning_values
         learning_label = self.learning_key if self.model_values else "native_bootstrap" if self.workspace else "idle"
+        if learning_state.get("training_state") == "waiting_evidence":
+            learning_label = "waiting_evidence"
         preflight = learning_state.get("data_preflight", {})
         assessment = learning_state.get("candidate_quality", {})
         readiness_data = ("对话配对 " if language == "中文" else "Dialogue pairs ") + ("✓" if preflight.get("dialogue_pairs_ready") else "○") + " · " + ("待补来源 " if language == "中文" else "Missing sources ") + str(preflight.get("unresolved_tasks", "—"))
+        if not preflight.get("dialogue_pairs_ready") and flags.get("model_blocker") == "dialogue_data_missing":
+            readiness_data += " · " + ("等待真实双人音频配对" if language == "中文" else "Awaiting real two-speaker pairs")
         validation_data = (("验证 " if language == "中文" else "Validation ") + ("✓" if assessment.get("validation_passed") else "○") + " · " +
                            ("回归 " if language == "中文" else "Regression ") + ("✓" if assessment.get("guard_passed") else "○") +
                            " · " + ("验收 " if language == "中文" else "Accepted ") + ("✓" if assessment.get("candidate_accepted") else "○"))
         objective = learning.get("objective_steps") or learning_state.get("objective_steps") or {}
         objective_text = (("已统计声学 " if language == "中文" else "Tracked acoustic ") + str(objective.get("acoustic", 0)) +
                           (" · 对话 " if language == "中文" else " · Dialogue ") + str(objective.get("dialogue", 0)))
-        step_text = f"{translate('steps')} {learning.get('steps', 0)} · {objective_text}"
+        step_text = f"{translate('steps')} {learning.get('steps', 0)} · {objective_text} · " + ("训练步数不代表验收成功" if language == "中文" else "Training steps do not imply acceptance")
         if learning_state.get("review_pending"):
             step_text = translate("contrast_pending") + " · " + step_text
         elif learning_state.get("candidate_isolated"):
@@ -20655,6 +21470,8 @@ class YuanApp:
                      + ("已标注配对 " if language == "中文" else "Annotated pairs ")) + f"{dialogue.get('verified', 0)}/{dialogue.get('count', 0)} · T/V/G/R {dialogue.get('train', 0)}/{dialogue.get('validation', 0)}/{dialogue.get('guard', 0)}/{dialogue.get('release', 0)}"
         source = self.source_values
         network_detail = translate(self.network_key)
+        if self.network_key in ("offline", "source_unavailable", "public_dialogue_wait") and self.reason:
+            network_detail += " · " + local_message(self.reason, language).split("\n", 1)[0][:120]
         if source and self.network_key not in ("offline", "source_paused"):
             network_detail += " · " + human_bytes(source.get("current", 0)) + " / " + (human_bytes(source["total"]) if source.get("total") else translate("unknown_total"))
         storage = resources.get("storage", {})
@@ -20663,6 +21480,11 @@ class YuanApp:
         if storage.get("retrying"):
             storage_line += " · " + translate("storage_retry")
         storage_details = (("可学习 " if language == "中文" else "Learnable ") + str(learnable) + " · " + translate("excluded") + " " + str(excluded) + " · " + pair_text + "\n") if os.environ.get("YUAN_PUBLISHER") == "1" else ""
+        acquisition_state = learning_state.get("acquisition_state", {})
+        if acquisition_state:
+            active_waits = ", ".join(f"{key}:{value}" for key, value in sorted(acquisition_state.items()) if value and key not in ("done", "pending"))
+            if active_waits:
+                network_detail += " · " + (("来源状态 " if language == "中文" else "Sources ") + active_waits)[:130]
         self.card("storage", [f"{translate('local')} {local.get('count', 0)} · {float(local.get('seconds', 0))/60:.1f} min · {translate('history')} {history.get('count', 0)}",
                               f"{translate('public')} {public.get('count', 0)} · {float(public.get('seconds', 0))/60:.1f} min",
                               network_detail, storage_details + storage_line])
@@ -21143,8 +21965,11 @@ def runtime_probe_compute(state, emit, dependencies):
         if not validated or (expected_backend not in ("", "cpu") and not any(item["device"] not in ("cpu", "cpu:0") for item in validated)):
             raise YuanFault("目标硬件加速未通过验证，继续检测其他计算后端 / Requested accelerator failed verification; trying another backend",
                             category="compatibility", code="compute_backend_failed", backend=expected_backend, devices=failures)
+        selection = read_json(Path(state) / "accelerator-selection.json")
         atomic_json(Path(state) / "compute-verified.json", {"backend": expected_backend, "devices": validated,
-                    "failures": failures, "compute_protocol": "yuan-compute-compatibility-v1",
+                    "failures": failures, "gpu_detected": bool(read_json(Path(state) / "hardware.json").get("adapters")),
+                    "gpu_training_verified": any(item["device"] not in ("cpu", "cpu:0") for item in validated),
+                    "backend_selection": selection, "compute_protocol": "yuan-compute-compatibility-v1",
                     "compute_compatibility_sha256": compute_compatibility_digest(),
                     "build_sha256": build_digest(), "at": time.time()})
         emit("probe", key="stage_probe_compute", check="audio_file_resampling")
@@ -21156,7 +21981,9 @@ def runtime_probe_compute(state, emit, dependencies):
         resampled = soxr.resample(recovered, rate, rate * 2)
         if not np.array_equal(values, recovered) or not len(resampled) or not np.isfinite(resampled).all():
             raise YuanError("音频读写与重采样检查失败 / Audio file and resampling check failed")
-        emit("probe", key="runtime_verify", check="complete", accelerators=validated)
+        emit("probe", key="runtime_verify", check="complete", accelerators=validated,
+                  gpu_training_verified=any(item["device"] not in ("cpu", "cpu:0") for item in validated),
+                  audio_generation="native_model_only")
     finally:
         torch.set_num_threads(threads)
 
@@ -21448,8 +22275,9 @@ class BrowserApp:
             self.server = None
             self.detached_safety_triggered = False
             self.detached_safety_at = None
-            self.detached_grace_seconds = 20.0
-            self.orphan_grace_seconds = 300.0
+            self.page_id = None
+            self.detached_grace_seconds = 300.0
+            self.orphan_grace_seconds = 900.0
 
     def protect_detached_session(self):
         with self.lock:
@@ -21497,9 +22325,9 @@ class BrowserApp:
         state = workspace_state(workspace)
         state.mkdir(parents=True, exist_ok=True)
         policy = AdaptivePolicy(state)
-        self.detached_grace_seconds = policy.number("interface", "detached_grace_seconds", 20.0, 5.0, 180.0)
-        self.orphan_grace_seconds = policy.number("interface", "orphan_grace_seconds", max(120.0, self.detached_grace_seconds * 8),
-                                                   self.detached_grace_seconds * 2, 3600.0)
+        self.detached_grace_seconds = policy.number("interface", "detached_grace_seconds", 300.0, 10.0, 900.0)
+        self.orphan_grace_seconds = policy.number("interface", "orphan_grace_seconds", max(900.0, self.detached_grace_seconds * 3),
+                                                   self.detached_grace_seconds, 7200.0)
         lease = WorkspaceLease(state / "workspace.lock")
         try:
             settings = workspace_settings(state, self.language, self.prompt)
@@ -21605,6 +22433,7 @@ class BrowserApp:
                                                 (self.launcher is None or self.launcher.blocked.is_set() or
                                                  not self.launcher.thread.is_alive() and not self.launcher.process_retained)),
                         "readiness": self.readiness_values, "audio": self.audio,
+                        "overview": interface_overview(self.readiness_values, self.audio, self.metrics, self.session_id),
                         "metrics": self.metrics, "progress": self.progress, "notices": list(self.notices)}
 
     def directories(self, path=None, offset=0):
@@ -21678,7 +22507,8 @@ class BrowserApp:
                         self.pending_force_recheck = True
                         self.open_pending()
             elif command == "detach":
-                self.detached_at = time.monotonic()
+                if isinstance(data.get("page_id"), str) and data["page_id"] == self.page_id:
+                    self.detached_at = time.monotonic()
             elif command in ("close", "disconnect"):
                 if self.session_id and data.get("confirmed") is not True:
                     raise YuanError("退出前需要确认结束对话 / Confirm ending the conversation before exit")
@@ -21734,12 +22564,21 @@ class BrowserApp:
                         self.send_payload({"error": "拒绝未经授权的界面访问 / Unauthorized interface access"}, 403)
                         return
                     path = urllib.parse.urlsplit(self.path).path
-                    app.last_seen = time.monotonic()
-                    app.detached_at = None
                     if path == "/":
                         nonce = secrets.token_urlsafe(24)
-                        self.send_payload(app.page(nonce), content_type="text/html; charset=utf-8", nonce=nonce)
+                        with app.lock:
+                            app.page_id = secrets.token_urlsafe(18)
+                            app.last_seen = time.monotonic()
+                            app.detached_at = None
+                            page = app.page(nonce)
+                        self.send_payload(page, content_type="text/html; charset=utf-8", nonce=nonce)
                     elif path == "/api/state":
+                        with app.lock:
+                            if self.headers.get("X-Yuan-Page") != app.page_id or app.page_id is None:
+                                self.send_payload({"error": "操作界面已刷新，请使用新页面 / Interface was replaced; use the latest page"}, 409)
+                                return
+                            app.last_seen = time.monotonic()
+                            app.detached_at = None
                         self.send_payload(app.snapshot())
                     else:
                         self.send_payload({"error": "Not found"}, 404)
@@ -21762,8 +22601,18 @@ class BrowserApp:
                         return
                     self.connection.settimeout(10)
                     data = json.loads(self.rfile.read(size), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
-                    app.last_seen = time.monotonic()
                     path = urllib.parse.urlsplit(self.path).path
+                    with app.lock:
+                        if path == "/api/action" and isinstance(data, dict) and data.get("action") == "detach":
+                            if data.get("page_id") != app.page_id or app.page_id is None:
+                                self.send_payload(app.snapshot())
+                                return
+                        elif self.headers.get("X-Yuan-Page") != app.page_id or app.page_id is None:
+                            self.send_payload({"error": "操作界面已刷新，请使用新页面 / Interface was replaced; use the latest page"}, 409)
+                            return
+                        if not (isinstance(data, dict) and data.get("action") == "detach"):
+                            app.last_seen = time.monotonic()
+                            app.detached_at = None
                     if path == "/api/directories" and isinstance(data, dict):
                         self.send_payload(app.directories(data.get("path"), data.get("offset", 0)))
                     elif path == "/api/action":
@@ -21786,22 +22635,22 @@ class BrowserApp:
 <section class="card"><h2>就绪条件 / Readiness</h2><dl id="readiness"></dl></section><section class="card"><h2>语音对话 / Voice conversation</h2><dl id="audio"></dl></section><section class="card"><h2>设备资源 / Device resources</h2><dl id="resources"></dl></section><section class="card"><h2>自主学习 / Autonomous learning</h2><dl id="learning"></dl></section>
 <section class="card"><h2>数据缺口 / Data coverage gaps</h2><div id="missing"><div id="coverage-legend" class="muted"></div><table id="coverage"></table></div></section><section class="card"><h2>运行状态 / Activity</h2><div id="notices"></div></section></div>
 <dialog id="picker"><h2>选择工作目录 / Choose workspace</h2><input id="path"><div class="row"><button id="go">打开 / Open</button><button id="up">上一级 / Parent</button><select id="roots"></select></div><div id="directories"></div><div class="row"><button id="previous">上一页 / Previous</button><button id="next">下一页 / Next</button><button id="use">选择此目录 / Use this folder</button><button id="cancel">取消 / Cancel</button></div></dialog>
-<script nonce="__CSP_NONCE__">'use strict';const token='__API_TOKEN__';const $=id=>document.getElementById(id);let state={},directory={},dirty=false,dirtyVersion=0,saving=null,savingTask=null,leaving=false,clientError='';history.replaceState(null,'','/?token='+encodeURIComponent(token));
-async function call(path,data){const response=await fetch(path,{method:data?'POST':'GET',headers:{'X-Yuan-Token':token,'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined,cache:'no-store'});const value=await response.json();if(!response.ok)throw new Error(value.error||response.statusText);return value;}
+<script nonce="__CSP_NONCE__">'use strict';const token='__API_TOKEN__';const pageId='__PAGE_ID__';const $=id=>document.getElementById(id);let state={},directory={},dirty=false,dirtyVersion=0,saving=null,savingTask=null,leaving=false,clientError='';history.replaceState(null,'','/?token='+encodeURIComponent(token));
+async function call(path,data){const response=await fetch(path,{method:data?'POST':'GET',headers:{'X-Yuan-Token':token,'X-Yuan-Page':pageId,'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined,cache:'no-store'});const value=await response.json();if(!response.ok)throw new Error(value.error||response.statusText);return value;}
 function error(e){clientError=e.message||String(e);$('reason').textContent=clientError;}function rows(id,values){const target=$(id);target.replaceChildren();for(const [label,value] of values){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label.includes(' / ')?label.split(' / ')[state.language==='English'?1:0]:label;dd.textContent=value??'—';target.append(dt,dd);}}const yes=x=>x===true?'✓':x===false?'…':'—';const seconds=x=>typeof x==='number'?x.toFixed(3)+' s':'—';const size=x=>typeof x==='number'?(x/1048576).toFixed(0)+' MiB':'—';
 function named(value){const labels={no_accepted_baseline:['无已验收版本','No accepted model'],serving_current:['当前版本已验收','Serving model accepted'],waiting_candidate_evaluation:['等待验证候选','Awaiting candidate evaluation'],evaluating:['正在验证','Evaluating'],accepted_task_evidence:['限定任务验收通过','Annotated tasks accepted'],waiting_independent_verifier:['等待独立验证模型','Awaiting independent verifier'],evaluating_tasks:['正在验证任务与回归','Evaluating tasks and regressions'],semantic_evidence_missing:['语义能力尚未验证','Semantic capability not verified'],yielded:['已让出资源','Yielded'],candidate_isolated:['候选未通过','Candidate isolated'],calibrating:['正在校准','Calibrating'],speech:['人声','Speech'],elevated_noise:['噪声升高','Elevated noise'],tracking:['正在监测','Tracking']};return labels[value]?.[state.language==='English'?1:0]||value||'—';}
 function coverage(learning){const cells=learning.coverage||learning.missing||[],english=state.language==='English',table=$('coverage');table.replaceChildren();$('coverage-legend').textContent=english?'Input · instructions · history':'输入 · 提示词 · 历史';if(!cells.length){table.textContent='—';return;}const head=document.createElement('tr');for(const value of ['', '中文','English']){const th=document.createElement('th');th.textContent=value;head.append(th);}table.append(head);const splits={train:['训练','Training'],validation:['验证','Validation'],guard:['保护','Guard'],release:['听测','Listening review']};for(const [split,label] of Object.entries(splits)){const tr=document.createElement('tr'),th=document.createElement('th');th.textContent=label[english?1:0];tr.append(th);for(const language of ['中文','English']){const td=document.createElement('td'),values=cells.filter(x=>x.language===language&&x.split===split);values.sort((a,b)=>['input','prompt','history'].indexOf(a.scenario)-['input','prompt','history'].indexOf(b.scenario));td.textContent=values.map(x=>`${x.have}/${x.need}`).join(' · ')||'—';if(split==='release')td.title=(english?'Complete reference annotations: ':'完整参考标注：')+values.map(x=>`${x.reference_sources??0}/${x.need}`).join(' · ');tr.append(td);}table.append(tr);}}
-function render(value){if(Number.isFinite(value.revision)&&Number.isFinite(state.revision)&&value.revision<state.revision)return;state=value;document.documentElement.lang=state.language==='English'?'en':'zh-CN';const r=value.readiness||{},a=value.audio||{},m=value.metrics||{},l=r.learning||{};const phases={preparation_local:['本地自研模型已创建 · 持续学习中','Owned local model created · learning'],preparation_sources:['自动获取双语训练数据','Acquiring bilingual training data'],preparation_evidence:['补齐独立验收证据','Collecting independent acceptance evidence'],preparation_accepted:['已验收 · 可语音对话','Accepted · voice dialogue available']};$('stage').textContent=(phases[r.preparation_stage]||['准备环境中','Preparing environment'])[state.language==='English'?1:0];const badges=[[value.session?(a.continuous?'● 麦克风工作中 / Microphone active':'○ 收音连接中断 / Capture disconnected'):'○ 麦克风未开启 / Microphone off',!!value.session&&!a.continuous],[`输入待处理 / Pending input: ${a.pending??0} · 拒绝 / Rejected: ${a.inference_dropped??0}`,Number(a.inference_dropped||0)>0],[m.compute_device?'计算 / Compute: '+m.compute_device:'计算 / Compute: —',false],['模型 / Model: '+(r.model_ready?'✓ Ready':'… Training/validation'),!r.model_ready],['存储 / Storage: '+(r.storage_ready?'✓':'…'),!r.storage_ready],['GPU / Accelerator: '+((m.accelerators||[]).filter(x=>x.device&&x.device!=='cpu').map(x=>x.device).join(', ')||'—'),false],[`模型阶段 / Model stage: ${r.model_lifecycle||'not_created'} · Steps: ${r.training_progress?.steps??0}`,!r.model_ready]];$('quick').replaceChildren();for(const [text,warn] of badges){const node=document.createElement('span');node.textContent=text;if(warn)node.className='warning';$('quick').append(node);}$('folder').textContent=value.workspace||'尚未选择 / No folder selected';$('status').textContent=value.status;const blockers={dialogue_data_missing:['尚缺可训练真人对话配对','Trainable human dialogue pairs still missing'],acceptance_data_missing:['独立验收数据不足','Independent acceptance samples missing'],reference_data_missing:['缺少完整独立参考回复','Independent reference answers missing'],dialogue_benchmark_missing:['尚缺中英文多轮对话基准','Bilingual dialogue benchmark incomplete'],data_sources_exhausted:['数据源暂受阻，自动退避重试','Sources paused; automatic retries scheduled'],native_learning:['本地模型还在训练及验收','Local model is training and undergoing acceptance']};$('reason').textContent=clientError||value.reason||r.model_detail||(!r.model_ready&&r.model_blocker?(blockers[r.model_blocker]||['模型仍待验证','Model not yet accepted'])[state.language==='English'?1:0]:'');$('toggle').textContent=value.ending?'正在结束 / Ending':value.session?'结束对话 / End conversation':'开始对话 / Start conversation';$('toggle').disabled=value.closing||value.ending||(!value.session&&!value.ready);$('choose').disabled=!!value.session||value.closing;$('prompt').disabled=!!value.session||value.closing;$('language').disabled=!!value.session||value.closing;$('recheck').disabled=!value.recheck_allowed;if(!dirty&&document.activeElement!==$('prompt'))$('prompt').value=value.prompt||'';if(!dirty&&document.activeElement!==$('language'))$('language').value=value.language||'中文';
-rows('readiness',[['运行环境 / Runtime',yes(r.runtime_ready)],['音频链路 / Pipeline',yes(r.pipeline_ready)],['音频设备 / Devices',yes(r.audio_ready)],['持续收音前置条件 / Capture prerequisites',yes(r.capture_ready)],['本地模型 / Local model',yes(r.preparation_stages?.model_created)],['对话训练数据 / Dialogue data',yes(r.preparation_stages?.training_data)],['候选训练 / Model training',named(r.model_lifecycle)],['独立验收 / Acceptance',yes(r.preparation_stages?.independent_acceptance)],['对话模型 / Model',yes(r.model_ready)],['存储 / Storage',yes(r.storage_ready)],['服务版本 / Serving',(r.serving_model||'—').slice(0,16)],['下一步 / Next action',named(r.next_action)]]);
-rows('audio',[['持续收音 / Listening',yes(a.continuous)],['正在说话 / Speech',yes(a.speech_active)],['响应时延 / Response',seconds(a.latency)],['轮次 / Turns',a.turns],['等待处理 / Pending',a.pending],['噪声状态 / Noise',named(a.noise_state)],['打断次数 / Interruptions',m.capture?.barge_in_events??0],['输入丢失 / Dropped input',m.capture?.dropped_utterances??a.inference_dropped??0],['推理缓冲 / Queue seconds',seconds(a.inference_window_seconds)],['收音断档 / Capture gaps',a.capture_gaps??m.capture?.capture_gaps??0],['收音重连 / Capture reconnects',a.reconnect_attempts??m.capture?.reconnect_attempts??0],['回声状态 / Echo',named(m.capture?.echo?.state)]]);
-rows('resources',[['当前计算设备 / Compute',m.compute_device||'—'],['CPU',typeof m.cpu==='number'?m.cpu.toFixed(0)+'%':'—'],['可用内存 / Available RAM',size(m.ram_available)],['进程内存 / Process RAM',size(m.process_ram)],['剩余磁盘 / Free disk',size(m.disk_free)],['显卡 / GPU',(m.accelerators||[]).map(x=>`${x.device} ${typeof x.utilization==='number'?x.utilization+'%':'—'} ${typeof x.used_bytes==='number'?size(x.used_bytes)+'/'+size(x.total_bytes):''}`).join(' · ')||'—']]);
+function render(value){if(Number.isFinite(value.revision)&&Number.isFinite(state.revision)&&value.revision<state.revision)return;state=value;document.documentElement.lang=state.language==='English'?'en':'zh-CN';const r=value.readiness||{},a=value.audio||{},m=value.metrics||{},l=r.learning||{},o=value.overview||{};const phases={preparation_local:['本地自研模型已创建 · 持续学习中','Owned local model created · learning'],preparation_sources:['自动获取双语训练数据','Acquiring bilingual training data'],preparation_evidence:['补齐独立验收证据','Collecting independent acceptance evidence'],preparation_accepted:['已验收 · 可语音对话','Accepted · voice dialogue available']};$('stage').textContent=(phases[r.preparation_stage]||['准备环境中','Preparing environment'])[state.language==='English'?1:0];const badges=[[`扬声器 / Speaker: ${r.output_ready?'✓':'○'}`,!r.output_ready],[value.session?(a.continuous?'● 麦克风工作中 / Microphone active':'○ 收音连接中断 / Capture disconnected'):'○ 麦克风未开启 / Microphone off',!!value.session&&!a.continuous],[`输入待处理 / Pending input: ${a.pending??0} · 拒绝 / Rejected: ${a.inference_dropped??0}`,Number(a.inference_dropped||0)>0],[m.compute_device?'计算 / Compute: '+m.compute_device:'计算 / Compute: —',false],['模型 / Model: '+(r.model_ready?'✓ Ready':'… Training/validation'),!r.model_ready],['存储 / Storage: '+(r.storage_ready?'✓':'…'),!r.storage_ready],['GPU / Accelerator: '+(o.compute_degraded?'CPU fallback / 自动恢复中':((m.accelerators||[]).filter(x=>x.device&&x.device!=='cpu').map(x=>x.device).join(', ')||'—')),!!o.compute_degraded],[`模型阶段 / Model stage: ${r.model_lifecycle||'not_created'} · Steps: ${r.training_progress?.steps??0}`,!r.model_ready]];$('quick').replaceChildren();for(const [text,warn] of badges){const node=document.createElement('span');node.textContent=text;if(warn)node.className='warning';$('quick').append(node);}$('folder').textContent=value.workspace||'尚未选择 / No folder selected';$('status').textContent=value.status;const blockers={dialogue_data_missing:['尚缺可训练真人对话配对','Trainable human dialogue pairs still missing'],acceptance_data_missing:['独立验收数据不足','Independent acceptance samples missing'],reference_data_missing:['缺少完整独立参考回复','Independent reference answers missing'],dialogue_benchmark_missing:['尚缺中英文多轮对话基准','Bilingual dialogue benchmark incomplete'],data_sources_exhausted:['数据源暂受阻，自动退避重试','Sources paused; automatic retries scheduled'],native_learning:['本地模型还在训练及验收','Local model is training and undergoing acceptance']};$('reason').textContent=clientError||value.reason||r.model_detail||(!r.model_ready&&r.model_blocker?(blockers[r.model_blocker]||['模型仍待验证','Model not yet accepted'])[state.language==='English'?1:0]:'');$('toggle').textContent=value.ending?'正在结束 / Ending':value.session?'结束对话 / End conversation':'开始对话 / Start conversation';$('toggle').disabled=value.closing||value.ending||(!value.session&&!value.ready);$('choose').disabled=!!value.session||value.closing;$('prompt').disabled=!!value.session||value.closing;$('language').disabled=!!value.session||value.closing;$('recheck').disabled=!value.recheck_allowed;if(!dirty&&document.activeElement!==$('prompt'))$('prompt').value=value.prompt||'';if(!dirty&&document.activeElement!==$('language'))$('language').value=value.language||'中文';
+rows('readiness',[['运行环境 / Runtime',yes(r.runtime_ready)],['音频链路 / Pipeline',yes(r.pipeline_ready)],['麦克风 / Microphone',yes(r.audio_ready)],['扬声器 / Speaker',yes(r.output_ready)],['持续收音前置条件 / Capture prerequisites',yes(r.capture_ready)],['本地模型 / Local model',yes(r.preparation_stages?.model_created)],['对话训练数据 / Dialogue data',yes(r.preparation_stages?.training_data)],['候选训练 / Model training',named(r.model_lifecycle)],['独立验收 / Acceptance',yes(r.preparation_stages?.independent_acceptance)],['对话模型 / Model',yes(r.model_ready)],['存储 / Storage',yes(r.storage_ready)],['服务版本 / Serving',(r.serving_model||'—').slice(0,16)],['下一步 / Next action',named(r.next_action)]]);
+rows('audio',[['持续收音 / Listening',yes(a.continuous)],['扬声器 / Speaker',yes(m.capture?.output_active)],['正在说话 / Speech',yes(a.speech_active)],['响应时延 / Response',seconds(a.latency)],['轮次 / Turns',a.turns],['等待处理 / Pending',a.pending],['噪声状态 / Noise',named(a.noise_state)],['打断次数 / Interruptions',m.capture?.barge_in_events??0],['输入丢失 / Dropped input',m.capture?.dropped_utterances??a.inference_dropped??0],['推理缓冲 / Queue seconds',seconds(a.inference_window_seconds)],['收音断档 / Capture gaps',a.capture_gaps??m.capture?.capture_gaps??0],['收音重连 / Capture reconnects',a.reconnect_attempts??m.capture?.reconnect_attempts??0],['丢失录音时间 / Lost input seconds',seconds(o.input_lost_seconds)],['收音持续率 / Capture uptime',typeof o.capture_uptime_fraction==='number'?(100*o.capture_uptime_fraction).toFixed(1)+'%':'—'],['回声状态 / Echo',named(m.capture?.echo?.state)]]);
+rows('resources',[['当前计算设备 / Compute',m.compute_device||'—'],['CPU',typeof m.cpu==='number'?m.cpu.toFixed(0)+'%':'—'],['可用内存 / Available RAM',size(m.ram_available)],['进程内存 / Process RAM',size(m.process_ram)],['剩余磁盘 / Free disk',size(m.disk_free)],['已检测硬件 / Detected hardware',(m.detected_accelerators||[]).join(' · ')||'—'],['已验证计算设备 / Verified compute',(m.accelerators||[]).map(x=>`${x.device} ${typeof x.utilization==='number'?x.utilization+'%':'—'} ${typeof x.used_bytes==='number'?size(x.used_bytes)+'/'+size(x.total_bytes):''}`).join(' · ')||'—']]);
 rows('learning',[['正在训练 / Training',yes(r.training_active)],['对话训练配对 / Dialogue pairs',yes(l.dialogue_trainable)],['声学训练数据 / Acoustic data',yes(l.acoustic_trainable)],['待补来源 / Missing source tasks',l.data_preflight?.unresolved_tasks],['验证数据 / Validation',yes(l.validation_ready)],['首发参考标注 / First-release annotations',yes(l.reference_ready)],['候选验证 / Candidate validation',yes(l.candidate_quality?.validation_passed)],['保护集测试 / Guard check',yes(l.candidate_quality?.guard_passed)],['候选回归 / Candidate regression',yes(l.candidate_quality?.regression_passed)],['候选已验收 / Candidate accepted',yes(l.candidate_quality?.candidate_accepted)],['来源被阻塞 / Sources blocked',yes(l.data_preflight?.source_blocked)],['候选改善 / Improvements',l.candidate_improvements],['验证误差改善 / Validation gain',typeof l.candidate_quality?.validation_relative_gain==='number'?(l.candidate_quality.validation_relative_gain*100).toFixed(1)+'%':'—'],['中英训练访问 / CN/EN training',(l.candidate_quality?.language_training_visits?.['中文']??'—')+' / '+(l.candidate_quality?.language_training_visits?.English??'—')],['服务更新 / Updates',l.serving_versions],['自动验收 / Acceptance',named(l.automatic_release)],['对话响应延迟 / Response delay',seconds(l.conversation_quality?.response_latency_seconds)],['对话失败比例 / Failed turns',typeof l.conversation_quality?.failed_fraction==='number'?(l.conversation_quality.failed_fraction*100).toFixed(1)+'%':'—'],['历史片段 / History clips',m.samples?.history?.count],['网络片段 / Online clips',m.samples?.public?.count]]);
 coverage(l);$('notices').textContent=(value.notices||[]).slice(-6).join('\n');const p=value.progress||{};$('progress').hidden=!(Number.isFinite(p.total)&&p.total>0);if(!$('progress').hidden){$('progress').max=p.total;$('progress').value=Math.max(0,p.current||0);}}
 async function action(payload){const value=await call('/api/action',payload);clientError='';render(value);return value;}async function save(){if(savingTask)return savingTask;if(!dirty)return;savingTask=(async()=>{while(dirty){const version=dirtyVersion,payload={action:'settings',language:$('language').value,prompt:$('prompt').value};await action(payload);if(version===dirtyVersion)dirty=false;}})();try{await savingTask;}finally{savingTask=null;}}function changed(){dirty=true;dirtyVersion++;clearTimeout(saving);saving=setTimeout(()=>save().catch(error),450);}$('prompt').addEventListener('input',changed);$('language').addEventListener('change',changed);
 async function list(path,offset=0){directory=await call('/api/directories',{path,offset});$('path').value=directory.path;$('directories').replaceChildren();for(const item of directory.entries){const button=document.createElement('button');button.textContent=item.name;button.addEventListener('click',()=>list(item.path).catch(error));$('directories').append(button);}$('roots').replaceChildren();for(const root of directory.roots){const option=document.createElement('option');option.value=root;option.textContent=root;$('roots').append(option);}$('next').disabled=directory.next===null;$('previous').disabled=!directory.offset;}
 $('choose').onclick=async()=>{try{await save();await list(state.workspace||undefined);$('picker').showModal();}catch(e){error(e);}};$('go').onclick=()=>list($('path').value).catch(error);$('up').onclick=()=>list(directory.parent).catch(error);$('roots').onchange=()=>list($('roots').value).catch(error);$('next').onclick=()=>list(directory.path,directory.next).catch(error);$('previous').onclick=()=>list(directory.path,Math.max(0,directory.offset-128)).catch(error);$('cancel').onclick=()=>$('picker').close();$('use').onclick=async()=>{try{await action({action:'workspace',path:directory.path});$('picker').close();}catch(e){error(e);}};
 $('toggle').onclick=async()=>{try{if(state.session){if(confirm('确认结束本次对话？ / End this conversation?'))await action({action:'stop',confirmed:true});}else{await save();await action({action:'start'});}}catch(e){error(e);}};$('recheck').onclick=()=>action({action:'recheck'}).catch(error);$('close').onclick=async()=>{if(state.session&&!confirm('确认结束对话并退出？ / End the conversation and exit?'))return;try{await save();await action({action:'close',confirmed:true});leaving=true;$('status').textContent='正在退出 / Closing';}catch(e){error(e);}};
-window.addEventListener('beforeunload',e=>{if(state.session&&!leaving){e.preventDefault();e.returnValue='';}});window.addEventListener('pagehide',()=>{if(!leaving)navigator.sendBeacon('/api/action?token='+encodeURIComponent(token),new Blob([JSON.stringify({action:'detach'})],{type:'application/json'}));});async function poll(){if(leaving)return;try{render(await call('/api/state'));}catch(e){error(e);$('toggle').disabled=true;}setTimeout(poll,document.hidden?2500:500);}poll();</script></html>'''.replace("__API_TOKEN__", self.token).replace("__CSP_NONCE__", nonce)
+window.addEventListener('beforeunload',e=>{if(state.session&&!leaving){e.preventDefault();e.returnValue='';}});window.addEventListener('pagehide',()=>{if(!leaving)navigator.sendBeacon('/api/action?token='+encodeURIComponent(token),new Blob([JSON.stringify({action:'detach',page_id:pageId})],{type:'application/json'}));});async function poll(){if(leaving)return;try{render(await call('/api/state'));}catch(e){error(e);$('toggle').disabled=true;}setTimeout(poll,document.hidden?2500:500);}poll();</script></html>'''.replace("__API_TOKEN__", self.token).replace("__PAGE_ID__", self.page_id).replace("__CSP_NONCE__", nonce)
 
     def run(self):
         import webbrowser
@@ -21905,7 +22754,58 @@ def run_interface_fallback(workspace=None):
     raise YuanError("交互界面均未通过启动检查 / Interactive interface startup failed: " + json.dumps(failures, ensure_ascii=False))
 
 
+
+def self_test():
+    tests = {}
+    tests["python"] = sys.version_info[:2] >= (3, 10)
+    tests["source_syntax"] = bool(ast.parse(Path(__file__).read_text(encoding="utf-8")))
+    tests["single_embedded_release_field"] = build_digest() == build_digest(Path(__file__).read_text(encoding="utf-8"))
+    tests["model_digest"] = is_digest(model_compatibility_digest())
+    tests["evaluator_digest"] = is_digest(behavior_digest())
+    tests["capture_digest"] = is_digest(capture_compatibility_digest())
+    source = Path(__file__).read_text(encoding="utf-8")
+    original = "        self." + "reply_epoch = 0\n"
+    if source.count(original) != 1:
+        raise YuanError("收音兼容性测试无法定位版本字段 / Capture contract test cannot locate epoch declaration")
+    capture_variant = source.replace(original, "        self." + "reply_epoch = 19\n", 1)
+    tests["capture_isolated_from_model"] = model_compatibility_digest(source) == model_compatibility_digest(capture_variant)
+    tests["capture_isolated_from_evaluator"] = evaluation_compatibility_digest(source) == evaluation_compatibility_digest(capture_variant)
+    tests["capture_change_detected"] = capture_compatibility_digest(source) != capture_compatibility_digest(capture_variant)
+    class DummyCapture:
+        def __init__(self):
+            self.stop_event = threading.Event()
+            self.reply_epoch = 8
+            self.trusted_speaking = False
+            self.connected = True
+    capture = DummyCapture()
+    parent = threading.Event()
+    cancel = ReplyCancel(parent, capture, 8, allow_speaking=True, preserve_input=True)
+    tests["live_capture"] = not cancel.is_set()
+    capture.reply_epoch = 9
+    tests["stale_utterance_cancelled"] = cancel.is_set()
+    capture.reply_epoch = 8
+    capture.trusted_speaking = True
+    tests["interrupts_reply"] = ReplyCancel(parent, capture, 8).is_set()
+    tests["input_can_encode_while_speaking"] = not cancel.is_set()
+    installer = object.__new__(RuntimeInstaller)
+    installer.hardware = {"system": "Linux", "adapters": [{"name": "NVIDIA", "vendor": "nvidia"}],
+                          "cuda": "12.4", "compute_capabilities": ["8.6"]}
+    installer.env = {}
+    options = installer.backend_candidates()
+    tests["gpu_backend_order"] = "cu124" in options and "cu121" in options and options[-1] == "cpu" and "cu130" not in options
+    tests["gpu_python_version_fallbacks"] = RuntimeInstaller.torch_version("cu121") == "2.5.1" and RuntimeInstaller.torch_version("rocm6.3") == "2.6.0"
+    tests["native_audio_contract"] = "native_audio_model_direct_waveform" in source and "network.decode(previous, hidden, condition)" in source
+    tests["embedded_model_present"] = bool(EMBEDDED_RELEASE)
+    report = {"format": "yuan-self-test-v1", "passed": all(value for key, value in tests.items() if key != "embedded_model_present"),
+              "checks": tests, "model_delivery": "embedded" if EMBEDDED_RELEASE else "not_embedded_requires_accepted_training_and_release"}
+    sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    return report["passed"]
+
+
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        raise SystemExit(0 if self_test() else 1)
     if len(sys.argv) == 4 and sys.argv[1] == "--probe-device-memory":
         memory_probe_entry(sys.argv[2], sys.argv[3])
         return
