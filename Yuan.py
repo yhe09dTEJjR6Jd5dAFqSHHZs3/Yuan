@@ -2048,9 +2048,11 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
         process.stdout.close()
         raise ValueError("Invalid process deadline")
     deadline = started + budget
-    progress_ceiling = started + max(budget, progress_ceiling_seconds if isinstance(progress_ceiling_seconds, (int, float)) and not isinstance(progress_ceiling_seconds, bool) and math.isfinite(progress_ceiling_seconds) else budget)
+    hard_budget = max(budget, progress_ceiling_seconds if isinstance(progress_ceiling_seconds, (int, float)) and not isinstance(progress_ceiling_seconds, bool) and math.isfinite(progress_ceiling_seconds) and progress_ceiling_seconds > 0 else budget)
+    progress_ceiling = started + hard_budget
     event_progress = {}
     previous_activity = None
+    productive_write_bytes = None
     previous_progress = None
     progress_stages = set()
     monitor = None
@@ -2101,7 +2103,7 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
                         progress_stages.add(line)
                         productive = True
                     if productive:
-                        deadline = max(deadline, last_output + budget)
+                        deadline = min(progress_ceiling, max(deadline, last_output + budget))
                 category = failure_category(YuanError(line))
                 if category != "unknown":
                     evidence.setdefault(category, line)
@@ -2125,9 +2127,10 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
                 elif progress:
                     progress(redact(line))
             now = time.monotonic()
-            if now >= deadline and process.poll() is None:
+            if now >= min(deadline, progress_ceiling) and process.poll() is None:
                 raise YuanFault("组件执行期限已到 / Component execution deadline reached", category="timeout", code="component_deadline", stage=stage,
-                                command=[str(value) for value in command], pid=process.pid, elapsed=now-started, budget_seconds=budget, output=redact(list(result)))
+                                command=[str(value) for value in command], pid=process.pid, elapsed=now-started, budget_seconds=budget,
+                                hard_limit_seconds=hard_budget, timeout_kind="hard" if now >= progress_ceiling else "soft", output=redact(list(result)))
             if now - last_heartbeat >= period:
                 last_heartbeat = now
                 activity = None
@@ -2148,8 +2151,6 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
                         if activity != previous_activity:
                             previous_activity = activity
                             last_activity = now
-                            if adaptive:
-                                deadline = max(deadline, now + budget)
                     except (OSError, psutil.Error):
                         monitor = None
                 if activity is None:
@@ -2157,12 +2158,18 @@ def run_command(command, env, cancel, progress=None, heartbeat=None, heartbeat_s
                     if activity is not None and activity != previous_activity:
                         previous_activity = activity
                         last_activity = now
-                        if adaptive:
-                            deadline = max(deadline, now + budget)
+                if adaptive and activity is not None:
+                    written = activity[2]
+                    if productive_write_bytes is None or written < productive_write_bytes:
+                        productive_write_bytes = written
+                    elif written - productive_write_bytes >= 1024 * 1024:
+                        productive_write_bytes = written
+                        deadline = min(progress_ceiling, max(deadline, now + budget))
                 if heartbeat:
                     heartbeat({"pid": process.pid, "elapsed": now - started, "output_idle": now - last_output, "activity_idle": now - last_activity,
                                "process_running": process.poll() is None, "process_activity": activity, "monitor_available": activity is not None,
-                               "remaining_seconds": max(0.0, deadline - now), "budget_seconds": budget})
+                               "remaining_seconds": max(0.0, min(deadline, progress_ceiling) - now), "budget_seconds": budget,
+                               "hard_remaining_seconds": max(0.0, progress_ceiling - now)})
                 if stall_seconds and now - max(last_output, last_activity) > stall_seconds and process.poll() is None:
                     raise YuanFault("组件没有可观察进展 / No observable component progress", category="timeout", code="component_stalled", stage=stage,
                                     command=[str(value) for value in command], pid=process.pid, idle_seconds=now-max(last_output, last_activity), output=redact(list(result)))
@@ -2386,7 +2393,15 @@ class RuntimeInstaller:
             if is_probe:
                 self.supervisor.poll()
             self.emit("progress", **{**self.progress, **values})
-        budget = self.supervisor.budget(self.phase, self.stall_seconds)
+        suggested = self.stall_seconds
+        local_install = "install" in command and "--no-index" in command
+        if transfer or local_install or "--verify-install" in command:
+            section = "transfer_command_initial_seconds" if transfer else "install_command_initial_seconds"
+            initial = self.policy.number("runtime", section, max(600.0, self.network.timeout_ceiling * (self.download_attempts + 2)),
+                                         self.supervisor.minimum, self.supervisor.ceiling)
+            suggested = max(suggested, initial)
+        budget = self.supervisor.budget(self.phase, suggested)
+        stall_limit = max(self.stall_seconds, min(budget, max(240.0, self.stall_seconds * 2))) if transfer or local_install else self.stall_seconds
         env = dict(self.env)
         if is_probe:
             names = (command[-1],) if "--probe-import" in command else () if "--verify-install" in command or "--probe-fast" in command else RUNTIME_MODULES
@@ -2406,9 +2421,9 @@ class RuntimeInstaller:
         try:
             with self.cancel.transfer() if transfer and isinstance(self.cancel, StartupControl) else nullcontext():
                 result = run_command(command, env, self.cancel, self.report if report else None, heartbeat=heartbeat,
-                                     heartbeat_seconds=self.heartbeat_seconds, stall_seconds=None if is_probe else self.stall_seconds,
+                                     heartbeat_seconds=self.heartbeat_seconds, stall_seconds=None if is_probe else stall_limit,
                                      timeout_seconds=budget, stage=self.phase, events=receive if is_probe else None, adaptive=not is_probe,
-                                     progress_ceiling_seconds=max(budget, self.supervisor.hard_ceiling + self.supervisor.grace) if is_probe else None)
+                                     progress_ceiling_seconds=max(budget, self.supervisor.hard_ceiling + self.supervisor.grace))
             self.emit("runtime_message", stage=self.phase, command=[str(value) for value in command], returncode=0, elapsed=time.monotonic()-began)
             return result
         except YuanFault as exc:
@@ -3157,12 +3172,11 @@ class RuntimeInstaller:
                 self.create_environment(self.interpreter(request), runtime)
                 python = runtime_python(runtime)
         help_text = self.pip_command(python, ["help", "install"])
-        version_text = self.pip_command(python, ["--version"])
-        match = re.match(r"pip ([0-9]+)(?:\.([0-9]+))?", version_text)
-        pip_version = (int(match[1]), int(match[2] or 0)) if match else (0, 0)
-        if pip_version < (26, 2) or "--dry-run" not in help_text or "--report" not in help_text:
-            self.command([str(python), "-m", "pip", "install", "--only-binary=:all:", "--no-deps", "--upgrade", "pip>=26.2"], report=True, transfer=True)
+        if "--dry-run" not in help_text or "--report" not in help_text:
+            self.pip_command(python, ["install", "--only-binary=:all:", "--no-deps", "--upgrade", "pip>=23"], report=True, transfer=True)
             help_text = self.pip_command(python, ["help", "install"])
+            if "--dry-run" not in help_text or "--report" not in help_text:
+                raise YuanFault("安装工具缺少依赖解析能力 / Installer lacks required resolution features", category="compatibility", code="pip_resolution_features_missing", stage=self.phase)
         progress_args = ["--progress-bar", "raw" if re.search(r"\braw\b", help_text) else "off"]
         platform_key, platform_value = self._platform_key(python)
         entry = lock["platforms"].get(platform_key)
@@ -3194,6 +3208,20 @@ class RuntimeInstaller:
                 installed = False
                 self.emit("notice", key="runtime_install_repair", reason=concise_error(exc), fault=fault_event(exc))
             else:
+                self.emit("notice", key="runtime_install_reused", executable=str(python))
+        if not installed and build.get("stage") in ("preparing_install", "installed"):
+            try:
+                self._verify_installation(python, entry)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                if failure_category(exc) not in ("integrity", "unknown"):
+                    raise
+                self.emit("notice", key="runtime_install_repair", reason=concise_error(exc), fault=fault_event(exc))
+            else:
+                installed = True
+                build.update(stage="installed", installed={"identity": identity, "lock": payload_digest(entry)})
+                atomic_json(build_path, build, self.cancel)
                 self.emit("notice", key="runtime_install_reused", executable=str(python))
         if not installed:
             build.pop("installed", None)
@@ -3282,7 +3310,7 @@ class RuntimeInstaller:
                     "requires_python": entry.get("requires_python", ""), "version": entry["version"] if "version" in entry else target.name.split("-")[1]}, self.cancel)
         return target
 
-    def pip_command(self, python, arguments, report=False):
+    def pip_command(self, python, arguments, report=False, transfer=False):
         try:
             self.command([str(python), "-c", "import pip"])
         except Cancelled:
@@ -3292,8 +3320,8 @@ class RuntimeInstaller:
                 raise
             archive = self.bootstrap_pip(python)
             script = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));sys.argv[0]='pip';runpy.run_module('pip',run_name='__main__')"
-            return self.command([str(python), "-c", script, str(archive), *arguments], report=report)
-        return self.command([str(python), "-m", "pip", *arguments], report=report)
+            return self.command([str(python), "-c", script, str(archive), *arguments], report=report, transfer=transfer)
+        return self.command([str(python), "-m", "pip", *arguments], report=report, transfer=transfer)
 
     def create_environment(self, python, runtime):
         try:
